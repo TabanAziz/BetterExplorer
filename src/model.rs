@@ -11,6 +11,7 @@ pub enum Location {
     #[default]
     Home,
     Computer,
+    Settings,
     Folder(PathBuf),
     Search {
         root: PathBuf,
@@ -34,6 +35,7 @@ impl Location {
         match self {
             Self::Home => "Home".into(),
             Self::Computer => "This PC".into(),
+            Self::Settings => "Settings".into(),
             Self::Search { query, .. } => format!("Search: {query}"),
             Self::Folder(path) => path
                 .file_name()
@@ -148,6 +150,22 @@ pub struct Settings {
     pub tabs: Vec<Location>,
     pub pins: Vec<PathBuf>,
     pub views: BTreeMap<PathBuf, u32>,
+}
+
+impl Settings {
+    pub fn remember_tabs(&mut self, tabs: impl IntoIterator<Item = Location>, active: usize) {
+        self.tabs.clear();
+        self.active = 0;
+        for (index, location) in tabs.into_iter().enumerate() {
+            if location == Location::Settings {
+                continue;
+            }
+            if index <= active {
+                self.active = self.tabs.len();
+            }
+            self.tabs.push(location);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]

@@ -11,4 +11,4 @@
 - Remote paths use a dedicated scanner when Windows identifies the path as UNC or mapped network. Windows may block a remote I/O call before cancellation takes effect. Only the active local folder has change notifications. Refresh network folders manually.
 - A secondary window reads current preferences and has its own session. Only the primary window writes preferences to reduce conflicting changes. The optional startup restoration is per primary session.
 - Shell integration tests cover local NTFS. Timing comparison against File Explorer, cold boots, SMB faults, long paths under all policies, cloud placeholder behavior, high DPI, multiple monitors and full Narrator and touch coverage are pending.
-- The packages are unsigned. Installation is per user and leaves Windows' shell and Win+E available.
+- The packages are unsigned. Installation is per user. BetterExplorer's optional Win+E helper runs in the current Windows desktop session. Apps that intercept the same key combination, Windows policies or an elevated foreground app can prevent the shortcut from being handled there. In those cases Windows can still handle the shortcut.

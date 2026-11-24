@@ -426,6 +426,7 @@ pub enum Glyph {
     Maximize,
     Restore,
     Chevron,
+    Settings,
 }
 
 pub fn draw_glyph(dc: HDC, glyph: Glyph, x: i32, y: i32, size: i32, color: u32) {
@@ -565,6 +566,12 @@ pub fn draw_glyph(dc: HDC, glyph: Glyph, x: i32, y: i32, size: i32, color: u32) 
                 box_(2, 3, 14, 11);
                 stroke(&[(8, 11), (8, 14)]);
                 stroke(&[(4, 14), (12, 14)]);
+            }
+            Glyph::Settings => {
+                for (row, handle) in [(3, 5), (8, 11), (13, 7)] {
+                    stroke(&[(2, row), (14, row)]);
+                    stroke(&[(handle, row - 2), (handle, row + 2)]);
+                }
             }
             Glyph::Home => {
                 stroke(&[(1, 7), (8, 2), (15, 7)]);

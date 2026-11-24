@@ -1,3 +1,4 @@
+use crate::hotkey;
 use crate::{
     benchmark::{self, Bench},
     chrome::*,
@@ -124,6 +125,9 @@ const PINNED: u16 = 179;
 const NETWORK: u16 = 180;
 const RECYCLE: u16 = 181;
 const LIBRARIES: u16 = 182;
+const OPEN_SETTINGS: u16 = 190;
+const WIN_E_WINDOWS: u16 = 191;
+const WIN_E_BETTER: u16 = 192;
 const TAB_START: u16 = 300;
 const BREADCRUMB_START: u16 = 340;
 const PIN_START: u16 = 430;
@@ -160,6 +164,7 @@ const COMMANDS: &[(u16, &str, i32)] = &[
     (FILTER, "Filter  ▾", 87),
     (MORE, "More options", 45),
     (DETAILS, "Details", 85),
+    (OPEN_SETTINGS, "Settings", 91),
 ];
 const PLACES: [&str; 6] = [
     "Desktop",
@@ -176,6 +181,10 @@ enum Event {
     Preview(u64, Option<Content>),
     Boot(Settings, Vec<(PathBuf, &'static str)>),
     SettingsError(String),
+    Hotkey {
+        status: Option<hotkey::Status>,
+        error: Option<String>,
+    },
     Operation {
         result: Result<String, String>,
         refresh: bool,
@@ -244,6 +253,19 @@ enum Edit {
     Extract(PathBuf, PathBuf),
 }
 
+#[derive(Clone, Copy)]
+struct ShortcutControls {
+    heading: HWND,
+    description: HWND,
+    state: HWND,
+}
+
+#[derive(Clone, Copy)]
+enum HotkeyRequest {
+    Read,
+    Change(bool),
+}
+
 struct App {
     window: HWND,
     buttons: Vec<(u16, HWND)>,
@@ -266,6 +288,10 @@ struct App {
     tabs: Vec<Tab>,
     active: usize,
     settings: Settings,
+    shortcut_controls: Option<ShortcutControls>,
+    hotkey_status: Option<hotkey::Status>,
+    hotkey_request: Option<HotkeyRequest>,
+    hotkey_error: Option<String>,
     places: Vec<(PathBuf, &'static str)>,
     pinned: Vec<PathBuf>,
     crumbs: Vec<PathBuf>,
@@ -385,6 +411,10 @@ impl App {
             )],
             active: 0,
             settings: Settings::default(),
+            shortcut_controls: None,
+            hotkey_status: None,
+            hotkey_request: None,
+            hotkey_error: None,
             places: Vec::new(),
             pinned: Vec::new(),
             crumbs: Vec::new(),
@@ -571,6 +601,12 @@ impl App {
         for control in [self.title, self.detail_title, self.header] {
             send(control, WM_SETFONT, self.fonts[1] as usize, 1);
         }
+        if let Some(controls) = self.shortcut_controls {
+            send(controls.heading, WM_SETFONT, self.fonts[1] as usize, 1);
+            for control in [controls.state, controls.description] {
+                send(control, WM_SETFONT, self.fonts[0] as usize, 1);
+            }
+        }
         for handle in old {
             if !handle.is_null() {
                 unsafe {
@@ -653,6 +689,136 @@ impl App {
         }
     }
 
+    fn open_settings(&mut self) {
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| *tab.history.current() == Location::Settings)
+        {
+            self.switch(index);
+        } else if self.tabs.len() == TAB_LIMIT {
+            self.go(Location::Settings);
+        } else {
+            self.new_tab(Location::Settings);
+        }
+        let focus = if self
+            .hotkey_status
+            .as_ref()
+            .is_some_and(|status| status.configured || status.running)
+        {
+            WIN_E_BETTER
+        } else {
+            WIN_E_WINDOWS
+        };
+        let focus = if self.hotkey_request.is_some() {
+            self.button(OPEN_SETTINGS)
+        } else {
+            self.button(focus)
+        };
+        unsafe {
+            SetFocus(focus);
+        }
+    }
+
+    fn ensure_shortcut_controls(&mut self) {
+        if self.shortcut_controls.is_some() {
+            return;
+        }
+        let label = |caption| new_control(self.window, "Static", caption, 0, SS_NOPREFIX, 0);
+        let controls = ShortcutControls {
+            heading: label("What opens when you press Win+E?"),
+            description: label(
+                "BetterExplorer uses a background shortcut helper that starts at sign-in.",
+            ),
+            state: label(""),
+        };
+        for (control, font) in [
+            (controls.heading, self.fonts[1]),
+            (controls.description, self.fonts[0]),
+            (controls.state, self.fonts[0]),
+        ] {
+            send(control, WM_SETFONT, font as usize, 0);
+        }
+        self.set_dynamic_button(WIN_E_WINDOWS, "Windows File Explorer");
+        self.set_dynamic_button(WIN_E_BETTER, "BetterExplorer");
+        self.shortcut_controls = Some(controls);
+    }
+
+    fn request_hotkey(&mut self, request: HotkeyRequest) {
+        if self.hotkey_request.is_some() {
+            return;
+        }
+        self.hotkey_request = Some(request);
+        self.hotkey_error = None;
+        self.update_shortcut_controls();
+        let events = Arc::clone(&self.events);
+        let owner = self.window as usize;
+        let work = std::thread::Builder::new()
+            .name("Win+E settings".into())
+            .spawn(move || {
+                let change = match request {
+                    HotkeyRequest::Read => Ok(()),
+                    HotkeyRequest::Change(enabled) => hotkey::set_enabled(enabled),
+                };
+                let status = hotkey::status();
+                let error = change
+                    .err()
+                    .map(|err| err.to_string())
+                    .or_else(|| status.as_ref().err().map(|err| err.to_string()));
+                publish(
+                    &events,
+                    owner,
+                    Event::Hotkey {
+                        status: status.ok(),
+                        error,
+                    },
+                );
+            });
+        if let Err(error) = work {
+            self.hotkey_request = None;
+            self.hotkey_error = Some(error.to_string());
+            self.update_shortcut_controls();
+        }
+    }
+
+    fn update_shortcut_controls(&self) {
+        let Some(controls) = self.shortcut_controls else {
+            return;
+        };
+        let message = if let Some(error) = &self.hotkey_error {
+            format!("Win+E setting: {error}")
+        } else {
+            match (self.hotkey_request, self.hotkey_status.as_ref()) {
+                (Some(HotkeyRequest::Read), _) => "Checking the current Win+E setting…".into(),
+                (Some(HotkeyRequest::Change(_)), _) => "Updating Win+E…".into(),
+                (_, Some(status)) if status.another_copy => {
+                    "Win+E is managed by another BetterExplorer copy.".into()
+                }
+                (_, Some(status)) if status.configured && status.running => {
+                    "Active in this session. Windows Startup Apps controls launch at sign-in."
+                        .into()
+                }
+                (_, Some(status)) if status.configured => {
+                    "Registered for sign-in. Select BetterExplorer to start the helper now.".into()
+                }
+                (_, Some(status)) if status.running => {
+                    "The BetterExplorer shortcut helper is running.".into()
+                }
+                (_, Some(_)) => "Windows File Explorer handles Win+E.".into(),
+                _ => String::new(),
+            }
+        };
+        text(controls.state, message);
+        let available = self.hotkey_request.is_none();
+        for id in [WIN_E_WINDOWS, WIN_E_BETTER] {
+            let control = self.button(id);
+            set_enabled(control, available);
+            unsafe {
+                InvalidateRect(control, null(), 0);
+            }
+        }
+    }
+
     fn drive_cards(&self) -> bool {
         if !matches!(self.location(), Location::Computer) || self.tab().view != VIEW_CARDS {
             return false;
@@ -672,6 +838,7 @@ impl App {
         let d = |value| scale(value, self.dpi);
         let pos = |id, x, y, width, height| move_to(self.button(id), x, y, width, height);
         let margin = d(10);
+        let settings_tab = *self.location() == Location::Settings;
         let tab_width = ((w - d(205)) / self.tabs.len() as i32).clamp(d(38), d(205));
         let mut x = margin;
         for offset in 0..TAB_LIMIT {
@@ -713,7 +880,9 @@ impl App {
             address_width - d(42),
             d(24),
         );
-        set_visible(self.address, self.editing_address);
+        set_visible(self.address, self.editing_address && !settings_tab);
+        set_visible(self.search, !settings_tab);
+        set_visible(self.button(REFRESH), !settings_tab);
         let mut crumb_x = address_x + d(33);
         let last = self.crumb_display.len().saturating_sub(1);
         let current_width = self
@@ -750,8 +919,11 @@ impl App {
         );
         x = margin;
         for &(id, _, width) in COMMANDS {
-            if id == DETAILS {
+            set_visible(self.button(id), !settings_tab || id == OPEN_SETTINGS);
+            if id == OPEN_SETTINGS {
                 pos(id, w - d(width + 10), d(83), d(width), d(31));
+            } else if id == DETAILS {
+                pos(id, w - d(width + 109), d(83), d(width), d(31));
             } else {
                 if matches!(id, CUT | SORT | MORE) {
                     x += d(9);
@@ -784,13 +956,17 @@ impl App {
             y += d(29);
         }
         let status_y = h - d(27);
-        let listing_right = if self.settings.details { w - d(226) } else { w };
+        let listing_right = if self.settings.details && !settings_tab {
+            w - d(226)
+        } else {
+            w
+        };
         let content_x = sidebar_width + d(12);
         let drive_mode = self.drive_cards();
         let section = !matches!(self.location(), Location::Folder(_));
         let list_y = if section { 155 } else { 123 };
         set_visible(self.title, section);
-        set_visible(self.summary, section);
+        set_visible(self.summary, section && !settings_tab);
         move_to(
             self.title,
             content_x,
@@ -799,7 +975,7 @@ impl App {
             d(23),
         );
         move_to(self.summary, listing_right - d(116), d(133), d(100), d(22));
-        set_visible(self.list, !drive_mode);
+        set_visible(self.list, !drive_mode && !settings_tab);
         move_to(
             self.list,
             content_x - d(3),
@@ -852,8 +1028,31 @@ impl App {
             d(196),
             status_y - d(detail_top + 11),
         );
-        set_visible(self.detail_title, self.settings.details);
-        set_visible(self.detail_body, self.settings.details);
+        set_visible(self.detail_title, self.settings.details && !settings_tab);
+        set_visible(self.detail_body, self.settings.details && !settings_tab);
+        set_visible(self.status, !settings_tab);
+        set_visible(self.button(QUICK_DETAILS), !settings_tab);
+        set_visible(self.button(QUICK_ICONS), !settings_tab);
+        if let Some(controls) = self.shortcut_controls {
+            for control in [
+                controls.heading,
+                controls.description,
+                controls.state,
+                self.button(WIN_E_WINDOWS),
+                self.button(WIN_E_BETTER),
+            ] {
+                set_visible(control, settings_tab);
+            }
+            if settings_tab {
+                let x = content_x + d(13);
+                let span = (w - x - d(20)).min(d(690));
+                move_to(controls.heading, x, d(184), span, d(27));
+                pos(WIN_E_WINDOWS, x, d(218), d(221), d(42));
+                pos(WIN_E_BETTER, x + d(231), d(218), d(188), d(42));
+                move_to(controls.state, x, d(278), span, d(58));
+                move_to(controls.description, x, d(351), span, d(48));
+            }
+        }
         move_to(self.status, margin, status_y + d(6), w - d(221), d(19));
         pos(QUICK_DETAILS, w - d(65), status_y + d(1), d(30), d(24));
         pos(QUICK_ICONS, w - d(34), status_y + d(1), d(30), d(24));
@@ -886,10 +1085,22 @@ impl App {
         unsafe {
             InvalidateRect(self.window, null(), 0);
             InvalidateRect(self.header, null(), 0);
+            if settings_tab {
+                // Owner-drawn children may have painted while this layout held the app borrow.
+                RedrawWindow(
+                    self.window,
+                    null(),
+                    null_mut(),
+                    RDW_INVALIDATE | RDW_ALLCHILDREN,
+                );
+            }
         }
     }
 
     fn address_focus(&mut self, editing: bool) {
+        if editing && *self.location() == Location::Settings {
+            return;
+        }
         if self.editing_address != editing {
             self.editing_address = editing;
             if !editing {
@@ -1105,6 +1316,20 @@ impl App {
         set_enabled(self.button(UP), self.location_dir().is_some());
         set_enabled(self.button(NEW), self.dest().is_some());
         set_enabled(self.button(PASTE), self.dest().is_some());
+        if self.shortcut_controls.is_some() {
+            for &(id, control) in &self.buttons {
+                if id == HOME
+                    || id == COMPUTER
+                    || id == OPEN_SETTINGS
+                    || (TAB_START..TAB_START + TAB_LIMIT as u16).contains(&id)
+                    || (CRUMB_START..CRUMB_START + CRUMB_LIMIT as u16).contains(&id)
+                {
+                    unsafe {
+                        InvalidateRect(control, null(), 0);
+                    }
+                }
+            }
+        }
     }
 
     fn apply_view(&mut self, view: u32) {
@@ -1198,7 +1423,11 @@ impl App {
         }
         self.error = None;
         self.note = None;
-        self.scanning = true;
+        let settings_tab = *self.location() == Location::Settings;
+        self.scanning = !settings_tab;
+        if settings_tab {
+            self.ensure_shortcut_controls();
+        }
         self.layout();
         self.status();
         self.request_scan();
@@ -1206,6 +1435,16 @@ impl App {
 
     fn request_scan(&mut self) {
         self.id = self.id.wrapping_add(1);
+        if *self.location() == Location::Settings {
+            if let Some(scanner) = &self.scanner {
+                scanner.cancel(self.id);
+            }
+            if let Some(watcher) = &self.watcher {
+                watcher.watch(self.id, None);
+            }
+            self.request_hotkey(HotkeyRequest::Read);
+            return;
+        }
         if let Some(scanner) = &self.scanner {
             scanner.request(Request {
                 id: self.id,
@@ -1328,7 +1567,7 @@ impl App {
                         Location::Folder(_) | Location::Search { .. } => {
                             self.settings.hidden != settings.hidden
                         }
-                        Location::Computer => false,
+                        Location::Computer | Location::Settings => false,
                     };
                     let view_changed = self.dest().is_some_and(|path| {
                         self.settings.views.get(&path) != settings.views.get(&path)
@@ -1337,6 +1576,7 @@ impl App {
                     self.places = places;
                     self.settings = settings;
                     let restore = self.launch_path.is_none()
+                        && !std::env::args_os().any(|arg| arg == "--new-window")
                         && self.id == 1
                         && self.tabs.len() == 1
                         && matches!(self.location(), Location::Home)
@@ -1371,6 +1611,12 @@ impl App {
                             self.status();
                         }
                     }
+                }
+                Event::Hotkey { status, error } => {
+                    self.hotkey_request = None;
+                    self.hotkey_status = status;
+                    self.hotkey_error = error;
+                    self.update_shortcut_controls();
                 }
                 Event::SettingsError(error) => {
                     self.note = Some(error);
@@ -1652,12 +1898,10 @@ impl App {
     fn settings_snapshot(&self) -> Settings {
         let mut settings = self.settings.clone();
         if self.save_enabled {
-            settings.tabs = self
-                .tabs
-                .iter()
-                .map(|tab| tab.history.current().clone())
-                .collect();
-            settings.active = self.active;
+            settings.remember_tabs(
+                self.tabs.iter().map(|tab| tab.history.current().clone()),
+                self.active,
+            );
         }
         settings
     }
@@ -1850,6 +2094,10 @@ impl App {
                 PostMessageW(self.window, WM_CLOSE, 0, 0);
             },
             ENTER_SEARCH => self.search(),
+            OPEN_SETTINGS => self.open_settings(),
+            WIN_E_WINDOWS | WIN_E_BETTER if *self.location() == Location::Settings => {
+                self.request_hotkey(HotkeyRequest::Change(id == WIN_E_BETTER));
+            }
             HOME => self.go(Location::Home),
             COMPUTER => self.go(Location::Computer),
             NETWORK => {
@@ -2283,6 +2531,8 @@ impl App {
                 ]
             }
             MORE => vec![
+                item(OPEN_SETTINGS, "Settings\tCtrl+,"),
+                line(),
                 item(NEW_WINDOW, "New window\tCtrl+N"),
                 item(CLOSE_TAB, "Close tab\tCtrl+W"),
                 item(MOVE_TAB_LEFT, "Move tab left").enabled(self.active > 0),
@@ -2421,6 +2671,9 @@ impl App {
             FILTER => Some(Glyph::Filter),
             MORE => Some(Glyph::More),
             DETAILS | QUICK_ICONS => Some(Glyph::Details),
+            OPEN_SETTINGS => Some(Glyph::Settings),
+            WIN_E_WINDOWS => Some(Glyph::Drive),
+            WIN_E_BETTER => Some(Glyph::Folder),
             PATH | COMPUTER => Some(Glyph::Drive),
             HOME => Some(Glyph::Home),
             PINNED => Some(Glyph::Pin),
@@ -2443,6 +2696,7 @@ impl App {
                 {
                     Some(Location::Home) => Glyph::Home,
                     Some(Location::Computer) => Glyph::Drive,
+                    Some(Location::Settings) => Glyph::Settings,
                     Some(Location::Search { .. }) => Glyph::Search,
                     _ => Glyph::Folder,
                 },
@@ -2487,11 +2741,26 @@ impl App {
             label: sidebar
                 || crumb
                 || tab
-                || matches!(id, NEW | SORT | VIEW | FILTER | DETAILS)
+                || matches!(
+                    id,
+                    NEW | SORT
+                        | VIEW
+                        | FILTER
+                        | DETAILS
+                        | OPEN_SETTINGS
+                        | WIN_E_WINDOWS
+                        | WIN_E_BETTER
+                )
                 || glyph.is_none(),
-            left: sidebar || crumb || tab,
+            left: sidebar || crumb || tab || matches!(id, WIN_E_WINDOWS | WIN_E_BETTER),
             active: (tab && id == TAB_START + self.active as u16)
                 || active_place
+                || (id == OPEN_SETTINGS && *self.location() == Location::Settings)
+                || (matches!(id, WIN_E_WINDOWS | WIN_E_BETTER)
+                    && self.hotkey_status.as_ref().is_some_and(|status| {
+                        !status.another_copy
+                            && (status.configured || status.running) == (id == WIN_E_BETTER)
+                    }))
                 || (id == DETAILS && self.settings.details)
                 || (id == HOME && matches!(self.location(), Location::Home))
                 || (id == COMPUTER && matches!(self.location(), Location::Computer))
@@ -2881,6 +3150,9 @@ fn key(app: &RefCell<App>, message: &MSG) -> bool {
         return true;
     }
     let shortcut = match (vk, ctrl, alt, shift) {
+        (VK_OEM_COMMA, true, false, _) => OPEN_SETTINGS,
+        (VK_RETURN, false, false, _) if focus == app.button(WIN_E_WINDOWS) => WIN_E_WINDOWS,
+        (VK_RETURN, false, false, _) if focus == app.button(WIN_E_BETTER) => WIN_E_BETTER,
         (0x4C, true, false, _) | (VK_D, false, true, _) => {
             app.address_focus(true);
             return true;
@@ -2892,7 +3164,9 @@ fn key(app: &RefCell<App>, message: &MSG) -> bool {
             }
             return true;
         }
-        (0x46, true, false, _) | (VK_F3, false, false, _) => {
+        (0x46, true, false, _) | (VK_F3, false, false, _)
+            if *app.location() != Location::Settings =>
+        {
             unsafe {
                 SetFocus(app.search);
             }
@@ -3229,10 +3503,19 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
             0
         }
         WM_CLOSE => {
+            if matches!(app.hotkey_request, Some(HotkeyRequest::Change(_))) {
+                return 0;
+            }
             if app.busy > 0 {
-                app.note =
-                    Some("Wait for Windows to finish the file operation before closing.".into());
-                app.status();
+                let message = "Wait for Windows to finish the file operation before closing.";
+                if *app.location() == Location::Settings {
+                    if let Some(controls) = app.shortcut_controls {
+                        text(controls.state, message);
+                    }
+                } else {
+                    app.note = Some(message.into());
+                    app.status();
+                }
                 return 0;
             }
             unsafe {

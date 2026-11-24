@@ -28,4 +28,8 @@ Use a disposable fixture folder for write tests.
 6. Repeat navigation and opening files in light/dark, contrast, 100/125/150/200% DPI and on two monitors. Use Narrator. Record separate outcomes per configuration.
 7. Compare launch and first content on a clean Windows build. Compare hashes, timestamps and throughput for large copies. Test disconnected SMB, inaccessible folders, encrypted files and cloud placeholders in a test environment.
 
+## Win+E
+
+On a disposable Windows account, install with Windows File Explorer selected and verify that Win+E opens Windows. Enable BetterExplorer in Settings, close its window and press Win+E on both sides of the keyboard. BetterExplorer should open once per press and the Start menu should stay closed. Ordinary typing, Win by itself, extra-modifier chords and all other Windows shortcuts should behave normally. Sign out and back in to verify the startup option. Switch back in Settings, then verify the Windows shortcut again. Repeat an upgrade and uninstall with the helper enabled.
+
 See the [parity matrix](parity-matrix.csv) for recorded results and open verification.

@@ -23,6 +23,40 @@ function Assert-X64Executable {
     }
 }
 
+function Build-SetupLauncher {
+    param([string] $Repo, [string] $Work, [string] $Destination)
+
+    $compiler = Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+    $automation = Join-Path $env:SystemRoot 'Microsoft.NET\assembly\GAC_MSIL\System.Management.Automation\v4.0_3.0.0.0__31bf3856ad364e35\System.Management.Automation.dll'
+    foreach ($dependency in @($compiler, $automation)) {
+        if (-not [IO.File]::Exists($dependency)) { throw "Required Windows setup build dependency is missing: $dependency" }
+    }
+
+    $common = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'install-common.ps1'))
+    $import = '. (Join-Path $PSScriptRoot ''install-common.ps1'')'
+    $resources = foreach ($scriptName in @('Install', 'Uninstall')) {
+        $source = [IO.File]::ReadAllText((Join-Path $PSScriptRoot ($scriptName.ToLowerInvariant() + '.ps1')))
+        if ([regex]::Matches($source, [regex]::Escape($import)).Count -ne 1) {
+            throw "Expected one common-script import in $scriptName.ps1."
+        }
+        $embedded = $source.Replace($import, $common).Replace('$PSScriptRoot', '$BetterExplorerBundleRoot')
+        $resourcePath = Join-Path $Work "$scriptName.embedded.ps1"
+        [IO.File]::WriteAllText($resourcePath, $embedded)
+        "/resource:$resourcePath,BetterExplorer.$scriptName.ps1"
+    }
+
+    $setup = Join-Path $Destination 'Setup.exe'
+    $icon = Join-Path $Repo 'assets/bex.ico'
+    $source = Join-Path $PSScriptRoot 'SetupLauncher.cs'
+    $compilerOptions = @(
+        '/nologo', '/target:winexe', '/platform:x64', '/optimize+',
+        "/out:$setup", "/win32icon:$icon", "/reference:$automation", '/reference:System.Windows.Forms.dll'
+    )
+    & $compiler @compilerOptions @resources $source
+    if ($LASTEXITCODE -ne 0) { throw 'Setup.exe compilation failed.' }
+    Assert-X64Executable $setup
+}
+
 $repo = Split-Path -Parent $PSScriptRoot
 $documents = @('README.md', 'LICENSE', 'THIRD-PARTY-LICENSES')
 foreach ($name in $documents) { $null = Get-OwnedFileHash (Join-Path $repo $name) }
@@ -80,6 +114,7 @@ try {
     foreach ($name in @('install.ps1', 'uninstall.ps1', 'install-common.ps1')) {
         [IO.File]::Copy((Join-Path $PSScriptRoot $name), (Join-Path $install $name))
     }
+    Build-SetupLauncher -Repo $repo -Work $work -Destination $install
 
     $checksums = [ordered] @{}
     foreach ($name in $script:BetterExplorerPayload) {

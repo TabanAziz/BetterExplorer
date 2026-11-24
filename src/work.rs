@@ -295,6 +295,7 @@ pub fn scan(request: Request, latest: &AtomicU64, mut publish: impl FnMut(ScanEv
     let mut entries = Vec::new();
     let mut error = None;
     match location {
+        Location::Settings => (),
         Location::Home => {
             let places = known_places();
             entries.extend(
@@ -468,8 +469,12 @@ impl Scanner {
         }
     }
 
+    pub fn cancel(&self, id: u64) {
+        self.latest.store(id, Ordering::Relaxed);
+    }
+
     pub fn request(&self, request: Request) {
-        self.latest.store(request.id, Ordering::Relaxed);
+        self.cancel(request.id);
         let lane = if request.location.directory().is_some_and(network_path) {
             &self.remote
         } else {

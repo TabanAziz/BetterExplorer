@@ -2,6 +2,8 @@ $script:BetterExplorerPayload = @(
     'BetterExplorer.exe', 'README.md', 'LICENSE', 'THIRD-PARTY-LICENSES', 'uninstall.ps1', 'install-common.ps1'
 )
 $script:BetterExplorerInstallManifest = '.betterexplorer-install.json'
+$script:BetterExplorerWinERunKey = 'Software\Microsoft\Windows\CurrentVersion\Run'
+$script:BetterExplorerWinERunName = 'BetterExplorerWinE'
 
 function Get-OwnedFileHash {
     param([string] $Path)
@@ -10,7 +12,17 @@ function Get-OwnedFileHash {
     if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
         throw "Expected a regular file at $Path."
     }
-    (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $stream = [IO.File]::OpenRead($item.FullName)
+    try {
+        $hash = [Security.Cryptography.SHA256]::Create()
+        try {
+            [BitConverter]::ToString($hash.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
+        } finally {
+            $hash.Dispose()
+        }
+    } finally {
+        $stream.Dispose()
+    }
 }
 
 function Assert-PlainDirectory {
@@ -49,10 +61,14 @@ function Get-InstallLocations {
 }
 
 function Invoke-InstallLock {
-    param([scriptblock] $Action)
+    param([scriptblock] $Action, [string] $TestRoot)
 
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    $mutex = [Threading.Mutex]::new($false, "Global\BetterExplorer.Install.$sid")
+    $name = "Global\BetterExplorer.Install.$sid"
+    if ($TestRoot) {
+        $name = "Local\BetterExplorer.TestInstall.$sid.$([IO.Path]::GetFileName($TestRoot).ToUpperInvariant())"
+    }
+    $mutex = [Threading.Mutex]::new($false, $name)
     $acquired = $false
     try {
         try { $acquired = $mutex.WaitOne(10000) } catch [Threading.AbandonedMutexException] { $acquired = $true }
@@ -107,6 +123,109 @@ function Get-InstalledShortcutHash {
     $actual = Get-OwnedFileHash $Path
     if ($actual -ceq $Expected) { return $actual }
     return $null
+}
+
+function Test-OwnedWinERunValue {
+    param([Microsoft.Win32.RegistryKey] $Key, [string] $Executable)
+
+    if ($null -eq $Key) { return $false }
+    $name = $script:BetterExplorerWinERunName
+    $value = $Key.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    $expected = '"{0}" --win-e-listener' -f $Executable
+    $value -is [string] -and [string]::Equals($value, $expected, [StringComparison]::Ordinal) -and
+        $Key.GetValueKind($name) -eq [Microsoft.Win32.RegistryValueKind]::String
+}
+
+function Test-OwnedWinERegistration {
+    param([string] $Executable)
+
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($script:BetterExplorerWinERunKey)
+    try {
+        Test-OwnedWinERunValue $key $Executable
+    } finally {
+        if ($null -ne $key) { $key.Dispose() }
+    }
+}
+
+function Test-OtherWinERegistration {
+    param([string] $Executable)
+
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($script:BetterExplorerWinERunKey)
+    if ($null -eq $key) { return $false }
+    try {
+        ($key.GetValueNames() -icontains $script:BetterExplorerWinERunName) -and
+            -not (Test-OwnedWinERunValue $key $Executable)
+    } finally {
+        $key.Dispose()
+    }
+}
+
+function Set-LegacyWinERegistration {
+    param([string] $Executable, [bool] $Enabled)
+
+    $user = [Microsoft.Win32.Registry]::CurrentUser
+    $key = if ($Enabled) { $user.CreateSubKey($script:BetterExplorerWinERunKey) }
+        else { $user.OpenSubKey($script:BetterExplorerWinERunKey, $true) }
+    if ($null -eq $key) { return }
+    try {
+        $name = $script:BetterExplorerWinERunName
+        $owned = Test-OwnedWinERunValue $key $Executable
+        if ($Enabled -and -not $owned) {
+            if ($key.GetValueNames() -icontains $name) {
+                throw 'The Win+E startup entry belongs to a different program.'
+            }
+            $key.SetValue($name, ('"{0}" --win-e-listener' -f $Executable), [Microsoft.Win32.RegistryValueKind]::String)
+        } elseif (-not $Enabled -and $owned) {
+            $key.DeleteValue($name, $false)
+        }
+    } finally {
+        $key.Dispose()
+    }
+}
+
+function Invoke-WinEControl {
+    param([string] $Executable, [string] $Command)
+
+    $process = Start-Process -FilePath $Executable -ArgumentList $Command -PassThru -ErrorAction Stop
+    try {
+        # The control process can start a listener that stays running after setup exits.
+        if (-not $process.WaitForExit(30000)) {
+            try {
+                $process.Kill()
+                $null = $process.WaitForExit(1000)
+            } catch [InvalidOperationException] {}
+            throw "The BetterExplorer Win+E command $Command timed out."
+        }
+        $code = $process.ExitCode
+        if ($Command -eq '--win-e-enabled' -and $code -eq 2) { return $false }
+        if ($code -ne 0) { throw "The BetterExplorer Win+E command $Command returned exit code $code." }
+        return $true
+    } finally {
+        $process.Dispose()
+    }
+}
+
+function Get-InstalledWinEState {
+    param([string] $Executable, [object] $Manifest, [string] $TestRoot)
+
+    $canControl = -not $TestRoot -and $Manifest -and
+        $Manifest.PSObject.Properties['win_e_cli'] -and $Manifest.win_e_cli -eq 1 -and
+        [IO.File]::Exists($Executable)
+    $enabled = if ($canControl) { Invoke-WinEControl $Executable '--win-e-enabled' }
+        else { -not $TestRoot -and (Test-OwnedWinERegistration $Executable) }
+    [pscustomobject] @{ Enabled = $enabled; CanControl = $canControl }
+}
+
+function Restore-InstalledWinE {
+    param([string] $Executable, [bool] $CanControl)
+
+    if ($CanControl) {
+        $configured = Invoke-WinEControl $Executable '--win-e-enabled'
+        $command = if ($configured) { '--win-e-resume' } else { '--win-e-on' }
+        $null = Invoke-WinEControl $Executable $command
+    } else {
+        Set-LegacyWinERegistration $Executable $true
+    }
 }
 
 function Remove-PayloadStage {

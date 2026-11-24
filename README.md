@@ -8,13 +8,17 @@ BetterExplorer is part of the Better series with [Better Task Manager](https://g
 
 ## Use
 
-Run `BetterExplorer.exe` from the portable package or pass a folder path on the command line. To install for your Windows account, extract the install ZIP and run from its directory.
+Run BetterExplorer.exe from the portable package or pass a folder path on the command line. To install for your Windows account, extract the install ZIP and open Setup.exe. Choose which app should open with Win+E, then install.
 
-    .\install.ps1 -StartMenuShortcut
+The default for a new installation is Windows File Explorer. Open the **Settings** tab from the command bar or with Ctrl+, to change the shortcut later. Choosing BetterExplorer starts a small background helper and sets it to run at sign-in. Choosing Windows File Explorer returns the shortcut immediately. Restart and administrator rights are unnecessary.
 
-The shortcut is optional. To remove the installed program, run the bundled uninstall script.
+The same setup program accepts unattended options.
 
-    & "$env:LOCALAPPDATA\Programs\BetterExplorer\uninstall.ps1"
+    .\Setup.exe -Quiet -StartMenuShortcut -WinE BetterExplorer
+
+To remove the installed program, run Setup.exe from the extracted bundle with the uninstall option. Uninstall also removes BetterExplorer's own shortcut setting.
+
+    .\Setup.exe --uninstall
 
 - Open folders from Home or This PC, use the breadcrumb bar, or press Ctrl+L to enter a path.
 - Ctrl+T and Ctrl+W manage tabs. Use More to reorder tabs and enable tab restoration.

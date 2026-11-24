@@ -9,6 +9,10 @@ BetterExplorer targets Windows 11 x64. The reference machine runs Windows 11 Pro
 - An explicitly opened shell destination can use File Explorer for Windows-managed virtual locations. The default Windows shell remains installed and available.
 - Store per-user settings locally and keep diagnostic data opt-in. No network services or telemetry are bundled.
 
+## Win+E
+
+The Settings tab, setup and uninstall share the executable's shortcut controls. The opt-in uses a single per-user startup entry. A separate message-loop process handles Win+E when enabled. The file browser stays out of the input callback, and key presses are not stored. The listener stops when the option is turned off. The standard Windows handling applies whenever the helper is not running.
+
 ## Performance targets
 
 | Metric | Target |
@@ -25,4 +29,5 @@ Use a release binary and a generated local fixture. Measure warm launch separate
 
 - [Virtual list views](https://learn.microsoft.com/en-us/windows/win32/controls/list-view-controls-overview)
 - [Windows 11 Details pane screenshots](https://www.anoopcnair.com/show-details-pane-in-file-explorer-windows-11/)
+- [Windows low-level keyboard callback](https://learn.microsoft.com/en-us/windows/win32/winmsg/lowlevelkeyboardproc)
 - [IFileOperation](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nn-shobjidl_core-ifileoperation)

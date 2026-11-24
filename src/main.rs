@@ -5,14 +5,22 @@ mod benchmark;
 #[cfg(windows)]
 mod chrome;
 #[cfg(windows)]
+mod hotkey;
+#[cfg(windows)]
 mod preview;
 #[cfg(windows)]
 mod ui;
 
 #[cfg(windows)]
 fn main() {
-    let path = std::env::args_os()
-        .skip(1)
+    let mut args = std::env::args_os().skip(1);
+    let first = args.next();
+    if let Some(exit) = first.as_deref().and_then(hotkey::cli) {
+        std::process::exit(exit);
+    }
+    let path = first
+        .into_iter()
+        .chain(args)
         .find(|arg| arg != "--new-window")
         .map(std::path::PathBuf::from)
         .and_then(|path| std::path::absolute(path).ok());

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.1
+
+- Added a Settings tab for the optional Win+E shortcut.
+- Added the same choice to interactive setup and per-user uninstall cleanup.
+
 ## 0.1.0
 
 - Initial Windows 11 preview with native tabs, path navigation, virtual file views and name search.

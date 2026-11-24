@@ -11,7 +11,7 @@ The app measures startup from the Windows process creation timestamp to showing 
 
 The optional idle sample records process CPU time after a five-second settle period. Percentiles use nearest rank. Cold boots, controlled Windows File Explorer comparisons and transfer-throughput benchmarks are pending.
 
-## Results
+## Results for 0.1.0
 
 Windows 11 Pro 25H2 build 26200.9974, Intel Core i7-11800H, 16 GB RAM, local NTFS, 1920 × 1080 at 100% scaling and 144 Hz. Rust 1.99.1 with the MSVC x64 release profile. The benchmark windows requested no foreground activation. The executable is 1.16 MiB.
 

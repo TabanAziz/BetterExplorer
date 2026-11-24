@@ -70,3 +70,23 @@ impl Drop for Cleanup {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+
+#[test]
+fn settings_tab_is_not_saved_as_a_folder_to_restore() {
+    use better_explorer::model::Settings;
+    let first = Location::path(r"C:\Projects");
+    let second = Location::path(r"C:\Photos");
+    let mut settings = Settings::default();
+
+    settings.remember_tabs([first.clone(), Location::Settings, second.clone()], 1);
+    assert_eq!(settings.tabs, [first, second.clone()]);
+    assert_eq!(settings.active, 0);
+
+    settings.remember_tabs([Location::Settings, second.clone()], 1);
+    assert_eq!(settings.tabs, [second]);
+    assert_eq!(settings.active, 0);
+
+    settings.remember_tabs([Location::Settings], 0);
+    assert!(settings.tabs.is_empty());
+    assert_eq!(settings.active, 0);
+}
