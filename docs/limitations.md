@@ -1,9 +1,10 @@
 # Known limitations
 
 - The command bar, breadcrumbs, file list and built-in actions use native Windows controls. BetterExplorer has its own visual styling. The interface is currently in English.
-- Network discovery depends on Windows. BetterExplorer lists folders configured in each library. Home shows files opened through BetterExplorer and favorites added from the file context menu. Gallery and Explorer's undo and redo history are pending.
+- Network discovery depends on Windows. BetterExplorer lists folders configured in each library. Home shows files opened through BetterExplorer and favorites added from the file context menu. Gallery is pending.
 - The virtual list has Details, List and icon views. Date groups appear in Details. The list uses Windows file type icons. File-specific icons, thumbnails, and Explorer's folder Tiles and Content layouts are pending. The Details pane previews supported local images and text after selection.
 - Each file operation captures its target. A paste waiting in the queue may need to be repeated if another copy changes the clipboard before Windows starts it.
+- Undo and redo use the current window's file operation history. Permanent deletion, moves between volumes, and replacing or merging existing items are outside that history. Undoing an output directory checks the directory's own metadata and recycles the full directory with its contents.
 - The app does not host arbitrary Shell context-menu extensions, sharing handlers or OneDrive sync overlays. Windows file associations and properties remain available. A separate menu action shows the item in Windows File Explorer.
 - Home and This PC search the Windows index by filename prefix or the beginning of a word or phrase. Queries with punctuation use literal substring matching. Coverage follows the Windows indexing settings. Search all drives matches text anywhere in file names in readable directories and skips reparse points. Content search and Advanced Query Syntax are pending.
 - Incoming Windows file drops copy to the active folder. Outgoing file-list drags offer Copy to Windows drop targets. Direct in-window folder targeting, device-specific namespace drops and drag modifiers are pending.

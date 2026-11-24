@@ -7,6 +7,11 @@ use crate::{
     file_icons,
     home_page::{Activity, HomePage, Icon, Item},
     preview::{self, Content},
+    settings_page::{
+        self, Choice, DATE_CHOICES, DATE_FORMAT_DAY_FIRST, DATE_FORMAT_MONTH_FIRST,
+        SHORTCUT_CHOICES, WIN_E_BETTER, WIN_E_WINDOWS,
+    },
+    window_geometry::{self, WindowPosition, WindowSize},
 };
 use better_explorer::{
     model::{
@@ -145,16 +150,14 @@ const NETWORK: u16 = 180;
 const RECYCLE: u16 = 181;
 const LIBRARIES: u16 = 182;
 const OPEN_SETTINGS: u16 = 190;
-const WIN_E_WINDOWS: u16 = 191;
-const WIN_E_BETTER: u16 = 192;
 const NAVIGATION: u16 = 193;
 const SUMMARY: u16 = 205;
-const DATE_FORMAT_DAY_FIRST: u16 = 206;
-const DATE_FORMAT_MONTH_FIRST: u16 = 207;
 const RECYCLE_RESTORE: u16 = 208;
 const RECYCLE_EMPTY: u16 = 209;
 const GROUP_NONE: u16 = 214;
 const SEARCH_ALL_DRIVES: u16 = 216;
+const UNDO: u16 = 217;
+const REDO: u16 = 218;
 const GROUP_MODIFIED: u16 = 215;
 const OPEN_TERMINAL: u16 = 210;
 const FOLDER_PROPERTIES: u16 = 211;
@@ -226,7 +229,7 @@ enum Event {
     Scan(ScanEvent),
     FileIcon(file_icons::Result),
     Preview(u64, Option<Content>),
-    Boot(Settings, Vec<(PathBuf, &'static str)>),
+    KnownPlaces(Vec<(PathBuf, &'static str)>),
     SettingsError(String),
     Hotkey {
         status: Option<hotkey::Status>,
@@ -236,6 +239,7 @@ enum Event {
         result: Result<String, String>,
         refresh: bool,
         opened: Option<PathBuf>,
+        file_history: [Option<&'static str>; 2],
     },
 }
 
@@ -342,14 +346,6 @@ enum Edit {
 }
 
 #[derive(Clone, Copy)]
-struct SettingsControls {
-    heading: HWND,
-    description: HWND,
-    state: HWND,
-    date_format_heading: HWND,
-}
-
-#[derive(Clone, Copy)]
 enum HotkeyRequest {
     Read,
     Change(bool),
@@ -396,7 +392,7 @@ struct App {
     tabs: Vec<Tab>,
     active: usize,
     settings: Settings,
-    settings_controls: Option<SettingsControls>,
+    settings_controls: Option<settings_page::Page>,
     hotkey_status: Option<hotkey::Status>,
     hotkey_request: Option<HotkeyRequest>,
     hotkey_error: Option<String>,
@@ -427,6 +423,8 @@ struct App {
     events: Events,
     scanner: Option<Scanner>,
     operations: Option<SyncSender<Operation>>,
+    file_history: [Option<&'static str>; 2],
+    file_history_revision: u64,
     clipboard_write: Option<shell::ClipboardWriteReceipt>,
     keep_rows: bool,
     saved: Option<SyncSender<Settings>>,
@@ -434,12 +432,19 @@ struct App {
     save_enabled: bool,
     watcher: Option<work::Watcher>,
     booted: bool,
-    launch_path: Option<PathBuf>,
     selection_event: bool,
+    normal_position: Option<WindowPosition>,
+    sizing_start: Option<WindowSize>,
+    manually_sizing: bool,
 }
 
 impl App {
-    fn create(window: HWND, launch_path: Option<PathBuf>, save_enabled: bool) -> Self {
+    fn create(
+        window: HWND,
+        launch_path: Option<PathBuf>,
+        save_enabled: bool,
+        settings: Settings,
+    ) -> Self {
         let mut buttons = Vec::new();
         for (id, label) in [
             (NEW_TAB, "New tab"),
@@ -495,7 +500,29 @@ impl App {
             0,
         );
         let dpi = unsafe { GetDpiForWindow(window) }.max(96);
-        let colors = Palette::read(ThemePreference::System);
+        let colors = Palette::read(settings.theme);
+        let restore_tabs = launch_path.is_none()
+            && !std::env::args_os().any(|arg| arg == "--new-window")
+            && settings.restore_tabs
+            && !settings.tabs.is_empty();
+        let tabs: Vec<_> = if restore_tabs {
+            settings
+                .tabs
+                .iter()
+                .take(TAB_LIMIT)
+                .cloned()
+                .map(Tab::new)
+                .collect()
+        } else {
+            vec![Tab::new(
+                launch_path.map(Location::Folder).unwrap_or_default(),
+            )]
+        };
+        let active = if restore_tabs {
+            settings.active.min(tabs.len() - 1)
+        } else {
+            0
+        };
         let mut app = Self {
             window,
             buttons,
@@ -525,14 +552,9 @@ impl App {
             brushes: [null_mut(); 4],
             dpi,
             colors,
-            tabs: vec![Tab::new(
-                launch_path
-                    .clone()
-                    .map(Location::Folder)
-                    .unwrap_or_default(),
-            )],
-            active: 0,
-            settings: Settings::default(),
+            tabs,
+            active,
+            settings,
             settings_controls: None,
             hotkey_status: None,
             hotkey_request: None,
@@ -564,6 +586,8 @@ impl App {
             events: Arc::new(Mutex::new(VecDeque::new())),
             scanner: None,
             operations: None,
+            file_history: [None; 2],
+            file_history_revision: 0,
             clipboard_write: None,
             keep_rows: false,
             saved: None,
@@ -571,8 +595,10 @@ impl App {
             save_enabled,
             watcher: None,
             booted: false,
-            launch_path,
             selection_event: false,
+            normal_position: WindowPosition::normal(window),
+            sizing_start: None,
+            manually_sizing: false,
         };
         unsafe {
             better_explorer::scroll::install(list);
@@ -610,7 +636,8 @@ impl App {
             send(list, LVM_INSERTCOLUMNW, index, &column as *const _ as isize);
         }
         app.apply_dpi(dpi);
-        app.apply_theme();
+        app.update_theme_controls();
+        app.update_view();
         let cue = wide("Search this folder");
         send(app.search, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
         unsafe {
@@ -634,6 +661,7 @@ impl App {
         std::thread::Builder::new()
             .name("Windows file operations".into())
             .spawn(move || {
+                let mut history = shell::History::default();
                 for operation in receiver {
                     let refresh = operation.updates_listing();
                     let opened = if let Operation::Open(path) = &operation {
@@ -641,7 +669,7 @@ impl App {
                     } else {
                         None
                     };
-                    let result = shell::run(owner, operation);
+                    let result = history.run(owner, operation);
                     let opened = opened.filter(|_| result.is_ok());
                     publish(
                         &operation_queue,
@@ -650,6 +678,7 @@ impl App {
                             result,
                             refresh,
                             opened,
+                            file_history: [history.undo_label(), history.redo_label()],
                         },
                     );
                 }
@@ -665,7 +694,7 @@ impl App {
                     publish(
                         &settings_queue,
                         owner,
-                        Event::Boot(read_settings(), work::known_places()),
+                        Event::KnownPlaces(work::known_places()),
                     );
                     while let Ok(settings) = receiver.recv() {
                         if let Err(error) = write_settings(&settings) {
@@ -777,13 +806,8 @@ impl App {
         for control in [self.title, self.detail_title, self.header] {
             send(control, WM_SETFONT, self.fonts[1] as usize, 1);
         }
-        if let Some(controls) = self.settings_controls {
-            for control in [controls.heading, controls.date_format_heading] {
-                send(control, WM_SETFONT, self.fonts[1] as usize, 1);
-            }
-            for control in [controls.state, controls.description] {
-                send(control, WM_SETFONT, self.fonts[0] as usize, 1);
-            }
+        if let Some(controls) = &mut self.settings_controls {
+            controls.set_fonts(dpi, self.fonts);
         }
         for handle in old {
             if !handle.is_null() {
@@ -823,6 +847,10 @@ impl App {
 
     fn apply_theme(&mut self) {
         self.colors = Palette::read(self.settings.theme);
+        self.update_theme_controls();
+    }
+
+    fn update_theme_controls(&mut self) {
         let old = std::mem::replace(&mut self.brushes, unsafe {
             [
                 CreateSolidBrush(self.colors.chrome),
@@ -927,7 +955,7 @@ impl App {
             WIN_E_WINDOWS
         };
         let focus = if self.hotkey_request.is_some() {
-            self.button(OPEN_SETTINGS)
+            self.button(TAB_START + self.active as u16)
         } else {
             self.button(focus)
         };
@@ -940,40 +968,49 @@ impl App {
         if self.settings_controls.is_some() {
             return;
         }
-        let label = |caption| new_control(self.window, "Static", caption, 0, SS_NOPREFIX, 0);
-        let controls = SettingsControls {
-            heading: label("What opens when you press Win+E?"),
-            description: label(
-                "BetterExplorer uses a background shortcut helper that starts at sign-in.",
-            ),
-            state: label(""),
-            date_format_heading: label("Date modified format"),
-        };
-        for (control, font) in [
-            (controls.heading, self.fonts[1]),
-            (controls.description, self.fonts[0]),
-            (controls.state, self.fonts[0]),
-            (controls.date_format_heading, self.fonts[1]),
-        ] {
-            send(control, WM_SETFONT, font as usize, 0);
+        self.settings_controls = Some(settings_page::Page::create(
+            self.window,
+            self.dpi,
+            self.fonts,
+        ));
+        for choice in SHORTCUT_CHOICES.into_iter().chain(DATE_CHOICES) {
+            self.set_dynamic_button(choice.id, choice.caption);
         }
-        self.set_dynamic_button(WIN_E_WINDOWS, "Windows File Explorer");
-        self.set_dynamic_button(WIN_E_BETTER, "BetterExplorer");
-        self.set_dynamic_button(DATE_FORMAT_DAY_FIRST, "DD.MM.YYYY");
-        self.set_dynamic_button(DATE_FORMAT_MONTH_FIRST, "MM/DD/YYYY");
-        self.settings_controls = Some(controls);
         self.update_modified_date_controls();
     }
 
-    fn update_modified_date_controls(&self) {
-        for id in [DATE_FORMAT_DAY_FIRST, DATE_FORMAT_MONTH_FIRST] {
-            let control = self.button(id);
-            if !control.is_null() {
-                set_enabled(control, self.booted);
-                unsafe {
-                    InvalidateRect(control, null(), 0);
-                }
+    fn selected_setting(&self, id: u16) -> bool {
+        match id {
+            WIN_E_WINDOWS | WIN_E_BETTER => self.hotkey_status.as_ref().is_some_and(|status| {
+                !status.another_copy
+                    && (status.configured || status.running) == (id == WIN_E_BETTER)
+            }),
+            DATE_FORMAT_DAY_FIRST => {
+                self.settings.modified_date_format == ModifiedDateFormat::DayMonthYear
             }
+            DATE_FORMAT_MONTH_FIRST => {
+                self.settings.modified_date_format == ModifiedDateFormat::MonthDayYear
+            }
+            _ => false,
+        }
+    }
+
+    fn update_setting_choice(&self, choice: Choice, enabled: bool) {
+        let button = self.button(choice.id);
+        if button.is_null() {
+            return;
+        }
+        let name = choice.accessible_name(self.selected_setting(choice.id));
+        if read(button) != OsStr::new(&name) {
+            text(button, name);
+        }
+        set_enabled(button, enabled);
+        unsafe { InvalidateRect(button, null(), 0) };
+    }
+
+    fn update_modified_date_controls(&self) {
+        for choice in DATE_CHOICES {
+            self.update_setting_choice(choice, self.booted);
         }
     }
 
@@ -1015,40 +1052,35 @@ impl App {
     }
 
     fn update_shortcut_controls(&self) {
-        let Some(controls) = self.settings_controls else {
+        let Some(controls) = &self.settings_controls else {
             return;
         };
         let message = if let Some(error) = &self.hotkey_error {
-            format!("Win+E setting: {error}")
+            error.clone()
         } else {
             match (self.hotkey_request, self.hotkey_status.as_ref()) {
-                (Some(HotkeyRequest::Read), _) => "Checking the current Win+E setting…".into(),
-                (Some(HotkeyRequest::Change(_)), _) => "Updating Win+E…".into(),
+                (Some(HotkeyRequest::Read), _) => "Checking the shortcut…".into(),
+                (Some(HotkeyRequest::Change(_)), _) => "Updating the shortcut…".into(),
                 (_, Some(status)) if status.another_copy => {
-                    "Win+E is managed by another BetterExplorer copy.".into()
+                    "Another BetterExplorer copy manages this shortcut.".into()
                 }
                 (_, Some(status)) if status.configured && status.running => {
-                    "Active in this session. Windows Startup Apps controls launch at sign-in."
-                        .into()
+                    "Helper running. See Windows Startup Apps for sign-in.".into()
                 }
                 (_, Some(status)) if status.configured => {
-                    "Registered for sign-in. Select BetterExplorer to start the helper now.".into()
+                    "Starts at sign-in. Select BetterExplorer to start now.".into()
                 }
-                (_, Some(status)) if status.running => {
-                    "The BetterExplorer shortcut helper is running.".into()
+                (_, Some(status)) if status.running => "Helper running for this session.".into(),
+                (_, Some(_)) => {
+                    "Selecting BetterExplorer starts a helper and runs it at sign-in.".into()
                 }
-                (_, Some(_)) => "Windows File Explorer handles Win+E.".into(),
                 _ => String::new(),
             }
         };
-        text(controls.state, message);
+        controls.set_status(message);
         let available = self.hotkey_request.is_none();
-        for id in [WIN_E_WINDOWS, WIN_E_BETTER] {
-            let control = self.button(id);
-            set_enabled(control, available);
-            unsafe {
-                InvalidateRect(control, null(), 0);
-            }
+        for choice in SHORTCUT_CHOICES {
+            self.update_setting_choice(choice, available);
         }
     }
 
@@ -1178,7 +1210,7 @@ impl App {
             right -= width;
             pos(id, right, d(83), width, d(31));
             right -= d(4);
-            set_visible(self.button(id), id == OPEN_SETTINGS || !settings_tab);
+            set_visible(self.button(id), !settings_tab);
         }
         for &(id, _, width) in COMMANDS {
             if matches!(id, OPEN_SETTINGS | DETAILS) {
@@ -1198,13 +1230,18 @@ impl App {
         }
 
         let sidebar_width = self.sidebar_width(w);
+        let content_top = if settings_tab {
+            settings_page::CONTENT_TOP
+        } else {
+            122
+        };
         let status_y = if settings_tab { h } else { h - d(27) };
         move_to(
             self.navigation,
             d(RESIZE_EDGE),
-            d(126),
+            d(content_top + 4),
             sidebar_width - d(RESIZE_EDGE + 5),
-            status_y - d(130),
+            status_y - d(content_top + 8),
         );
         let listing_right = if self.settings.details && !settings_tab {
             w - d(226)
@@ -1216,7 +1253,7 @@ impl App {
         let drive_mode = self.drive_cards();
         let section = !matches!(self.location(), Location::Folder(_));
         let list_y = if section { 155 } else { 123 };
-        set_visible(self.title, section && !home_tab);
+        set_visible(self.title, section && !settings_tab && !home_tab);
         set_visible(self.summary, section && !settings_tab && !home_tab);
         if let Some(home) = &self.home {
             home.set_visible(home_tab);
@@ -1295,46 +1332,11 @@ impl App {
         set_visible(self.status, !settings_tab);
         set_visible(self.button(QUICK_DETAILS), !settings_tab && !home_tab);
         set_visible(self.button(QUICK_ICONS), !settings_tab && !home_tab);
-        if let Some(controls) = self.settings_controls {
-            for control in [
-                controls.heading,
-                controls.description,
-                controls.state,
-                self.button(WIN_E_WINDOWS),
-                self.button(WIN_E_BETTER),
-                controls.date_format_heading,
-                self.button(DATE_FORMAT_DAY_FIRST),
-                self.button(DATE_FORMAT_MONTH_FIRST),
-            ] {
-                set_visible(control, settings_tab);
-            }
-            if settings_tab {
-                let x = content_x + d(13);
-                let span = (w - x - d(20)).min(d(690));
-                move_to(controls.heading, x, d(184), span, d(27));
-                let gap = d(10);
-                let windows_width = d(221).min((span - gap) * 11 / 20);
-                pos(WIN_E_WINDOWS, x, d(218), windows_width, d(36));
-                pos(
-                    WIN_E_BETTER,
-                    x + windows_width + gap,
-                    d(218),
-                    d(188).min(span - windows_width - gap),
-                    d(36),
-                );
-                move_to(controls.state, x, d(266), span, d(49));
-                move_to(controls.description, x, d(319), span, d(48));
-                move_to(controls.date_format_heading, x, d(373), span, d(27));
-                let format_width = d(136).min((span - gap) / 2);
-                pos(DATE_FORMAT_DAY_FIRST, x, d(402), format_width, d(36));
-                pos(
-                    DATE_FORMAT_MONTH_FIRST,
-                    x + format_width + gap,
-                    d(402),
-                    format_width,
-                    d(36),
-                );
-            }
+        if let Some(controls) = &self.settings_controls {
+            controls.layout(
+                settings_tab.then(|| settings_page::Layout::new(sidebar_width, w, dpi)),
+                |id| self.button(id),
+            );
         }
         let offer_all_drives = !self.scanning
             && matches!(
@@ -1476,8 +1478,6 @@ impl App {
             }
         }
         unsafe {
-            InvalidateRect(self.window, null(), 0);
-            InvalidateRect(self.header, null(), 0);
             RedrawWindow(
                 self.window,
                 null(),
@@ -1513,18 +1513,20 @@ impl App {
     fn paint(&self) {
         let bounds = rect(self.window);
         let d = |value| scale(value, self.dpi);
-        let footer_height = if *self.location() == Location::Settings {
-            0
+        let settings_tab = *self.location() == Location::Settings;
+        let content_top = if settings_tab {
+            settings_page::CONTENT_TOP
         } else {
-            d(28)
+            122
         };
+        let footer_height = if settings_tab { 0 } else { d(28) };
         let mut paint = unsafe { zeroed() };
         let dc = unsafe { BeginPaint(self.window, &mut paint) };
         fill(dc, &bounds, self.colors.content);
         fill(
             dc,
             &RECT {
-                bottom: d(122),
+                bottom: d(content_top),
                 ..bounds
             },
             self.colors.chrome,
@@ -1532,7 +1534,7 @@ impl App {
         fill(
             dc,
             &RECT {
-                top: d(122),
+                top: d(content_top),
                 right: self.sidebar_width(bounds.right),
                 bottom: bounds.bottom - footer_height,
                 ..bounds
@@ -1589,7 +1591,10 @@ impl App {
                 self.colors.muted,
             );
         }
-        for y in [37, 78, 121] {
+        for y in [37, 78, 121]
+            .into_iter()
+            .take(if settings_tab { 2 } else { 3 })
+        {
             fill(
                 dc,
                 &RECT {
@@ -1600,7 +1605,7 @@ impl App {
                 self.colors.edge,
             );
         }
-        let right = if self.settings.details && *self.location() != Location::Settings {
+        let right = if self.settings.details && !settings_tab {
             bounds.right - d(226)
         } else {
             0
@@ -1610,7 +1615,7 @@ impl App {
                 fill(
                     dc,
                     &RECT {
-                        top: d(122),
+                        top: d(content_top),
                         left: x,
                         right: x + 1,
                         bottom: bounds.bottom - footer_height,
@@ -1618,6 +1623,10 @@ impl App {
                     self.colors.edge,
                 );
             }
+        }
+        if settings_tab {
+            settings_page::Layout::new(self.sidebar_width(bounds.right), bounds.right, self.dpi)
+                .paint(dc, &self.colors);
         }
         if right > 0 {
             if let Some(Content::Bitmap(image)) = &self.preview {
@@ -1945,18 +1954,12 @@ impl App {
         } else {
             item.glyph()
         } {
-            let icon_color = if !item.enabled {
-                self.colors.muted
-            } else if matches!(
-                item.id,
-                VIEW | SORT | GROUP_SUBMENU | NEW | RENAME | REFRESH | RECYCLE_RESTORE
-            ) || item.checked
-            {
-                self.colors.accent
+            let icon_x = r.left + d(11);
+            if !item.enabled || self.colors.contrast {
+                draw_glyph(dc, glyph, icon_x, icon_y, scale_icon, color);
             } else {
-                self.colors.text
-            };
-            draw_glyph(dc, glyph, r.left + d(11), icon_y, scale_icon, icon_color);
+                draw_menu_glyph(dc, glyph, icon_x, icon_y, scale_icon, self.colors.dark);
+            }
         }
         if item.submenu && self.colors.dark {
             let middle = (r.top + r.bottom) / 2;
@@ -2398,73 +2401,12 @@ impl App {
                     self.status();
                 }
                 Event::Preview(..) => (),
-                Event::Boot(settings, places) => {
-                    let listing_changed = match self.location() {
-                        Location::Home => self.settings.pins != settings.pins,
-                        Location::Folder(path) => {
-                            self.settings.hidden != settings.hidden
-                                || self.settings.folder_order(path) != settings.folder_order(path)
-                        }
-                        Location::Search { .. } | Location::PcSearch { .. } => {
-                            self.settings.hidden != settings.hidden
-                        }
-                        Location::Computer | Location::Settings | Location::Namespace { .. } => {
-                            false
-                        }
-                    };
-                    let view_changed = self.dest().is_some_and(|path| {
-                        self.settings.views.get(&path) != settings.views.get(&path)
-                    });
-                    let details_changed = self.settings.details != settings.details;
-                    let date_format_changed =
-                        self.settings.modified_date_format != settings.modified_date_format;
+                Event::KnownPlaces(places) => {
                     self.places = places;
-                    self.settings = settings;
                     self.update_sidebar();
                     self.update_home();
-                    let restore = self.launch_path.is_none()
-                        && !std::env::args_os().any(|arg| arg == "--new-window")
-                        && self.id == 1
-                        && self.tabs.len() == 1
-                        && matches!(self.location(), Location::Home)
-                        && !self.editing_address
-                        && self.settings.restore_tabs
-                        && !self.settings.tabs.is_empty();
                     self.booted = true;
-                    self.apply_theme();
                     self.update_modified_date_controls();
-                    if date_format_changed {
-                        unsafe {
-                            InvalidateRect(self.list, null(), 0);
-                        }
-                    }
-                    if restore {
-                        self.tabs = self
-                            .settings
-                            .tabs
-                            .iter()
-                            .take(TAB_LIMIT)
-                            .cloned()
-                            .map(Tab::new)
-                            .collect();
-                        self.active = self.settings.active.min(self.tabs.len() - 1);
-                        self.update_view();
-                        self.refresh();
-                    } else {
-                        if view_changed {
-                            self.update_view();
-                            self.rebuild_grouping();
-                        }
-                        if listing_changed {
-                            self.reload(true);
-                        } else {
-                            if view_changed || details_changed {
-                                self.layout();
-                            }
-                            self.update_preview();
-                            self.status();
-                        }
-                    }
                 }
                 Event::Hotkey { status, error } => {
                     self.hotkey_request = None;
@@ -2480,7 +2422,12 @@ impl App {
                     result,
                     refresh,
                     opened,
+                    file_history,
                 } => {
+                    self.file_history = file_history;
+                    if refresh {
+                        self.file_history_revision = self.file_history_revision.wrapping_add(1);
+                    }
                     if let Some(path) = opened {
                         self.settings.record_recent(path);
                         self.update_home();
@@ -3385,6 +3332,13 @@ impl App {
                     self.operation(Operation::Paste { target, receipt });
                 }
             }
+            UNDO | REDO => {
+                self.operation(if id == UNDO {
+                    Operation::Undo
+                } else {
+                    Operation::Redo
+                });
+            }
             RECYCLE_RESTORE | DELETE | PERMANENT if self.recycling() => {
                 let keys: Vec<_> = self
                     .selected_indices()
@@ -3875,8 +3829,9 @@ impl MenuItem {
             NEW_FOLDER => Glyph::Folder,
             NEW_TEXT => Glyph::Document,
             OPEN => Glyph::Forward,
-            OPEN_TAB => Glyph::Add,
-            OPEN_WINDOW | REVEAL => Glyph::Restore,
+            OPEN_TAB => Glyph::NewTab,
+            OPEN_WINDOW => Glyph::Restore,
+            REVEAL => Glyph::Folder,
             OPEN_WITH => Glyph::Document,
             OPEN_TERMINAL => Glyph::Terminal,
             CUT => Glyph::Cut,
@@ -3884,17 +3839,35 @@ impl MenuItem {
             PASTE => Glyph::Paste,
             RENAME => Glyph::Rename,
             DELETE | RECYCLE_EMPTY => Glyph::Delete,
-            SHORTCUT | COPY_PATH | FOLDER_COPY_PATH => Glyph::Link,
-            PIN | FAVORITE => Glyph::Pin,
+            UNDO | RECYCLE_RESTORE => Glyph::Undo,
+            REDO => Glyph::Redo,
+            SHORTCUT => Glyph::Shortcut,
+            COPY_PATH | FOLDER_COPY_PATH => Glyph::Link,
+            PIN => Glyph::Pushpin,
+            FAVORITE => Glyph::Pin,
             COMPRESS | EXTRACT => Glyph::Archive,
             PROPERTIES | FOLDER_PROPERTIES => Glyph::Settings,
-            RECYCLE_RESTORE => Glyph::Restore,
             _ => return None,
         })
     }
 }
 
 impl App {
+    fn file_history_items(&self) -> [MenuItem; 2] {
+        let [undo, redo] = self.file_history;
+        [
+            (UNDO, "Undo", "Ctrl+Z", undo),
+            (REDO, "Redo", "Ctrl+Y", redo),
+        ]
+        .map(|(id, verb, shortcut, action)| {
+            let label = match action {
+                Some(action) => format!("{verb} {action}\t{shortcut}"),
+                None => format!("{verb}\t{shortcut}"),
+            };
+            MenuItem::new(id, &label).enabled(action.is_some() && self.busy == 0)
+        })
+    }
+
     fn menu(&mut self, id: u16) -> Vec<MenuItem> {
         let item = MenuItem::new;
         let line = MenuItem::separator;
@@ -4045,10 +4018,14 @@ impl App {
                 items
             }
             CONTEXT => {
+                let [undo, redo] = self.file_history_items();
                 if self.recycling() && self.first_selected().is_none() {
                     return vec![
                         item(RECYCLE_EMPTY, "Empty Recycle Bin").enabled(!self.rows.is_empty()),
                         item(REFRESH, "Refresh\tF5"),
+                        line(),
+                        undo,
+                        redo,
                     ];
                 }
                 if let Some(entry) = self.first_selected() {
@@ -4067,6 +4044,9 @@ impl App {
                                 line(),
                                 item(RECYCLE_EMPTY, "Empty Recycle Bin"),
                                 item(REFRESH, "Refresh\tF5"),
+                                line(),
+                                undo,
+                                redo,
                             ]
                         } else {
                             vec![
@@ -4092,6 +4072,9 @@ impl App {
                         item(RENAME, "Rename\tF2").enabled(!entry.location && count == 1),
                         item(DELETE, "Delete\tDel").enabled(!entry.location),
                         item(COPY_PATH, "Copy as path").enabled(count == 1),
+                        line(),
+                        undo,
+                        redo,
                         line(),
                     ]);
                     if entry.directory {
@@ -4144,6 +4127,8 @@ impl App {
                     items.extend([
                         item(REFRESH, "Refresh\tF5"),
                         line(),
+                        undo,
+                        redo,
                         item(PASTE, "Paste\tCtrl+V").enabled(paste),
                         MenuItem::submenu(NEW, "New", self.menu(NEW)).enabled(destination),
                     ]);
@@ -4185,8 +4170,6 @@ impl App {
             MORE => Some(Glyph::More),
             DETAILS | QUICK_ICONS => Some(Glyph::Details),
             OPEN_SETTINGS => Some(Glyph::Settings),
-            WIN_E_WINDOWS => Some(Glyph::Drive),
-            WIN_E_BETTER => Some(Glyph::Folder),
             PATH => Some(match self.location() {
                 Location::Home => Glyph::Home,
                 Location::Settings => Glyph::Settings,
@@ -4284,29 +4267,10 @@ impl App {
             label: (id != DETAILS || !self.compact_toolbar(rect(self.window).right))
                 && (crumb
                     || tab
-                    || matches!(
-                        id,
-                        NEW | SORT
-                            | VIEW
-                            | FILTER
-                            | DETAILS
-                            | OPEN_SETTINGS
-                            | WIN_E_WINDOWS
-                            | WIN_E_BETTER
-                    )
+                    || matches!(id, NEW | SORT | VIEW | FILTER | DETAILS | OPEN_SETTINGS)
                     || glyph.is_none()),
-            left: crumb || tab || matches!(id, WIN_E_WINDOWS | WIN_E_BETTER),
+            left: crumb || tab,
             active: (tab && id == TAB_START + self.active as u16)
-                || (id == OPEN_SETTINGS && *self.location() == Location::Settings)
-                || (matches!(id, WIN_E_WINDOWS | WIN_E_BETTER)
-                    && self.hotkey_status.as_ref().is_some_and(|status| {
-                        !status.another_copy
-                            && (status.configured || status.running) == (id == WIN_E_BETTER)
-                    }))
-                || (id == DATE_FORMAT_DAY_FIRST
-                    && self.settings.modified_date_format == ModifiedDateFormat::DayMonthYear)
-                || (id == DATE_FORMAT_MONTH_FIRST
-                    && self.settings.modified_date_format == ModifiedDateFormat::MonthDayYear)
                 || (id == DETAILS && self.settings.details)
                 || (id == HOME && matches!(self.location(), Location::Home))
                 || (id == COMPUTER && matches!(self.location(), Location::Computer))
@@ -4875,6 +4839,68 @@ mod context_menu_tests {
             }
         }
     }
+
+    #[test]
+    fn control_z_and_y_queue_history_commands_and_preserve_text_editing() {
+        unsafe {
+            let controls = INITCOMMONCONTROLSEX {
+                dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
+                dwICC: ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES,
+            };
+            assert_ne!(InitCommonControlsEx(&controls), 0);
+            let window = CreateWindowExW(
+                0,
+                wide("Static").as_ptr(),
+                null(),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                960,
+                608,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null(),
+            );
+            assert!(!window.is_null());
+            let app = RefCell::new(App::create(
+                window,
+                Some(r"C:\Example".into()),
+                false,
+                Settings::default(),
+            ));
+            let (operations, pending) = sync_channel(2);
+            app.borrow_mut().operations = Some(operations);
+            let mut previous = [0; 256];
+            assert_ne!(GetKeyboardState(previous.as_mut_ptr()), 0);
+            let mut keys = [0; 256];
+            keys[VK_CONTROL as usize] = 0x80;
+            assert_ne!(SetKeyboardState(keys.as_ptr()), 0);
+            let press = |character| {
+                key(
+                    &app,
+                    &MSG {
+                        message: WM_KEYDOWN,
+                        wParam: usize::from(character),
+                        ..zeroed()
+                    },
+                )
+            };
+            let undo = press(b'Z') && matches!(pending.try_recv(), Ok(Operation::Undo));
+            let redo = press(b'Y') && matches!(pending.try_recv(), Ok(Operation::Redo));
+            let search = app.borrow().search;
+            SetFocus(search);
+            let edit_keeps_shortcuts = GetFocus() == search && !press(b'Z') && !press(b'Y');
+            SetKeyboardState(previous.as_ptr());
+            DestroyWindow(window);
+            assert!(undo, "Ctrl+Z must queue the file undo command");
+            assert!(redo, "Ctrl+Y must queue the file redo command");
+            assert!(
+                edit_keeps_shortcuts,
+                "a text editor handles its own shortcuts"
+            );
+        }
+    }
 }
 
 fn show_menu(app: &RefCell<App>, id: u16, coordinates: LPARAM) {
@@ -4885,6 +4911,7 @@ fn show_menu(app: &RefCell<App>, id: u16, coordinates: LPARAM) {
     let painted = !state.colors.contrast;
     let menu_color = state.colors.chrome;
     let window = state.window;
+    let file_history_revision = state.file_history_revision;
     let selected_targets = |state: &App| {
         state
             .selected_indices()
@@ -4982,8 +5009,16 @@ fn show_menu(app: &RefCell<App>, id: u16, coordinates: LPARAM) {
             let unchanged = target.is_none_or(|(location, paths)| {
                 state.location() == &location && selected_targets(&state) == paths
             });
-            if unchanged {
-                state.command(selected as u16);
+            let command = selected as u16;
+            if matches!(command, UNDO | REDO) {
+                if state.busy == 0 && state.file_history_revision == file_history_revision {
+                    state.command(command);
+                } else {
+                    state.note = Some("File history changed. Open the menu again.".into());
+                    state.status();
+                }
+            } else if unchanged {
+                state.command(command);
             }
         }
     }
@@ -5007,7 +5042,7 @@ fn key(app: &RefCell<App>, message: &MSG) -> bool {
     } else {
         null_mut()
     };
-    let typing = focus == app.address || focus == app.search || focus == edit;
+    let typing = focus == app.address || focus == app.search || (!edit.is_null() && focus == edit);
     let down = |key: u16| unsafe { GetKeyState(key as i32) < 0 };
     let ctrl = down(VK_CONTROL);
     let alt = down(VK_MENU);
@@ -5079,6 +5114,8 @@ fn key(app: &RefCell<App>, message: &MSG) -> bool {
         (0x58, true, false, false) if !typing => CUT,
         (0x43, true, false, false) if !typing => COPY,
         (0x56, true, false, false) if !typing => PASTE,
+        (0x5A, true, false, false) if !typing => UNDO,
+        (0x59, true, false, false) if !typing => REDO,
         (VK_DELETE, false, false, false) if focus == app.list => DELETE,
         (VK_DELETE, false, false, true) if focus == app.list => PERMANENT,
         (VK_F2, false, false, _) if focus == app.list => RENAME,
@@ -5100,6 +5137,9 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
     if matches!(message, WM_NCCALCSIZE | WM_NCPAINT) {
         return 0;
     }
+    if message == WM_ERASEBKGND {
+        return 1;
+    }
     if message == WM_NCACTIVATE {
         return unsafe { DefWindowProcW(window, message, wp, -1) };
     }
@@ -5118,7 +5158,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
             unsafe {
                 SetTextColor(
                     wp as HDC,
-                    if matches!(id, STATUS | SUMMARY) {
+                    if matches!(id, STATUS | SUMMARY) || settings_page::is_muted_label(id) {
                         colors.muted
                     } else {
                         colors.text
@@ -5316,7 +5356,6 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
             app.paint();
             0
         }
-        WM_ERASEBKGND => 1,
         WM_NCHITTEST => app.hit_test(lp),
         WM_LBUTTONDOWN => {
             let x = lp as i16 as i32;
@@ -5347,10 +5386,40 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
             }
             0
         }
-        WM_SIZE | WM_EXITSIZEMOVE => {
-            let slot = app.file_icon_slot();
-            app.file_icons.viewport_changed(slot);
-            app.layout();
+        WM_ENTERSIZEMOVE => {
+            app.sizing_start = WindowSize::normal(window);
+            0
+        }
+        WM_SIZING => {
+            if !app.manually_sizing {
+                app.manually_sizing = true;
+                drop(app);
+                set_composition(window, true);
+            }
+            1
+        }
+        WM_EXITSIZEMOVE => {
+            let start = app.sizing_start.take();
+            if std::mem::take(&mut app.manually_sizing) {
+                drop(app);
+                set_composition(window, false);
+                if let Some(size) = WindowSize::normal(window).filter(|size| Some(*size) != start) {
+                    let _ = size.save();
+                }
+            }
+            0
+        }
+        WM_SIZE => {
+            if wp != SIZE_MINIMIZED as WPARAM {
+                app.normal_position = WindowPosition::normal(window).or(app.normal_position);
+                let slot = app.file_icon_slot();
+                app.file_icons.viewport_changed(slot);
+                app.layout();
+            }
+            0
+        }
+        WM_MOVE => {
+            app.normal_position = WindowPosition::normal(window).or(app.normal_position);
             0
         }
         WM_THEMECHANGED | WM_SETTINGCHANGE | WM_SYSCOLORCHANGE => {
@@ -5371,23 +5440,18 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
                     SWP_NOACTIVATE | SWP_NOZORDER,
                 );
             }
+            app.normal_position = WindowPosition::normal(window).or(app.normal_position);
             app.layout();
             0
         }
         WM_GETMINMAXINFO => {
             let info = unsafe { &mut *(lp as *mut MINMAXINFO) };
-            info.ptMinTrackSize.x = scale(552, app.dpi);
-            info.ptMinTrackSize.y = scale(450, app.dpi);
-            unsafe {
-                let monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
-                let mut bounds: MONITORINFO = zeroed();
-                bounds.cbSize = size_of::<MONITORINFO>() as u32;
-                if GetMonitorInfoW(monitor, &mut bounds) != 0 {
-                    info.ptMaxPosition.x = bounds.rcWork.left - bounds.rcMonitor.left;
-                    info.ptMaxPosition.y = bounds.rcWork.top - bounds.rcMonitor.top;
-                    info.ptMaxSize.x = bounds.rcWork.right - bounds.rcWork.left;
-                    info.ptMaxSize.y = bounds.rcWork.bottom - bounds.rcWork.top;
-                }
+            if let Some(bounds) = window_geometry::window_monitor_info(window) {
+                info.ptMinTrackSize = WindowSize::minimum(app.dpi, bounds.rcWork);
+                info.ptMaxPosition.x = bounds.rcWork.left - bounds.rcMonitor.left;
+                info.ptMaxPosition.y = bounds.rcWork.top - bounds.rcMonitor.top;
+                info.ptMaxSize.x = bounds.rcWork.right - bounds.rcWork.left;
+                info.ptMaxSize.y = bounds.rcWork.bottom - bounds.rcWork.top;
             }
             0
         }
@@ -5410,6 +5474,16 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
                 app.draw_sidebar(draw);
             } else if (DRIVE_START..DRIVE_START + DRIVE_LIMIT as u16).contains(&id) {
                 app.draw_drive(draw, (id - DRIVE_START) as usize);
+            } else if let Some(choice) = settings_page::choice(id) {
+                settings_page::draw_choice(
+                    draw,
+                    choice,
+                    &app.colors,
+                    app.dpi,
+                    app.fonts,
+                    app.selected_setting(id),
+                    app.hover == draw.hwndItem,
+                );
             } else {
                 let style = app.button_style(id, draw.hwndItem);
                 draw_button(
@@ -5452,14 +5526,19 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
             if app.busy > 0 {
                 let message = "Wait for Windows to finish the file operation before closing.";
                 if *app.location() == Location::Settings {
-                    if let Some(controls) = app.settings_controls {
-                        text(controls.state, message);
+                    if let Some(controls) = &app.settings_controls {
+                        controls.set_status(message);
                     }
                 } else {
                     app.note = Some(message.into());
                     app.status();
                 }
                 return 0;
+            }
+            let position = WindowPosition::normal(window).or(app.normal_position);
+            drop(app);
+            if let Some(position) = position {
+                let _ = position.save();
             }
             unsafe {
                 KillTimer(window, SETTINGS_TIMER);
@@ -5472,6 +5551,20 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
             drop(app);
             unsafe { DefWindowProcW(window, message, wp, lp) }
         }
+    }
+}
+
+fn set_composition(window: HWND, enabled: bool) {
+    unsafe {
+        let style = GetWindowLongPtrW(window, GWL_EXSTYLE);
+        let composited = WS_EX_COMPOSITED as isize;
+        // Present the parent and native children together when the window first appears or resizes.
+        let style = if enabled {
+            style | composited
+        } else {
+            style & !composited
+        };
+        SetWindowLongPtrW(window, GWL_EXSTYLE, style);
     }
 }
 
@@ -5525,6 +5618,10 @@ unsafe extern "system" fn button_proc(
             }
         } else if msg == WM_MOUSELEAVE {
             PostMessageW(GetParent(window), HOVER, window as usize, 1);
+        } else if matches!(msg, WM_SETFOCUS | WM_KILLFOCUS)
+            && settings_page::choice(GetDlgCtrlID(window) as u16).is_some()
+        {
+            InvalidateRect(window, null(), 0);
         }
         DefSubclassProc(window, msg, wp, lp)
     }
@@ -5668,8 +5765,11 @@ pub fn run(path: Option<PathBuf>) -> Result<(), std::io::Error> {
         if RegisterClassExW(&info) == 0 {
             return Err(std::io::Error::last_os_error());
         }
+        let preferred = WindowSize::load();
+        let (work_area, position) = window_geometry::startup_work_area(WindowPosition::load());
+        let center = window_geometry::center(work_area);
         let window = CreateWindowExW(
-            WS_EX_APPWINDOW,
+            WS_EX_APPWINDOW | WS_EX_COMPOSITED,
             class.as_ptr(),
             wide("BetterExplorer").as_ptr(),
             WS_POPUP
@@ -5678,10 +5778,10 @@ pub fn run(path: Option<PathBuf>) -> Result<(), std::io::Error> {
                 | WS_MINIMIZEBOX
                 | WS_MAXIMIZEBOX
                 | WS_CLIPCHILDREN,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            1136,
-            732,
+            center.x,
+            center.y,
+            1,
+            1,
             null_mut(),
             null_mut(),
             module,
@@ -5690,7 +5790,23 @@ pub fn run(path: Option<PathBuf>) -> Result<(), std::io::Error> {
         if window.is_null() {
             return Err(std::io::Error::last_os_error());
         }
-        let app = Box::new(RefCell::new(App::create(window, path, settings.is_some())));
+        let dpi = GetDpiForWindow(window).max(96);
+        let bounds = preferred.placed(dpi, work_area, position);
+        SetWindowPos(
+            window,
+            null_mut(),
+            bounds.left,
+            bounds.top,
+            bounds.right - bounds.left,
+            bounds.bottom - bounds.top,
+            SWP_NOACTIVATE | SWP_NOZORDER,
+        );
+        let app = Box::new(RefCell::new(App::create(
+            window,
+            path,
+            settings.is_some(),
+            read_settings(),
+        )));
         SetWindowLongPtrW(
             window,
             GWLP_USERDATA,
@@ -5715,7 +5831,13 @@ pub fn run(path: Option<PathBuf>) -> Result<(), std::io::Error> {
                 SW_SHOWNORMAL
             },
         );
-        UpdateWindow(window);
+        RedrawWindow(
+            window,
+            null(),
+            null_mut(),
+            RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+        );
+        set_composition(window, false);
         if app.borrow().bench.is_some() {
             PostMessageW(window, BENCH_STARTED, 0, 0);
         }
@@ -5783,6 +5905,7 @@ mod group_tests {
                 window,
                 Some(r"C:\Example".into()),
                 false,
+                Settings::default(),
             )));
             SetWindowLongPtrW(
                 window,

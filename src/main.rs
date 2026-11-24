@@ -17,7 +17,11 @@ mod hotkey;
 #[cfg(windows)]
 mod preview;
 #[cfg(windows)]
+mod settings_page;
+#[cfg(windows)]
 mod ui;
+#[cfg(windows)]
+mod window_geometry;
 
 #[cfg(windows)]
 fn main() {

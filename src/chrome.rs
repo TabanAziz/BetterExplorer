@@ -261,9 +261,13 @@ pub fn set_enabled(window: HWND, enabled: bool) {
 }
 
 pub fn font(dpi: u32, semibold: bool) -> HFONT {
+    font_sized(dpi, 13, semibold)
+}
+
+pub fn font_sized(dpi: u32, size: i32, semibold: bool) -> HFONT {
     unsafe {
         CreateFontW(
-            -scale(13, dpi),
+            -scale(size, dpi),
             0,
             0,
             0,
@@ -466,12 +470,15 @@ pub enum Glyph {
     Up,
     Refresh,
     Add,
+    NewTab,
     Close,
     Cut,
     Copy,
     Paste,
     Rename,
     Delete,
+    Undo,
+    Redo,
     Sort,
     View,
     Filter,
@@ -482,6 +489,7 @@ pub enum Glyph {
     Drive,
     Home,
     Pin,
+    Pushpin,
     Network,
     Library,
     Recycle,
@@ -492,6 +500,7 @@ pub enum Glyph {
     Settings,
     Terminal,
     Link,
+    Shortcut,
     Document,
     Archive,
     Check,
@@ -606,6 +615,21 @@ struct IconBitmap {
     pixels: *mut u32,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum GlyphPaint {
+    Plain(u32),
+    Menu { dark: bool },
+}
+
+impl GlyphPaint {
+    fn draw(self, dc: HDC, glyph: Glyph, x: i32, y: i32, size: i32) {
+        match self {
+            Self::Plain(color) => draw_glyph_shape(dc, glyph, x, y, size, color),
+            Self::Menu { dark } => draw_menu_glyph_shape(dc, glyph, x, y, size, dark),
+        }
+    }
+}
+
 impl IconBitmap {
     fn new(dc: HDC, size: i32) -> Option<Self> {
         unsafe {
@@ -635,7 +659,7 @@ impl IconBitmap {
         }
     }
 
-    fn rasterize(dc: HDC, glyph: Glyph, size: i32, color: u32) -> Option<Self> {
+    fn rasterize(dc: HDC, glyph: Glyph, size: i32, paint: GlyphPaint) -> Option<Self> {
         const SAMPLES: usize = 4;
         let source_size = size as usize * SAMPLES;
         let source = Self::new(dc, source_size as i32)?;
@@ -643,14 +667,13 @@ impl IconBitmap {
         unsafe {
             std::ptr::write_bytes(source.pixels, 0, source_size * source_size);
         }
-        draw_glyph_shape(
-            source.dc,
-            glyph,
-            0,
-            0,
-            source_size as i32,
-            rgb(255, 255, 255),
-        );
+        // Menu swatches are nonblack. Use white coverage for single-color glyphs so
+        // system foreground colors such as pure black can still be drawn.
+        let source_paint = match paint {
+            GlyphPaint::Plain(_) => GlyphPaint::Plain(rgb(255, 255, 255)),
+            menu => menu,
+        };
+        source_paint.draw(source.dc, glyph, 0, 0, source_size as i32);
         unsafe {
             GdiFlush();
         }
@@ -659,17 +682,29 @@ impl IconBitmap {
         let size = size as usize;
         for y in 0..size {
             for x in 0..size {
-                let mut covered = 0;
+                let (mut red, mut green, mut blue, mut covered) = (0, 0, 0, 0);
                 for dy in 0..SAMPLES {
                     let offset = (y * SAMPLES + dy) * source_size + x * SAMPLES;
-                    covered += pixels[offset..offset + SAMPLES]
-                        .iter()
-                        .filter(|pixel| **pixel & 255 != 0)
-                        .count();
+                    for &pixel in &pixels[offset..offset + SAMPLES] {
+                        if pixel & 0x00ff_ffff != 0 {
+                            covered += 1;
+                            red += (pixel >> 16) & 255;
+                            green += (pixel >> 8) & 255;
+                            blue += pixel & 255;
+                        }
+                    }
                 }
-                let a = ((covered * 255 + SAMPLES * SAMPLES / 2) / (SAMPLES * SAMPLES)) as u32;
-                let channel = |shift: u32| ((color >> shift) & 255u32) * a / 255;
-                let pixel = a << 24 | channel(0) << 16 | channel(8) << 8 | channel(16);
+                if let GlyphPaint::Plain(color) = paint {
+                    red = (color & 255) * covered;
+                    green = ((color >> 8) & 255) * covered;
+                    blue = ((color >> 16) & 255) * covered;
+                }
+                let samples = (SAMPLES * SAMPLES) as u32;
+                let average = |channel| (channel + samples / 2) / samples;
+                let pixel = average(covered * 255) << 24
+                    | average(red) << 16
+                    | average(green) << 8
+                    | average(blue);
                 unsafe {
                     destination.pixels.add(y * size + x).write(pixel);
                 }
@@ -689,24 +724,32 @@ impl Drop for IconBitmap {
     }
 }
 
-type IconCache = HashMap<(Glyph, i32, u32), IconBitmap>;
+type IconCache = HashMap<(Glyph, i32, GlyphPaint), IconBitmap>;
 
 thread_local! {
     static ICONS: RefCell<IconCache> = RefCell::new(HashMap::new());
 }
 
 pub fn draw_glyph(dc: HDC, glyph: Glyph, x: i32, y: i32, size: i32, color: u32) {
+    draw_cached_glyph(dc, glyph, x, y, size, GlyphPaint::Plain(color));
+}
+
+pub fn draw_menu_glyph(dc: HDC, glyph: Glyph, x: i32, y: i32, size: i32, dark: bool) {
+    draw_cached_glyph(dc, glyph, x, y, size, GlyphPaint::Menu { dark });
+}
+
+fn draw_cached_glyph(dc: HDC, glyph: Glyph, x: i32, y: i32, size: i32, paint: GlyphPaint) {
     if !(6..=64).contains(&size) {
-        draw_glyph_shape(dc, glyph, x, y, size, color);
+        paint.draw(dc, glyph, x, y, size);
         return;
     }
     let painted = ICONS.with_borrow_mut(|icons| {
-        let key = (glyph, size, color);
+        let key = (glyph, size, paint);
         if icons.len() >= 192 && !icons.contains_key(&key) {
             icons.clear();
         }
         if let std::collections::hash_map::Entry::Vacant(entry) = icons.entry(key) {
-            if let Some(icon) = IconBitmap::rasterize(dc, glyph, size, color) {
+            if let Some(icon) = IconBitmap::rasterize(dc, glyph, size, paint) {
                 entry.insert(icon);
             }
         }
@@ -732,7 +775,195 @@ pub fn draw_glyph(dc: HDC, glyph: Glyph, x: i32, y: i32, size: i32, color: u32) 
         })
     });
     if !painted {
-        draw_glyph_shape(dc, glyph, x, y, size, color);
+        paint.draw(dc, glyph, x, y, size);
+    }
+}
+
+fn menu_glyph_colors(glyph: Glyph, dark: bool) -> (u32, u32) {
+    let (dark_ink, dark_fill, light_ink, light_fill) = match glyph {
+        Glyph::Cut | Glyph::Details | Glyph::Settings => (
+            rgb(197, 172, 255),
+            rgb(68, 52, 101),
+            rgb(104, 57, 167),
+            rgb(236, 225, 253),
+        ),
+        Glyph::Delete | Glyph::Recycle => (
+            rgb(255, 139, 158),
+            rgb(100, 45, 61),
+            rgb(172, 45, 72),
+            rgb(255, 220, 229),
+        ),
+        Glyph::Rename => (
+            rgb(255, 177, 107),
+            rgb(107, 64, 44),
+            rgb(167, 68, 19),
+            rgb(255, 230, 206),
+        ),
+        Glyph::Archive | Glyph::Folder | Glyph::Paste | Glyph::Pin | Glyph::Pushpin => (
+            rgb(251, 207, 115),
+            rgb(101, 76, 38),
+            rgb(130, 82, 13),
+            rgb(255, 240, 207),
+        ),
+        Glyph::Add | Glyph::Check | Glyph::Refresh => (
+            rgb(124, 225, 165),
+            rgb(36, 84, 62),
+            rgb(26, 116, 70),
+            rgb(219, 247, 231),
+        ),
+        Glyph::Link | Glyph::Shortcut | Glyph::Terminal | Glyph::Sort => (
+            rgb(105, 221, 232),
+            rgb(31, 78, 90),
+            rgb(13, 111, 123),
+            rgb(214, 247, 249),
+        ),
+        _ => (
+            rgb(131, 188, 255),
+            rgb(44, 72, 109),
+            rgb(35, 88, 166),
+            rgb(216, 233, 255),
+        ),
+    };
+    if dark {
+        (dark_ink, dark_fill)
+    } else {
+        (light_ink, light_fill)
+    }
+}
+
+fn draw_menu_glyph_shape(dc: HDC, glyph: Glyph, x: i32, y: i32, size: i32, dark: bool) {
+    use windows_sys::Win32::Foundation::POINT;
+
+    let (ink, tint) = menu_glyph_colors(glyph, dark);
+    let s = |value: i32| value * size / 16;
+    let rect = |l, t, r, b| RECT {
+        left: x + s(l),
+        top: y + s(t),
+        right: x + s(r),
+        bottom: y + s(b),
+    };
+    let panel = |l, t, r, b, radius, color| {
+        rounded_fill(dc, &rect(l, t, r, b), s(radius).max(1), color);
+    };
+    let points = |points: &[(i32, i32)]| -> Vec<POINT> {
+        points
+            .iter()
+            .map(|&(px, py)| POINT {
+                x: x + s(px),
+                y: y + s(py),
+            })
+            .collect()
+    };
+    unsafe {
+        let pen = CreatePen(PS_SOLID, s(1).max(1), ink);
+        let brush = CreateSolidBrush(tint);
+        let old_pen = SelectObject(dc, pen);
+        let old_brush = SelectObject(dc, brush);
+        let line = |vertices: &[(i32, i32)]| {
+            let vertices = points(vertices);
+            Polyline(dc, vertices.as_ptr(), vertices.len() as i32);
+        };
+        let polygon = |vertices: &[(i32, i32)]| {
+            let vertices = points(vertices);
+            Polygon(dc, vertices.as_ptr(), vertices.len() as i32);
+        };
+        match glyph {
+            Glyph::Document => {
+                polygon(&[(3, 2), (9, 2), (13, 6), (13, 14), (3, 14)]);
+                line(&[(9, 2), (9, 6), (13, 6)]);
+                line(&[(5, 9), (11, 9)]);
+                line(&[(5, 11), (10, 11)]);
+            }
+            Glyph::Copy => {
+                panel(1, 1, 11, 12, 2, ink);
+                panel(2, 2, 10, 11, 1, tint);
+                panel(5, 4, 15, 15, 2, ink);
+                panel(6, 5, 14, 14, 1, tint);
+                line(&[(8, 8), (12, 8)]);
+                line(&[(8, 10), (12, 10)]);
+            }
+            Glyph::Cut => {
+                line(&[(4, 2), (10, 10)]);
+                line(&[(12, 2), (6, 10)]);
+                Ellipse(dc, x + s(2), y + s(9), x + s(8), y + s(15));
+                Ellipse(dc, x + s(8), y + s(9), x + s(14), y + s(15));
+            }
+            Glyph::Paste => {
+                panel(2, 3, 14, 15, 2, ink);
+                panel(3, 4, 13, 14, 1, tint);
+                panel(5, 1, 11, 6, 1, ink);
+                line(&[(5, 9), (11, 9)]);
+                line(&[(5, 11), (10, 11)]);
+            }
+            Glyph::Rename => {
+                polygon(&[(2, 13), (3, 9), (11, 1), (14, 4), (6, 12)]);
+                line(&[(9, 3), (12, 6)]);
+                line(&[(3, 9), (6, 12)]);
+                line(&[(8, 14), (15, 14)]);
+            }
+            Glyph::Delete | Glyph::Recycle => {
+                polygon(&[(4, 5), (12, 5), (11, 14), (5, 14)]);
+                panel(2, 3, 14, 5, 1, ink);
+                line(&[(6, 3), (6, 2), (10, 2), (10, 3)]);
+                line(&[(7, 7), (7, 11)]);
+                line(&[(9, 7), (9, 11)]);
+            }
+            Glyph::Archive => {
+                panel(2, 5, 14, 15, 2, ink);
+                panel(3, 6, 13, 14, 1, tint);
+                panel(1, 2, 15, 6, 1, ink);
+                line(&[(6, 9), (10, 9)]);
+            }
+            Glyph::Folder => {
+                polygon(&[(2, 4), (6, 4), (8, 6), (14, 6), (14, 13), (2, 13)]);
+                line(&[(2, 7), (14, 7)]);
+            }
+            Glyph::Pin => {
+                polygon(&[
+                    (8, 2),
+                    (10, 6),
+                    (14, 6),
+                    (11, 9),
+                    (12, 14),
+                    (8, 11),
+                    (4, 14),
+                    (5, 9),
+                    (2, 6),
+                    (6, 6),
+                ]);
+            }
+            Glyph::Pushpin => {
+                polygon(&[
+                    (6, 2),
+                    (14, 10),
+                    (12, 10),
+                    (9, 8),
+                    (8, 12),
+                    (4, 8),
+                    (8, 7),
+                    (6, 4),
+                ]);
+                line(&[(6, 10), (2, 14)]);
+            }
+            Glyph::Restore => {
+                panel(5, 2, 15, 11, 2, ink);
+                panel(6, 3, 14, 10, 1, tint);
+                panel(1, 5, 12, 14, 2, ink);
+                panel(2, 7, 11, 13, 1, tint);
+            }
+            Glyph::Terminal | Glyph::View | Glyph::Details | Glyph::NewTab => {
+                panel(1, 2, 15, 14, 2, tint);
+                draw_glyph_shape(dc, glyph, x + s(1), y + s(1), s(14), ink);
+            }
+            _ => {
+                panel(1, 1, 15, 15, 7, tint);
+                draw_glyph_shape(dc, glyph, x + s(2), y + s(2), s(12), ink);
+            }
+        }
+        SelectObject(dc, old_brush);
+        SelectObject(dc, old_pen);
+        DeleteObject(brush);
+        DeleteObject(pen);
     }
 }
 
@@ -804,6 +1035,12 @@ fn draw_glyph_shape(dc: HDC, glyph: Glyph, x: i32, y: i32, size: i32, color: u32
                 stroke(&[(3, 8), (13, 8)]);
                 stroke(&[(8, 3), (8, 13)]);
             }
+            Glyph::NewTab => {
+                box_(2, 3, 14, 13);
+                stroke(&[(2, 6), (14, 6)]);
+                stroke(&[(6, 9), (10, 9)]);
+                stroke(&[(8, 7), (8, 11)]);
+            }
             Glyph::Close => {
                 stroke(&[(4, 4), (12, 12)]);
                 stroke(&[(4, 12), (12, 4)]);
@@ -839,6 +1076,14 @@ fn draw_glyph_shape(dc: HDC, glyph: Glyph, x: i32, y: i32, size: i32, color: u32
                 stroke(&[(6, 3), (6, 2), (10, 2), (10, 3)]);
                 stroke(&[(7, 6), (7, 11)]);
                 stroke(&[(9, 6), (9, 11)]);
+            }
+            Glyph::Undo => {
+                stroke(&[(2, 7), (10, 7), (13, 9), (13, 11), (11, 13), (7, 13)]);
+                stroke(&[(6, 3), (2, 7), (6, 11)]);
+            }
+            Glyph::Redo => {
+                stroke(&[(14, 7), (6, 7), (3, 9), (3, 11), (5, 13), (9, 13)]);
+                stroke(&[(10, 3), (14, 7), (10, 11)]);
             }
             Glyph::Sort => {
                 stroke(&[(1, 6), (4, 3), (7, 6)]);
@@ -930,6 +1175,20 @@ fn draw_glyph_shape(dc: HDC, glyph: Glyph, x: i32, y: i32, size: i32, color: u32
                 (6, 6),
                 (8, 2),
             ]),
+            Glyph::Pushpin => {
+                stroke(&[
+                    (6, 2),
+                    (14, 10),
+                    (12, 10),
+                    (9, 8),
+                    (8, 12),
+                    (4, 8),
+                    (8, 7),
+                    (6, 4),
+                    (6, 2),
+                ]);
+                stroke(&[(6, 10), (2, 14)]);
+            }
             Glyph::Network => {
                 box_(6, 2, 10, 6);
                 box_(1, 10, 5, 14);
@@ -958,6 +1217,11 @@ fn draw_glyph_shape(dc: HDC, glyph: Glyph, x: i32, y: i32, size: i32, color: u32
                 stroke(&[(6, 5), (9, 2), (12, 2), (14, 4), (14, 7), (11, 10)]);
                 stroke(&[(10, 11), (7, 14), (4, 14), (2, 12), (2, 9), (5, 6)]);
                 stroke(&[(5, 11), (11, 5)]);
+            }
+            Glyph::Shortcut => {
+                stroke(&[(8, 3), (3, 3), (3, 13), (13, 13), (13, 8)]);
+                stroke(&[(7, 9), (13, 3)]);
+                stroke(&[(9, 3), (13, 3), (13, 7)]);
             }
             Glyph::Document => {
                 stroke(&[(4, 2), (10, 2), (13, 5), (13, 14), (4, 14), (4, 2)]);

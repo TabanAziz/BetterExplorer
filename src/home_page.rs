@@ -142,7 +142,7 @@ impl HomePage {
     }
 
     pub fn set_bounds(&self, x: i32, y: i32, width: i32, height: i32) {
-        unsafe { MoveWindow(self.0.window.get(), x, y, width.max(0), height.max(0), 1) };
+        unsafe { MoveWindow(self.0.window.get(), x, y, width.max(0), height.max(0), 0) };
     }
 
     pub fn set_visible(&self, visible: bool) {

@@ -21,9 +21,9 @@ use windows::{
         UI::Shell::{
             FileOperation, IFileOperation, IFileOperationProgressSink,
             IFileOperationProgressSink_Impl, IShellItem, IShellLinkW, SHCreateItemFromParsingName,
-            SHOpenWithDialog, ShellLink, COPYENGINE_S_USER_IGNORED, FOFX_ADDUNDORECORD,
-            FOFX_EARLYFAILURE, FOFX_RECYCLEONDELETE, FOFX_SHOWELEVATIONPROMPT, FOF_ALLOWUNDO,
-            FOF_WANTNUKEWARNING, OAIF_EXEC, OPENASINFO,
+            SHOpenWithDialog, ShellLink, COPYENGINE_S_USER_IGNORED, FILEOPERATION_FLAGS,
+            FOFX_ADDUNDORECORD, FOFX_EARLYFAILURE, FOFX_RECYCLEONDELETE, FOFX_SHOWELEVATIONPROMPT,
+            FOF_ALLOWUNDO, FOF_RENAMEONCOLLISION, FOF_WANTNUKEWARNING, OAIF_EXEC, OPENASINFO,
         },
     },
 };
@@ -49,7 +49,12 @@ use windows_sys::Win32::{
     },
 };
 
+mod history;
+pub use history::History;
+
 pub enum Operation {
+    Undo,
+    Redo,
     Open(PathBuf),
     OpenWith(PathBuf),
     Properties(PathBuf),
@@ -106,7 +111,9 @@ impl Operation {
     pub fn updates_listing(&self) -> bool {
         matches!(
             self,
-            Self::Paste { .. }
+            Self::Undo
+                | Self::Redo
+                | Self::Paste { .. }
                 | Self::Transfer { .. }
                 | Self::Create { .. }
                 | Self::Rename { .. }
@@ -136,9 +143,18 @@ impl Drop for Apartment {
 }
 
 pub fn run(owner: usize, operation: Operation) -> Result<String, String> {
+    run_recorded(owner, operation, None)
+}
+
+fn run_recorded(
+    owner: usize,
+    operation: Operation,
+    recording: Option<&mut history::Recording>,
+) -> Result<String, String> {
     let _apartment = Apartment::start().map_err(|e| e.to_string())?;
     let owner = HWND(owner as _);
     let result = match operation {
+        Operation::Undo | Operation::Redo => return Err("File history is unavailable.".into()),
         Operation::Open(path) => execute(owner, "open", path.as_os_str(), None),
         Operation::OpenWith(path) => {
             let path = wide(path);
@@ -181,7 +197,7 @@ pub fn run(owner: usize, operation: Operation) -> Result<String, String> {
         }
         Operation::Paste { target, receipt } => {
             let (paths, moving, sequence) = read_clipboard(owner, &receipt)?;
-            transfer(owner, &paths, &target, moving)?;
+            transfer(owner, &paths, &target, moving, recording)?;
             if moving {
                 clear_clipboard_if_unchanged(owner, sequence);
             }
@@ -197,7 +213,7 @@ pub fn run(owner: usize, operation: Operation) -> Result<String, String> {
             target,
             moving,
         } => {
-            transfer(owner, &paths, &target, moving)?;
+            transfer(owner, &paths, &target, moving, recording)?;
             return Ok(if moving {
                 "Items moved."
             } else {
@@ -209,16 +225,37 @@ pub fn run(owner: usize, operation: Operation) -> Result<String, String> {
             target,
             name,
             directory,
-        } => create(owner, &target, &name, directory),
-        Operation::Rename { path, name } => rename(owner, &path, &name),
-        Operation::Delete { paths, permanent } => delete(owner, &paths, permanent),
-        Operation::Shortcut { source, target } => shortcut(&source, &target),
+        } => create(owner, &target, &name, directory, recording),
+        Operation::Rename { path, name } => rename(owner, &path, &name, recording),
+        Operation::Delete { paths, permanent } => delete(owner, &paths, permanent, recording),
+        Operation::Shortcut { source, target } => {
+            let capture = recording
+                .as_ref()
+                .and_then(|_| history::Capture::created(&target));
+            shortcut(&source, &target)?;
+            if let (Some(recording), Some(capture)) = (recording, capture) {
+                capture.publish_created(recording, "Create shortcut", &target);
+            }
+            Ok(())
+        }
         Operation::Compress { sources, output } => {
+            let capture = recording
+                .as_ref()
+                .and_then(|_| history::Capture::created(&output));
             archive::compress(&sources, &output)?;
+            if let (Some(recording), Some(capture)) = (recording, capture) {
+                capture.publish_created(recording, "Compress", &output);
+            }
             return Ok("ZIP archive created.".into());
         }
         Operation::Extract { source, output } => {
+            let capture = recording
+                .as_ref()
+                .and_then(|_| history::Capture::created(&output));
             archive::extract(&source, &output)?;
+            if let (Some(recording), Some(capture)) = (recording, capture) {
+                capture.publish_created(recording, "Extract", &output);
+            }
             return Ok("ZIP archive extracted.".into());
         }
     };
@@ -281,12 +318,16 @@ fn item(path: &Path) -> windows::core::Result<IShellItem> {
 
 fn perform(
     owner: HWND,
-    recycle: Option<bool>,
+    flags: FILEOPERATION_FLAGS,
     queue: impl FnOnce(&IFileOperation) -> windows::core::Result<()>,
 ) -> Result<(), String> {
     let run = || -> windows::core::Result<_> {
         let failure = Arc::new(Mutex::new(None));
-        let sink: IFileOperationProgressSink = ResultSink(Arc::clone(&failure)).into();
+        let sink: IFileOperationProgressSink = ResultSink {
+            failure: Some(Arc::clone(&failure)),
+            capture: None,
+        }
+        .into();
         // The COM apartment and all Shell objects stay on the operation thread.
         let aborted = unsafe {
             let operation: IFileOperation =
@@ -294,17 +335,6 @@ fn perform(
             if !owner.0.is_null() {
                 operation.SetOwnerWindow(owner)?;
             }
-            let base = FOFX_SHOWELEVATIONPROMPT | FOFX_EARLYFAILURE;
-            let flags = match recycle {
-                Some(false) => base,
-                Some(true) => {
-                    base | FOF_ALLOWUNDO
-                        | FOFX_ADDUNDORECORD
-                        | FOFX_RECYCLEONDELETE
-                        | FOF_WANTNUKEWARNING
-                }
-                None => base | FOF_ALLOWUNDO | FOFX_ADDUNDORECORD,
-            };
             operation.SetOperationFlags(flags)?;
             queue(&operation)?;
             let cookie = operation.Advise(&sink)?;
@@ -326,16 +356,41 @@ fn perform(
     }
 }
 
-fn transfer(owner: HWND, paths: &[PathBuf], target: &Path, moving: bool) -> Result<(), String> {
-    perform(owner, None, |operation| {
+fn operation_flags(private: bool) -> FILEOPERATION_FLAGS {
+    let base = FOFX_SHOWELEVATIONPROMPT | FOFX_EARLYFAILURE;
+    if private {
+        base
+    } else {
+        base | FOF_ALLOWUNDO | FOFX_ADDUNDORECORD
+    }
+}
+
+fn transfer(
+    owner: HWND,
+    paths: &[PathBuf],
+    target: &Path,
+    moving: bool,
+    mut recording: Option<&mut history::Recording>,
+) -> Result<(), String> {
+    let mut flags = operation_flags(recording.is_some());
+    if recording.is_some() && !moving && history::same_source_folder(paths, target) {
+        flags |= FOF_RENAMEONCOLLISION;
+    }
+    perform(owner, flags, |operation| {
         let destination = item(target)?;
         for path in paths {
             let source = item(path)?;
+            let sink = recording.as_deref_mut().and_then(|recording| {
+                recording.track(
+                    if moving { "Move" } else { "Copy" },
+                    history::Capture::transferred(path, &source, target, moving),
+                )
+            });
             unsafe {
                 if moving {
-                    operation.MoveItem(&source, &destination, PCWSTR::null(), None)?;
+                    operation.MoveItem(&source, &destination, PCWSTR::null(), sink.as_ref())?;
                 } else {
-                    operation.CopyItem(&source, &destination, PCWSTR::null(), None)?;
+                    operation.CopyItem(&source, &destination, PCWSTR::null(), sink.as_ref())?;
                 }
             }
         }
@@ -343,12 +398,22 @@ fn transfer(owner: HWND, paths: &[PathBuf], target: &Path, moving: bool) -> Resu
     })
 }
 
-fn create(owner: HWND, target: &Path, name: &str, directory: bool) -> Result<(), String> {
+fn create(
+    owner: HWND,
+    target: &Path,
+    name: &str,
+    directory: bool,
+    recording: Option<&mut history::Recording>,
+) -> Result<(), String> {
     if !safe_name(name) {
         return Err("Enter a valid Windows file name.".into());
     }
+    let private = recording.is_some();
+    let sink = recording.and_then(|recording| {
+        recording.track("Create", history::Capture::created(&target.join(name)))
+    });
     let name = wide(name);
-    perform(owner, None, |operation| unsafe {
+    perform(owner, operation_flags(private), |operation| unsafe {
         operation.NewItem(
             &item(target)?,
             if directory {
@@ -358,23 +423,53 @@ fn create(owner: HWND, target: &Path, name: &str, directory: bool) -> Result<(),
             },
             PCWSTR(name.as_ptr()),
             PCWSTR::null(),
-            None,
+            sink.as_ref(),
         )
     })
 }
 
-fn rename(owner: HWND, path: &Path, name: &str) -> Result<(), String> {
+fn rename(
+    owner: HWND,
+    path: &Path,
+    name: &str,
+    recording: Option<&mut history::Recording>,
+) -> Result<(), String> {
     if !safe_name(name) {
         return Err("Enter a valid Windows file name.".into());
     }
-    let name = wide(name);
-    perform(owner, None, |operation| unsafe {
-        operation.RenameItem(&item(path)?, PCWSTR(name.as_ptr()), None)
-    })
+    perform(
+        owner,
+        operation_flags(recording.is_some()),
+        |operation| unsafe {
+            let source = item(path)?;
+            let sink = recording.and_then(|recording| {
+                recording.track("Rename", history::Capture::renamed(path, name))
+            });
+            let name = wide(name);
+            operation.RenameItem(&source, PCWSTR(name.as_ptr()), sink.as_ref())
+        },
+    )
 }
 
-fn delete(owner: HWND, paths: &[PathBuf], permanent: bool) -> Result<(), String> {
-    perform(owner, Some(!permanent), |operation| {
+fn delete(
+    owner: HWND,
+    paths: &[PathBuf],
+    permanent: bool,
+    recording: Option<&mut history::Recording>,
+) -> Result<(), String> {
+    if let Some(recording) = recording.filter(|_| !permanent) {
+        return recording.recycle(owner, paths);
+    }
+    delete_with_shell(owner, paths, permanent)
+}
+
+fn delete_with_shell(owner: HWND, paths: &[PathBuf], permanent: bool) -> Result<(), String> {
+    let flags = if permanent {
+        operation_flags(true)
+    } else {
+        operation_flags(false) | FOFX_RECYCLEONDELETE | FOF_WANTNUKEWARNING
+    };
+    perform(owner, flags, |operation| {
         for path in paths {
             unsafe {
                 operation.DeleteItem(&item(path)?, None)?;
@@ -407,15 +502,28 @@ fn shortcut(source: &Path, target: &Path) -> Result<(), String> {
 }
 
 #[implement(IFileOperationProgressSink)]
-struct ResultSink(Arc<Mutex<Option<HRESULT>>>);
+struct ResultSink {
+    failure: Option<Arc<Mutex<Option<HRESULT>>>>,
+    capture: Option<history::Observer>,
+}
 
 impl ResultSink_Impl {
     fn record(&self, code: HRESULT) {
         if code.is_err() || code == COPYENGINE_S_USER_IGNORED {
-            let mut failure = self.0.lock().unwrap();
+            let Some(failure) = &self.failure else {
+                return;
+            };
+            let mut failure = failure.lock().unwrap();
             if failure.is_none() || *failure == Some(COPYENGINE_S_USER_IGNORED) {
                 *failure = Some(code);
             }
+        }
+    }
+
+    fn completed(&self, code: HRESULT, source: Ref<IShellItem>, output: Ref<IShellItem>) {
+        self.record(code);
+        if let Some(capture) = &self.capture {
+            capture.completed(code, source.as_ref(), output.as_ref());
         }
     }
 }
@@ -435,12 +543,12 @@ impl IFileOperationProgressSink_Impl for ResultSink_Impl {
     fn PostRenameItem(
         &self,
         _: u32,
-        _: Ref<IShellItem>,
+        source: Ref<IShellItem>,
         _: &PCWSTR,
         result: HRESULT,
-        _: Ref<IShellItem>,
+        output: Ref<IShellItem>,
     ) -> windows::core::Result<()> {
-        self.record(result);
+        self.completed(result, source, output);
         Ok(())
     }
     fn PreMoveItem(
@@ -455,13 +563,13 @@ impl IFileOperationProgressSink_Impl for ResultSink_Impl {
     fn PostMoveItem(
         &self,
         _: u32,
-        _: Ref<IShellItem>,
+        source: Ref<IShellItem>,
         _: Ref<IShellItem>,
         _: &PCWSTR,
         result: HRESULT,
-        _: Ref<IShellItem>,
+        output: Ref<IShellItem>,
     ) -> windows::core::Result<()> {
-        self.record(result);
+        self.completed(result, source, output);
         Ok(())
     }
     fn PreCopyItem(
@@ -476,13 +584,13 @@ impl IFileOperationProgressSink_Impl for ResultSink_Impl {
     fn PostCopyItem(
         &self,
         _: u32,
-        _: Ref<IShellItem>,
+        source: Ref<IShellItem>,
         _: Ref<IShellItem>,
         _: &PCWSTR,
         result: HRESULT,
-        _: Ref<IShellItem>,
+        output: Ref<IShellItem>,
     ) -> windows::core::Result<()> {
-        self.record(result);
+        self.completed(result, source, output);
         Ok(())
     }
     fn PreDeleteItem(&self, _: u32, _: Ref<IShellItem>) -> windows::core::Result<()> {
@@ -491,11 +599,11 @@ impl IFileOperationProgressSink_Impl for ResultSink_Impl {
     fn PostDeleteItem(
         &self,
         _: u32,
-        _: Ref<IShellItem>,
+        source: Ref<IShellItem>,
         result: HRESULT,
-        _: Ref<IShellItem>,
+        output: Ref<IShellItem>,
     ) -> windows::core::Result<()> {
-        self.record(result);
+        self.completed(result, source, output);
         Ok(())
     }
     fn PreNewItem(&self, _: u32, _: Ref<IShellItem>, _: &PCWSTR) -> windows::core::Result<()> {
@@ -504,14 +612,14 @@ impl IFileOperationProgressSink_Impl for ResultSink_Impl {
     fn PostNewItem(
         &self,
         _: u32,
-        _: Ref<IShellItem>,
+        destination: Ref<IShellItem>,
         _: &PCWSTR,
         _: &PCWSTR,
         _: u32,
         result: HRESULT,
-        _: Ref<IShellItem>,
+        output: Ref<IShellItem>,
     ) -> windows::core::Result<()> {
-        self.record(result);
+        self.completed(result, destination, output);
         Ok(())
     }
     fn UpdateProgress(&self, _: u32, _: u32) -> windows::core::Result<()> {
@@ -813,7 +921,11 @@ mod tests {
     #[test]
     fn shell_records_an_ignored_move_even_when_the_batch_succeeds() {
         let recorded = Arc::new(Mutex::new(None));
-        let sink: IFileOperationProgressSink = ResultSink(Arc::clone(&recorded)).into();
+        let sink: IFileOperationProgressSink = ResultSink {
+            failure: Some(Arc::clone(&recorded)),
+            capture: None,
+        }
+        .into();
         unsafe {
             sink.PostMoveItem(
                 0,
