@@ -34,6 +34,15 @@ pub const fn rgb(r: u32, g: u32, b: u32) -> u32 {
     r | g << 8 | b << 16
 }
 
+pub fn blend_color(base: u32, tint: u32, percent: u32) -> u32 {
+    let channel = |shift: u32| {
+        let base = (base >> shift) & 255;
+        let tint = (tint >> shift) & 255;
+        (base * (100 - percent) + tint * percent + 50) / 100
+    };
+    rgb(channel(0), channel(8), channel(16))
+}
+
 pub struct Palette {
     pub dark: bool,
     pub contrast: bool,
@@ -79,15 +88,102 @@ impl Palette {
                 accent: color(COLOR_HIGHLIGHT),
             };
         }
-        let dark = match preference {
-            ThemePreference::System => system_dark(),
-            ThemePreference::Dark => true,
-            ThemePreference::Light => false,
-        };
+        match preference {
+            ThemePreference::DeepSpace => Self {
+                dark: true,
+                contrast,
+                chrome: rgb(20, 24, 49),
+                title: rgb(27, 25, 63),
+                sidebar: rgb(17, 21, 42),
+                field: rgb(35, 40, 64),
+                content: rgb(15, 18, 35),
+                text: rgb(239, 239, 255),
+                muted: rgb(180, 189, 224),
+                edge: rgb(65, 70, 112),
+                active: rgb(47, 43, 91),
+                accent: rgb(194, 171, 255),
+            },
+            ThemePreference::PaperWhite => Self {
+                dark: false,
+                contrast,
+                chrome: rgb(247, 243, 232),
+                title: rgb(242, 236, 220),
+                sidebar: rgb(246, 240, 225),
+                field: rgb(255, 251, 240),
+                content: rgb(255, 253, 246),
+                text: rgb(35, 43, 57),
+                muted: rgb(85, 94, 111),
+                edge: rgb(202, 192, 168),
+                active: rgb(224, 233, 246),
+                accent: rgb(43, 80, 145),
+            },
+            ThemePreference::CandyRush => Self {
+                dark: false,
+                contrast,
+                chrome: rgb(251, 224, 240),
+                title: rgb(249, 213, 235),
+                sidebar: rgb(253, 233, 244),
+                field: rgb(255, 243, 250),
+                content: rgb(255, 248, 252),
+                text: rgb(67, 22, 49),
+                muted: rgb(107, 55, 87),
+                edge: rgb(217, 155, 193),
+                active: rgb(245, 193, 224),
+                accent: rgb(151, 27, 95),
+            },
+            ThemePreference::Frost => Self {
+                dark: false,
+                contrast,
+                chrome: rgb(223, 242, 249),
+                title: rgb(213, 237, 248),
+                sidebar: rgb(230, 245, 251),
+                field: rgb(243, 252, 255),
+                content: rgb(248, 253, 255),
+                text: rgb(25, 57, 73),
+                muted: rgb(66, 101, 118),
+                edge: rgb(164, 200, 215),
+                active: rgb(197, 229, 242),
+                accent: rgb(23, 92, 129),
+            },
+            ThemePreference::Eclipse => Self {
+                dark: true,
+                contrast,
+                chrome: rgb(35, 28, 25),
+                title: rgb(43, 30, 25),
+                sidebar: rgb(30, 24, 23),
+                field: rgb(53, 38, 31),
+                content: rgb(22, 19, 18),
+                text: rgb(252, 239, 225),
+                muted: rgb(207, 180, 158),
+                edge: rgb(91, 66, 51),
+                active: rgb(67, 47, 38),
+                accent: rgb(255, 175, 113),
+            },
+            ThemePreference::CyberGrid => Self {
+                dark: true,
+                contrast,
+                chrome: rgb(13, 36, 36),
+                title: rgb(13, 44, 43),
+                sidebar: rgb(10, 32, 33),
+                field: rgb(19, 54, 54),
+                content: rgb(9, 25, 27),
+                text: rgb(225, 252, 242),
+                muted: rgb(147, 196, 183),
+                edge: rgb(49, 104, 94),
+                active: rgb(20, 67, 59),
+                accent: rgb(103, 244, 193),
+            },
+            ThemePreference::System => Self::standard(system_dark()),
+            ThemePreference::Dark => Self::standard(true),
+            ThemePreference::Light => Self::standard(false),
+        }
+    }
+
+    fn standard(dark: bool) -> Self {
         if dark {
             Self {
                 dark,
-                contrast,
+                contrast: false,
                 chrome: rgb(33, 34, 39),
                 title: rgb(36, 32, 48),
                 sidebar: rgb(30, 31, 35),
@@ -102,7 +198,7 @@ impl Palette {
         } else {
             Self {
                 dark,
-                contrast,
+                contrast: false,
                 chrome: rgb(248, 248, 252),
                 title: rgb(237, 234, 248),
                 sidebar: rgb(246, 246, 251),
@@ -309,6 +405,7 @@ pub fn draw_button(
     let selected = draw.itemState & ODS_SELECTED != 0;
     let disabled = draw.itemState & ODS_DISABLED != 0;
     let hover = style.hover && !disabled;
+    let danger_hover = style.danger && hover && !palette.contrast;
     let inset = scale(2, dpi);
     fill(dc, &bounds, style.surface);
     if style.active || selected || hover {
@@ -318,7 +415,7 @@ pub fn draw_button(
             right: bounds.right - inset,
             bottom: bounds.bottom - inset,
         };
-        let color = if style.danger && hover && !palette.contrast {
+        let color = if danger_hover {
             rgb(150, 39, 34)
         } else {
             palette.active
@@ -352,6 +449,8 @@ pub fn draw_button(
         };
         let color = if disabled {
             palette.muted
+        } else if danger_hover {
+            rgb(255, 255, 255)
         } else {
             style.icon_color
         };

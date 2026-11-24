@@ -1,8 +1,27 @@
 #![cfg(windows)]
 
-use better_explorer::model::{safe_name, History, Location};
+use better_explorer::model::{safe_name, History, Location, Settings, ThemePreference};
 use better_explorer::work::{scan, Request, ScanEvent, Sort};
 use std::sync::atomic::AtomicU64;
+
+#[test]
+fn theme_settings_round_trip_without_changing_existing_names() {
+    for preference in ThemePreference::ALL {
+        let settings = Settings {
+            theme: preference,
+            ..Settings::default()
+        };
+        let encoded = serde_json::to_vec(&settings).unwrap();
+        let decoded: Settings = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.theme, preference);
+    }
+    assert_eq!(
+        serde_json::from_str::<Settings>(r#"{"theme":"Light"}"#)
+            .unwrap()
+            .theme,
+        ThemePreference::Light
+    );
+}
 
 #[test]
 fn history_discards_forward_locations_after_new_navigation() {

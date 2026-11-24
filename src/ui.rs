@@ -8,9 +8,10 @@ use crate::{
     home_page::{Activity, HomePage, Icon, Item},
     preview::{self, Content},
     settings_page::{
-        self, Choice, DATE_CHOICES, DATE_FORMAT_DAY_FIRST, DATE_FORMAT_MONTH_FIRST,
-        SHORTCUT_CHOICES, WIN_E_BETTER, WIN_E_WINDOWS,
+        self, Choice, Section, DATE_CHOICES, DATE_FORMAT_DAY_FIRST, DATE_FORMAT_MONTH_FIRST,
+        SECTIONS, SHORTCUT_CHOICES, THEME_START, WIN_E_BETTER, WIN_E_WINDOWS,
     },
+    theme_visuals,
     window_geometry::{self, WindowPosition, WindowSize},
 };
 use better_explorer::{
@@ -158,6 +159,7 @@ const GROUP_NONE: u16 = 214;
 const SEARCH_ALL_DRIVES: u16 = 216;
 const UNDO: u16 = 217;
 const REDO: u16 = 218;
+const OPEN_APPEARANCE: u16 = 219;
 const GROUP_MODIFIED: u16 = 215;
 const OPEN_TERMINAL: u16 = 210;
 const FOLDER_PROPERTIES: u16 = 211;
@@ -393,6 +395,7 @@ struct App {
     active: usize,
     settings: Settings,
     settings_controls: Option<settings_page::Page>,
+    settings_section: Section,
     hotkey_status: Option<hotkey::Status>,
     hotkey_request: Option<HotkeyRequest>,
     hotkey_error: Option<String>,
@@ -556,6 +559,7 @@ impl App {
             active,
             settings,
             settings_controls: None,
+            settings_section: Section::default(),
             hotkey_status: None,
             hotkey_request: None,
             hotkey_error: None,
@@ -638,8 +642,6 @@ impl App {
         app.apply_dpi(dpi);
         app.update_theme_controls();
         app.update_view();
-        let cue = wide("Search this folder");
-        send(app.search, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
         unsafe {
             DragAcceptFiles(window, 1);
         }
@@ -848,6 +850,42 @@ impl App {
     fn apply_theme(&mut self) {
         self.colors = Palette::read(self.settings.theme);
         self.update_theme_controls();
+        self.update_search_hint();
+    }
+
+    fn search_hint(&self) -> String {
+        match self.location() {
+            Location::Home | Location::Computer | Location::PcSearch { .. } => {
+                "Search this PC".into()
+            }
+            Location::Folder(_) | Location::Search { .. } => {
+                format!("Search {}", self.location().caption())
+            }
+            _ => "Open a folder to search".into(),
+        }
+    }
+
+    fn custom_search_cue(&self) -> bool {
+        self.colors.dark && !self.colors.contrast
+    }
+
+    fn update_search_hint(&self) {
+        let hint = wide(self.search_hint());
+        send(
+            self.search,
+            EM_SETCUEBANNER,
+            usize::from(!self.custom_search_cue()),
+            hint.as_ptr() as isize,
+        );
+    }
+
+    fn select_theme(&mut self, theme: ThemePreference) {
+        if self.settings.theme != theme {
+            self.settings.theme = theme;
+            self.apply_theme();
+            self.update_appearance_choices();
+            self.schedule_save();
+        }
     }
 
     fn update_theme_controls(&mut self) {
@@ -933,7 +971,10 @@ impl App {
         }
     }
 
-    fn open_settings(&mut self) {
+    fn open_settings(&mut self, section: Option<Section>) {
+        if let Some(section) = section {
+            self.settings_section = section;
+        }
         if let Some(index) = self
             .tabs
             .iter()
@@ -945,22 +986,13 @@ impl App {
         } else {
             self.new_tab(Location::Settings);
         }
-        let focus = if self
-            .hotkey_status
-            .as_ref()
-            .is_some_and(|status| status.configured || status.running)
+        self.update_appearance_choices();
+        self.layout();
+        if let Some((id, _)) = SECTIONS
+            .iter()
+            .find(|(_, section)| *section == self.settings_section)
         {
-            WIN_E_BETTER
-        } else {
-            WIN_E_WINDOWS
-        };
-        let focus = if self.hotkey_request.is_some() {
-            self.button(TAB_START + self.active as u16)
-        } else {
-            self.button(focus)
-        };
-        unsafe {
-            SetFocus(focus);
+            unsafe { SetFocus(self.button(*id)) };
         }
     }
 
@@ -973,10 +1005,43 @@ impl App {
             self.dpi,
             self.fonts,
         ));
+        for (id, section) in SECTIONS {
+            self.set_dynamic_button(id, section.label());
+        }
         for choice in SHORTCUT_CHOICES.into_iter().chain(DATE_CHOICES) {
             self.set_dynamic_button(choice.id, choice.caption);
         }
+        for (index, theme) in ThemePreference::ALL.into_iter().enumerate() {
+            self.set_dynamic_button(THEME_START + index as u16, theme.label());
+        }
         self.update_modified_date_controls();
+        self.update_appearance_choices();
+    }
+
+    fn update_appearance_choices(&self) {
+        if self.settings_controls.is_none() {
+            return;
+        }
+        let update = |id, label, selected| {
+            let control = self.button(id);
+            if !control.is_null() {
+                let name = settings_page::accessible_name(label, selected);
+                if read(control) != OsStr::new(&name) {
+                    text(control, name);
+                }
+                unsafe { InvalidateRect(control, null(), 0) };
+            }
+        };
+        for (id, section) in SECTIONS {
+            update(id, section.label(), self.settings_section == section);
+        }
+        for (index, theme) in ThemePreference::ALL.into_iter().enumerate() {
+            update(
+                THEME_START + index as u16,
+                theme.label(),
+                self.settings.theme == theme,
+            );
+        }
     }
 
     fn selected_setting(&self, id: u16) -> bool {
@@ -1116,6 +1181,11 @@ impl App {
         width < scale(866, self.dpi)
     }
 
+    fn tab_width(&self, width: i32) -> i32 {
+        let d = |value| scale(value, self.dpi);
+        ((width - d(193)) / self.tabs.len() as i32 - d(2)).clamp(d(32), d(221))
+    }
+
     fn layout(&mut self) {
         let bounds = rect(self.window);
         let w = bounds.right;
@@ -1129,7 +1199,7 @@ impl App {
         let margin = d(10);
         let settings_tab = *self.location() == Location::Settings;
         let home_tab = self.home.is_some() && *self.location() == Location::Home;
-        let tab_width = ((w - d(193)) / self.tabs.len() as i32 - d(2)).clamp(d(32), d(221));
+        let tab_width = self.tab_width(w);
         let mut x = margin;
         for offset in 0..TAB_LIMIT {
             let id = TAB_START + offset as u16;
@@ -1334,7 +1404,9 @@ impl App {
         set_visible(self.button(QUICK_ICONS), !settings_tab && !home_tab);
         if let Some(controls) = &self.settings_controls {
             controls.layout(
-                settings_tab.then(|| settings_page::Layout::new(sidebar_width, w, dpi)),
+                settings_tab.then(|| {
+                    settings_page::Layout::new(sidebar_width, w, h, dpi, self.settings_section)
+                }),
                 |id| self.button(id),
             );
         }
@@ -1557,6 +1629,19 @@ impl App {
             },
             self.colors.title,
         );
+        let next_tab_right = d(46) + self.tabs.len() as i32 * (self.tab_width(bounds.right) + d(2));
+        theme_visuals::paint_motif(
+            dc,
+            RECT {
+                left: next_tab_right + d(8),
+                top: d(3),
+                right: bounds.right - d(148),
+                bottom: d(36),
+            },
+            self.settings.theme,
+            &self.colors,
+            self.dpi,
+        );
         let (left, right, search_width) = self.address_bounds(bounds.right);
         rounded_fill(
             dc,
@@ -1625,8 +1710,14 @@ impl App {
             }
         }
         if settings_tab {
-            settings_page::Layout::new(self.sidebar_width(bounds.right), bounds.right, self.dpi)
-                .paint(dc, &self.colors);
+            settings_page::Layout::new(
+                self.sidebar_width(bounds.right),
+                bounds.right,
+                bounds.bottom,
+                self.dpi,
+                self.settings_section,
+            )
+            .paint(dc, &self.colors);
         }
         if right > 0 {
             if let Some(Content::Bitmap(image)) = &self.preview {
@@ -2138,16 +2229,7 @@ impl App {
             std::env::var("SystemDrive").ok().as_deref(),
         );
         self.measure_breadcrumbs();
-        let hint = wide(match self.location() {
-            Location::Home | Location::Computer | Location::PcSearch { .. } => {
-                "Search this PC".into()
-            }
-            Location::Folder(_) | Location::Search { .. } => {
-                format!("Search {}", self.location().caption())
-            }
-            _ => "Open a folder to search".into(),
-        });
-        send(self.search, EM_SETCUEBANNER, 1, hint.as_ptr() as isize);
+        self.update_search_hint();
         set_enabled(self.button(BACK), self.tab().history.can_back());
         set_enabled(self.button(FORWARD), self.tab().history.can_forward());
         set_enabled(
@@ -3187,6 +3269,18 @@ impl App {
             self.edit = None;
             self.layout();
         }
+        if *self.location() == Location::Settings {
+            if let Some(section) = settings_page::section(id) {
+                self.settings_section = section;
+                self.update_appearance_choices();
+                self.layout();
+                return;
+            }
+            if let Some(theme) = settings_page::theme(id) {
+                self.select_theme(theme);
+                return;
+            }
+        }
         match id {
             BACK | FORWARD => {
                 let history = &mut self.tab_mut().history;
@@ -3243,7 +3337,8 @@ impl App {
                 PostMessageW(self.window, WM_CLOSE, 0, 0);
             },
             ENTER_SEARCH => self.search(),
-            OPEN_SETTINGS => self.open_settings(),
+            OPEN_SETTINGS => self.open_settings(None),
+            OPEN_APPEARANCE => self.open_settings(Some(Section::Appearance)),
             WIN_E_WINDOWS | WIN_E_BETTER if *self.location() == Location::Settings => {
                 self.request_hotkey(HotkeyRequest::Change(id == WIN_E_BETTER));
             }
@@ -3676,13 +3771,11 @@ impl App {
                 self.status();
             }
             THEME_SYSTEM | THEME_DARK | THEME_LIGHT => {
-                self.settings.theme = match id {
+                self.select_theme(match id {
                     THEME_DARK => ThemePreference::Dark,
                     THEME_LIGHT => ThemePreference::Light,
                     _ => ThemePreference::System,
-                };
-                self.apply_theme();
-                self.schedule_save();
+                });
             }
             RESTORE_TABS => {
                 self.settings.restore_tabs = !self.settings.restore_tabs;
@@ -3992,6 +4085,7 @@ impl App {
                     item(RESTORE_TABS, "Restore tabs on startup")
                         .checked(self.settings.restore_tabs),
                     line(),
+                    item(OPEN_APPEARANCE, "Appearance…"),
                     item(THEME_SYSTEM, "Use system theme")
                         .checked(matches!(self.settings.theme, ThemePreference::System)),
                     item(THEME_DARK, "Dark theme")
@@ -5048,6 +5142,11 @@ fn key(app: &RefCell<App>, message: &MSG) -> bool {
     let alt = down(VK_MENU);
     let shift = down(VK_SHIFT);
     let vk = message.wParam as u16;
+    let focused_setting = if *app.location() == Location::Settings && !focus.is_null() {
+        (unsafe { GetDlgCtrlID(focus) }) as u16
+    } else {
+        0
+    };
     if vk == VK_TAB && !ctrl && !alt {
         let next = unsafe { GetNextDlgTabItem(app.window, focus, i32::from(shift)) };
         if !next.is_null() {
@@ -5063,13 +5162,8 @@ fn key(app: &RefCell<App>, message: &MSG) -> bool {
             app.select_sidebar();
             return true;
         }
-        (VK_RETURN, false, false, _) if focus == app.button(WIN_E_WINDOWS) => WIN_E_WINDOWS,
-        (VK_RETURN, false, false, _) if focus == app.button(WIN_E_BETTER) => WIN_E_BETTER,
-        (VK_RETURN, false, false, _) if focus == app.button(DATE_FORMAT_DAY_FIRST) => {
-            DATE_FORMAT_DAY_FIRST
-        }
-        (VK_RETURN, false, false, _) if focus == app.button(DATE_FORMAT_MONTH_FIRST) => {
-            DATE_FORMAT_MONTH_FIRST
+        (VK_RETURN, false, false, _) if settings_page::is_button(focused_setting) => {
+            focused_setting
         }
         (0x4C, true, false, _) | (VK_D, false, true, _) => {
             app.address_focus(true);
@@ -5474,6 +5568,26 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
                 app.draw_sidebar(draw);
             } else if (DRIVE_START..DRIVE_START + DRIVE_LIMIT as u16).contains(&id) {
                 app.draw_drive(draw, (id - DRIVE_START) as usize);
+            } else if let Some(section) = settings_page::section(id) {
+                settings_page::draw_section(
+                    draw,
+                    section,
+                    &app.colors,
+                    app.dpi,
+                    app.fonts,
+                    app.settings_section == section,
+                    app.hover == draw.hwndItem,
+                );
+            } else if let Some(theme) = settings_page::theme(id) {
+                settings_page::draw_theme(
+                    draw,
+                    theme,
+                    &app.colors,
+                    app.dpi,
+                    app.fonts,
+                    app.settings.theme == theme,
+                    app.hover == draw.hwndItem,
+                );
             } else if let Some(choice) = settings_page::choice(id) {
                 settings_page::draw_choice(
                     draw,
@@ -5619,11 +5733,71 @@ unsafe extern "system" fn button_proc(
         } else if msg == WM_MOUSELEAVE {
             PostMessageW(GetParent(window), HOVER, window as usize, 1);
         } else if matches!(msg, WM_SETFOCUS | WM_KILLFOCUS)
-            && settings_page::choice(GetDlgCtrlID(window) as u16).is_some()
+            && settings_page::is_button(GetDlgCtrlID(window) as u16)
         {
             InvalidateRect(window, null(), 0);
         }
         DefSubclassProc(window, msg, wp, lp)
+    }
+}
+
+unsafe extern "system" fn search_cue_proc(
+    window: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+    _: usize,
+    _: usize,
+) -> LRESULT {
+    unsafe {
+        if matches!(msg, WM_SETFOCUS | WM_KILLFOCUS) {
+            let result = DefSubclassProc(window, msg, wp, lp);
+            InvalidateRect(window, null(), 0);
+            return result;
+        }
+        if !matches!(msg, WM_PAINT | WM_PRINTCLIENT)
+            || GetFocus() == window
+            || GetWindowTextLengthW(window) != 0
+        {
+            return DefSubclassProc(window, msg, wp, lp);
+        }
+        let parent = GetParent(window);
+        let pointer = GetWindowLongPtrW(parent, GWLP_USERDATA) as *const RefCell<App>;
+        let Some(app) = pointer.as_ref().and_then(|app| app.try_borrow().ok()) else {
+            return DefSubclassProc(window, msg, wp, lp);
+        };
+        if !app.custom_search_cue() {
+            return DefSubclassProc(window, msg, wp, lp);
+        }
+
+        // The native single-line edit uses a fixed gray cue, which is too dim on dark themes.
+        let mut paint = zeroed();
+        let dc = if msg == WM_PAINT {
+            BeginPaint(window, &mut paint)
+        } else {
+            wp as HDC
+        };
+        if !dc.is_null() {
+            let bounds = rect(window);
+            let margins = send(window, EM_GETMARGINS, 0, 0) as u32;
+            fill(dc, &bounds, app.colors.field);
+            text_at(
+                dc,
+                &app.search_hint(),
+                RECT {
+                    left: (margins & 0xffff) as i32,
+                    right: bounds.right - (margins >> 16) as i32,
+                    ..bounds
+                },
+                app.fonts[0],
+                app.colors.muted,
+                DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+            );
+        }
+        if msg == WM_PAINT {
+            EndPaint(window, &paint);
+        }
+        0
     }
 }
 
@@ -5818,6 +5992,7 @@ pub fn run(path: Option<PathBuf>) -> Result<(), std::io::Error> {
                 SetWindowSubclass(app.header, Some(header_proc), 1, 0);
             }
             SetWindowSubclass(app.list, Some(group_list_proc), 2, 0);
+            SetWindowSubclass(app.search, Some(search_cue_proc), 1, 0);
             for &(_, button) in &app.buttons {
                 SetWindowSubclass(button, Some(button_proc), 1, 0);
             }

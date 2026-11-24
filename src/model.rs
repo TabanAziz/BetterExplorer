@@ -263,12 +263,46 @@ pub enum ModifiedDateFormat {
     MonthDayYear,
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ThemePreference {
     #[default]
     System,
     Dark,
     Light,
+    DeepSpace,
+    PaperWhite,
+    CandyRush,
+    Frost,
+    Eclipse,
+    CyberGrid,
+}
+
+impl ThemePreference {
+    pub const ALL: [Self; 9] = [
+        Self::System,
+        Self::Light,
+        Self::Dark,
+        Self::DeepSpace,
+        Self::PaperWhite,
+        Self::CandyRush,
+        Self::Frost,
+        Self::Eclipse,
+        Self::CyberGrid,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::System => "System",
+            Self::Light => "Light",
+            Self::Dark => "Dark",
+            Self::DeepSpace => "Deep Space",
+            Self::PaperWhite => "Paper White",
+            Self::CandyRush => "Candy Rush",
+            Self::Frost => "Frost",
+            Self::Eclipse => "Eclipse",
+            Self::CyberGrid => "Cyber Grid",
+        }
+    }
 }
 
 pub fn settings_path() -> Option<PathBuf> {

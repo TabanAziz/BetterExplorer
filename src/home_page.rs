@@ -1,5 +1,6 @@
 use crate::chrome::{
-    button, draw_glyph, draw_resource_icon, fill, font, rect, rgb, scale, text_at, Glyph, Palette,
+    button, draw_glyph, draw_resource_icon, fill, font, rect, rgb, rounded_fill, scale, text_at,
+    Glyph, Palette,
 };
 use better_explorer::model::wide;
 use std::{
@@ -32,6 +33,8 @@ const GAP: i32 = 9;
 const TILE_HEIGHT: i32 = 62;
 const ROW_HEIGHT: i32 = 46;
 const TAB_HEIGHT: i32 = 33;
+const TAB_INSET: i32 = 3;
+const TAB_GAP: i32 = 3;
 const REVEAL: u32 = WM_APP + 1;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -426,6 +429,12 @@ struct Layout {
 }
 
 impl Layout {
+    fn tab_width(self, dpi: u32) -> i32 {
+        let inset = scale(TAB_INSET, dpi);
+        let gap = scale(TAB_GAP, dpi);
+        ((self.width - 2 * inset - gap) / 2).clamp(0, scale(98, dpi))
+    }
+
     fn new(
         width: i32,
         height: i32,
@@ -543,15 +552,16 @@ impl State {
                 d(TILE_HEIGHT),
             );
         }
-        let tab_gap = d(4);
-        let tab_width = ((layout.width - tab_gap) / 2).clamp(0, d(98));
+        let inset = d(TAB_INSET);
+        let tab_gap = d(TAB_GAP);
+        let tab_width = layout.tab_width(self.dpi.get());
         for (index, tab) in self.tabs.into_iter().enumerate() {
             place(
                 tab,
-                layout.x + index as i32 * (tab_width + tab_gap),
-                layout.tabs_y,
+                layout.x + inset + index as i32 * (tab_width + tab_gap),
+                layout.tabs_y + inset,
                 tab_width,
-                d(TAB_HEIGHT),
+                d(TAB_HEIGHT) - 2 * inset,
             );
         }
         for (index, entry) in activity.iter().enumerate() {
@@ -695,6 +705,13 @@ impl State {
             colors.text,
             flags,
         );
+        let track = area(
+            layout.x,
+            layout.tabs_y - offset,
+            layout.tab_width(self.dpi.get()) * 2 + 2 * d(TAB_INSET) + d(TAB_GAP),
+            d(TAB_HEIGHT),
+        );
+        rounded_fill(dc, &track, d(10), colors.tile);
         let separator = line(layout.tabs_y + d(TAB_HEIGHT + 4), d(1));
         fill(dc, &separator, colors.edge);
         if self.activity.borrow().is_empty() {
@@ -749,26 +766,19 @@ impl State {
             Activity::Favorites
         };
         let selected = self.selected.get() == tab;
-        let highlighted = hot || selected;
-        fill(draw.hDC, &bounds, colors.content);
-        if highlighted || focused {
-            round_box(
-                draw.hDC,
-                &bounds,
-                d(8),
-                if highlighted {
-                    colors.highlight()
-                } else {
-                    colors.content
-                },
-                if focused && !(highlighted && colors.contrast) {
-                    colors.accent
-                } else if highlighted {
-                    colors.highlight()
-                } else {
-                    colors.content
-                },
-            );
+        let highlighted = selected || (hot && colors.contrast);
+        let surface = if highlighted {
+            colors.highlight()
+        } else if hot {
+            colors.edge
+        } else {
+            colors.tile
+        };
+        fill(draw.hDC, &bounds, colors.tile);
+        if focused && !colors.contrast {
+            round_box(draw.hDC, &bounds, d(7), surface, colors.muted);
+        } else if surface != colors.tile {
+            rounded_fill(draw.hDC, &bounds, d(7), surface);
         }
         let label = if tab == Activity::Recent {
             "Recent"
@@ -782,20 +792,13 @@ impl State {
             if selected { fonts.label } else { fonts.regular },
             if highlighted {
                 colors.highlight_text()
-            } else {
+            } else if hot {
                 colors.text
+            } else {
+                colors.muted
             },
             DT_SINGLELINE | DT_VCENTER | DT_CENTER,
         );
-        if selected && !colors.contrast {
-            let mark = area(
-                (bounds.right - d(16)) / 2,
-                bounds.bottom - d(4),
-                d(16),
-                d(2),
-            );
-            fill(draw.hDC, &mark, colors.accent);
-        }
         if focused && colors.contrast {
             let focus = area(
                 bounds.left + d(2),

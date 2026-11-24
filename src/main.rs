@@ -19,6 +19,8 @@ mod preview;
 #[cfg(windows)]
 mod settings_page;
 #[cfg(windows)]
+mod theme_visuals;
+#[cfg(windows)]
 mod ui;
 #[cfg(windows)]
 mod window_geometry;
