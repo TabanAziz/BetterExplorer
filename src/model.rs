@@ -1,3 +1,4 @@
+use crate::namespace::Namespace;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -12,6 +13,11 @@ pub enum Location {
     Home,
     Computer,
     Settings,
+    Namespace {
+        kind: Namespace,
+        child: Option<String>,
+        title: Option<String>,
+    },
     Folder(PathBuf),
     Search {
         root: PathBuf,
@@ -22,6 +28,14 @@ pub enum Location {
 impl Location {
     pub fn path(path: impl Into<PathBuf>) -> Self {
         Self::Folder(path.into())
+    }
+
+    pub fn namespace(kind: Namespace) -> Self {
+        Self::Namespace {
+            kind,
+            child: None,
+            title: None,
+        }
     }
 
     pub fn directory(&self) -> Option<&Path> {
@@ -36,6 +50,11 @@ impl Location {
             Self::Home => "Home".into(),
             Self::Computer => "This PC".into(),
             Self::Settings => "Settings".into(),
+            Self::Namespace { kind, title, .. } => title.clone().unwrap_or_else(|| match kind {
+                Namespace::Network => "Network".into(),
+                Namespace::RecycleBin => "Recycle Bin".into(),
+                Namespace::Libraries => "Libraries".into(),
+            }),
             Self::Search { query, .. } => format!("Search: {query}"),
             Self::Folder(path) => path
                 .file_name()
@@ -144,15 +163,25 @@ pub struct Settings {
     pub hidden: bool,
     pub hide_extensions: bool,
     pub details: bool,
+    pub modified_date_format: ModifiedDateFormat,
     pub theme: ThemePreference,
     pub restore_tabs: bool,
     pub active: usize,
     pub tabs: Vec<Location>,
     pub pins: Vec<PathBuf>,
+    pub recent: Vec<PathBuf>,
+    pub favorites: Vec<PathBuf>,
+    pub home_compact: bool,
     pub views: BTreeMap<PathBuf, u32>,
 }
 
 impl Settings {
+    pub fn record_recent(&mut self, path: PathBuf) {
+        self.recent.retain(|entry| entry != &path);
+        self.recent.insert(0, path);
+        self.recent.truncate(40);
+    }
+
     pub fn remember_tabs(&mut self, tabs: impl IntoIterator<Item = Location>, active: usize) {
         self.tabs.clear();
         self.active = 0;
@@ -166,6 +195,13 @@ impl Settings {
             self.tabs.push(location);
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ModifiedDateFormat {
+    #[default]
+    DayMonthYear,
+    MonthDayYear,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]

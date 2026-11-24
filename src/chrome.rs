@@ -1,5 +1,7 @@
 use better_explorer::model::{from_wide, wide, ThemePreference};
 use std::{
+    cell::RefCell,
+    collections::HashMap,
     ffi::OsString,
     mem::{size_of, zeroed},
     ptr::{null, null_mut},
@@ -7,7 +9,10 @@ use std::{
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, RECT, WPARAM},
     Graphics::{
-        Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE},
+        Dwm::{
+            DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
+            DWMWCP_ROUND,
+        },
         Gdi::*,
     },
     System::{
@@ -31,6 +36,7 @@ pub struct Palette {
     pub chrome: u32,
     pub title: u32,
     pub sidebar: u32,
+    pub field: u32,
     pub content: u32,
     pub text: u32,
     pub muted: u32,
@@ -60,6 +66,7 @@ impl Palette {
                 chrome: color(COLOR_BTNFACE),
                 title: color(COLOR_BTNFACE),
                 sidebar: color(COLOR_WINDOW),
+                field: color(COLOR_WINDOW),
                 content: color(COLOR_WINDOW),
                 text: color(COLOR_WINDOWTEXT),
                 muted: color(COLOR_WINDOWTEXT),
@@ -77,29 +84,31 @@ impl Palette {
             Self {
                 dark,
                 contrast,
-                chrome: rgb(32, 30, 30),
-                title: rgb(44, 34, 32),
-                sidebar: rgb(32, 31, 30),
-                content: rgb(26, 25, 25),
-                text: rgb(242, 240, 238),
-                muted: rgb(184, 179, 176),
-                edge: rgb(63, 58, 55),
-                active: rgb(68, 49, 39),
-                accent: rgb(255, 155, 82),
+                chrome: rgb(33, 34, 39),
+                title: rgb(36, 32, 48),
+                sidebar: rgb(30, 31, 35),
+                field: rgb(47, 44, 57),
+                content: rgb(26, 27, 30),
+                text: rgb(244, 243, 248),
+                muted: rgb(184, 182, 196),
+                edge: rgb(59, 58, 70),
+                active: rgb(55, 52, 68),
+                accent: rgb(255, 174, 92),
             }
         } else {
             Self {
                 dark,
                 contrast,
-                chrome: rgb(249, 246, 243),
-                title: rgb(242, 229, 220),
-                sidebar: rgb(251, 248, 246),
+                chrome: rgb(248, 248, 252),
+                title: rgb(237, 234, 248),
+                sidebar: rgb(246, 246, 251),
+                field: rgb(248, 246, 252),
                 content: rgb(255, 255, 255),
-                text: rgb(32, 30, 28),
-                muted: rgb(94, 86, 82),
-                edge: rgb(229, 218, 211),
-                active: rgb(250, 231, 217),
-                accent: rgb(163, 68, 24),
+                text: rgb(32, 31, 42),
+                muted: rgb(94, 92, 111),
+                edge: rgb(221, 219, 231),
+                active: rgb(230, 225, 247),
+                accent: rgb(158, 75, 21),
             }
         }
     }
@@ -128,7 +137,7 @@ pub fn set_theme(window: HWND, list: HWND, palette: &Palette) {
         Vec::new()
     } else {
         wide(if palette.dark {
-            "DarkMode_ItemsView"
+            "DarkMode_Explorer"
         } else {
             "Explorer"
         })
@@ -143,6 +152,13 @@ pub fn set_theme(window: HWND, list: HWND, palette: &Palette) {
             window,
             DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
             (&dark as *const i32).cast(),
+            size_of::<i32>() as u32,
+        );
+        let corners = DWMWCP_ROUND;
+        DwmSetWindowAttribute(
+            window,
+            DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+            (&corners as *const i32).cast(),
             size_of::<i32>() as u32,
         );
         SetWindowTheme(list, style_ptr, null());
@@ -224,7 +240,7 @@ pub fn send(window: HWND, message: u32, wp: WPARAM, lp: LPARAM) -> isize {
 
 pub fn move_to(window: HWND, x: i32, y: i32, width: i32, height: i32) {
     unsafe {
-        MoveWindow(window, x, y, width.max(0), height.max(0), 1);
+        MoveWindow(window, x, y, width.max(0), height.max(0), 0);
     }
 }
 
@@ -299,11 +315,13 @@ pub fn draw_button(
         } else {
             palette.active
         };
-        fill(dc, &r, color);
+        rounded_fill(dc, &r, scale(5, dpi), color);
         if style.active {
             fill(
                 dc,
                 &RECT {
+                    left: r.left + inset,
+                    right: r.right - inset,
                     top: r.bottom - inset,
                     ..r
                 },
@@ -374,6 +392,47 @@ pub struct ButtonStyle {
     pub icon_color: u32,
 }
 
+struct ResourceIcon(HICON);
+
+impl Drop for ResourceIcon {
+    fn drop(&mut self) {
+        unsafe {
+            DestroyIcon(self.0);
+        }
+    }
+}
+
+thread_local! {
+    static RESOURCE_ICONS: RefCell<HashMap<(u16, i32), ResourceIcon>> = RefCell::new(HashMap::new());
+}
+
+pub fn draw_resource_icon(dc: HDC, resource: u16, x: i32, y: i32, side: i32) -> bool {
+    RESOURCE_ICONS.with_borrow_mut(|icons| {
+        let key = (resource, side);
+        if icons.len() >= 96 && !icons.contains_key(&key) {
+            icons.clear();
+        }
+        if let std::collections::hash_map::Entry::Vacant(entry) = icons.entry(key) {
+            let icon = unsafe {
+                LoadImageW(
+                    GetModuleHandleW(null()),
+                    resource as usize as *const u16,
+                    IMAGE_ICON,
+                    side,
+                    side,
+                    0,
+                )
+            };
+            if !icon.is_null() {
+                entry.insert(ResourceIcon(icon));
+            }
+        }
+        icons.get(&key).is_some_and(|icon| unsafe {
+            DrawIconEx(dc, x, y, icon.0, side, side, 0, null_mut(), DI_NORMAL) != 0
+        })
+    })
+}
+
 pub fn list_images(dpi: u32, side: i32) -> HIMAGELIST {
     let side = scale(side, dpi);
     unsafe {
@@ -396,7 +455,7 @@ pub fn list_images(dpi: u32, side: i32) -> HIMAGELIST {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Glyph {
     Back,
     Forward,
@@ -429,7 +488,164 @@ pub enum Glyph {
     Settings,
 }
 
+pub fn rounded_fill(dc: HDC, bounds: &RECT, radius: i32, color: u32) {
+    unsafe {
+        let brush = CreateSolidBrush(color);
+        let old_brush = SelectObject(dc, brush);
+        let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
+        RoundRect(
+            dc,
+            bounds.left,
+            bounds.top,
+            bounds.right,
+            bounds.bottom,
+            radius * 2,
+            radius * 2,
+        );
+        SelectObject(dc, old_pen);
+        SelectObject(dc, old_brush);
+        DeleteObject(brush);
+    }
+}
+
+struct IconBitmap {
+    dc: HDC,
+    bitmap: HBITMAP,
+    previous: HGDIOBJ,
+    pixels: *mut u32,
+}
+
+impl IconBitmap {
+    fn new(dc: HDC, size: i32) -> Option<Self> {
+        unsafe {
+            let mut info: BITMAPINFO = zeroed();
+            info.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+            info.bmiHeader.biWidth = size;
+            info.bmiHeader.biHeight = -size;
+            info.bmiHeader.biPlanes = 1;
+            info.bmiHeader.biBitCount = 32;
+            let mut pixels = null_mut();
+            let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut pixels, null_mut(), 0);
+            if bitmap.is_null() {
+                return None;
+            }
+            let dc = CreateCompatibleDC(dc);
+            if dc.is_null() {
+                DeleteObject(bitmap);
+                return None;
+            }
+            let previous = SelectObject(dc, bitmap);
+            Some(Self {
+                dc,
+                bitmap,
+                previous,
+                pixels: pixels.cast(),
+            })
+        }
+    }
+
+    fn rasterize(dc: HDC, glyph: Glyph, size: i32, color: u32) -> Option<Self> {
+        const SAMPLES: usize = 4;
+        let source_size = size as usize * SAMPLES;
+        let source = Self::new(dc, source_size as i32)?;
+        let destination = Self::new(dc, size)?;
+        unsafe {
+            std::ptr::write_bytes(source.pixels, 0, source_size * source_size);
+        }
+        draw_glyph_shape(
+            source.dc,
+            glyph,
+            0,
+            0,
+            source_size as i32,
+            rgb(255, 255, 255),
+        );
+        unsafe {
+            GdiFlush();
+        }
+        let pixels =
+            unsafe { std::slice::from_raw_parts(source.pixels, source_size * source_size) };
+        let size = size as usize;
+        for y in 0..size {
+            for x in 0..size {
+                let mut covered = 0;
+                for dy in 0..SAMPLES {
+                    let offset = (y * SAMPLES + dy) * source_size + x * SAMPLES;
+                    covered += pixels[offset..offset + SAMPLES]
+                        .iter()
+                        .filter(|pixel| **pixel & 255 != 0)
+                        .count();
+                }
+                let a = ((covered * 255 + SAMPLES * SAMPLES / 2) / (SAMPLES * SAMPLES)) as u32;
+                let channel = |shift: u32| ((color >> shift) & 255u32) * a / 255;
+                let pixel = a << 24 | channel(0) << 16 | channel(8) << 8 | channel(16);
+                unsafe {
+                    destination.pixels.add(y * size + x).write(pixel);
+                }
+            }
+        }
+        Some(destination)
+    }
+}
+
+impl Drop for IconBitmap {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.dc, self.previous);
+            DeleteObject(self.bitmap);
+            DeleteDC(self.dc);
+        }
+    }
+}
+
+type IconCache = HashMap<(Glyph, i32, u32), IconBitmap>;
+
+thread_local! {
+    static ICONS: RefCell<IconCache> = RefCell::new(HashMap::new());
+}
+
 pub fn draw_glyph(dc: HDC, glyph: Glyph, x: i32, y: i32, size: i32, color: u32) {
+    if !(6..=64).contains(&size) {
+        draw_glyph_shape(dc, glyph, x, y, size, color);
+        return;
+    }
+    let painted = ICONS.with_borrow_mut(|icons| {
+        let key = (glyph, size, color);
+        if icons.len() >= 192 && !icons.contains_key(&key) {
+            icons.clear();
+        }
+        if let std::collections::hash_map::Entry::Vacant(entry) = icons.entry(key) {
+            if let Some(icon) = IconBitmap::rasterize(dc, glyph, size, color) {
+                entry.insert(icon);
+            }
+        }
+        icons.get(&key).is_some_and(|icon| unsafe {
+            GdiAlphaBlend(
+                dc,
+                x,
+                y,
+                size,
+                size,
+                icon.dc,
+                0,
+                0,
+                size,
+                size,
+                BLENDFUNCTION {
+                    BlendOp: AC_SRC_OVER as u8,
+                    BlendFlags: 0,
+                    SourceConstantAlpha: 255,
+                    AlphaFormat: AC_SRC_ALPHA as u8,
+                },
+            ) != 0
+        })
+    });
+    if !painted {
+        draw_glyph_shape(dc, glyph, x, y, size, color);
+    }
+}
+
+fn draw_glyph_shape(dc: HDC, glyph: Glyph, x: i32, y: i32, size: i32, color: u32) {
     use windows_sys::Win32::Foundation::POINT;
 
     let stroke = |points: &[(i32, i32)]| {
@@ -455,8 +671,18 @@ pub fn draw_glyph(dc: HDC, glyph: Glyph, x: i32, y: i32, size: i32, color: u32) 
     };
     let dot = |px, py| stroke(&[(px, py), (px + 2, py)]);
     unsafe {
-        let pen = CreatePen(PS_SOLID, (size / 13).max(1), color);
+        let pen = CreatePen(PS_SOLID, (size / 12).max(1), color);
         let old = SelectObject(dc, pen);
+        let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        let round = |l, t, r, b| {
+            Ellipse(
+                dc,
+                x + l * size / 16,
+                y + t * size / 16,
+                x + r * size / 16,
+                y + b * size / 16,
+            )
+        };
         match glyph {
             Glyph::Back => {
                 stroke(&[(13, 8), (3, 8)]);
@@ -548,17 +774,7 @@ pub fn draw_glyph(dc: HDC, glyph: Glyph, x: i32, y: i32, size: i32, color: u32) 
                 dot(10, 9);
             }
             Glyph::Search => {
-                stroke(&[
-                    (3, 3),
-                    (8, 2),
-                    (11, 5),
-                    (11, 8),
-                    (8, 11),
-                    (4, 11),
-                    (2, 8),
-                    (2, 5),
-                    (3, 3),
-                ]);
+                round(2, 2, 11, 11);
                 stroke(&[(10, 10), (14, 14)]);
             }
             Glyph::Folder => stroke(&[(2, 4), (7, 4), (8, 6), (14, 6), (14, 13), (2, 13), (2, 4)]),
@@ -568,10 +784,34 @@ pub fn draw_glyph(dc: HDC, glyph: Glyph, x: i32, y: i32, size: i32, color: u32) 
                 stroke(&[(4, 14), (12, 14)]);
             }
             Glyph::Settings => {
-                for (row, handle) in [(3, 5), (8, 11), (13, 7)] {
-                    stroke(&[(2, row), (14, row)]);
-                    stroke(&[(handle, row - 2), (handle, row + 2)]);
-                }
+                stroke(&[
+                    (6, 2),
+                    (10, 2),
+                    (10, 4),
+                    (11, 5),
+                    (13, 4),
+                    (15, 7),
+                    (13, 8),
+                    (13, 9),
+                    (15, 10),
+                    (13, 13),
+                    (11, 12),
+                    (10, 13),
+                    (10, 15),
+                    (6, 15),
+                    (6, 13),
+                    (5, 12),
+                    (3, 13),
+                    (1, 10),
+                    (3, 9),
+                    (3, 8),
+                    (1, 7),
+                    (3, 4),
+                    (5, 5),
+                    (6, 4),
+                    (6, 2),
+                ]);
+                round(6, 6, 11, 11);
             }
             Glyph::Home => {
                 stroke(&[(1, 7), (8, 2), (15, 7)]);
@@ -619,6 +859,7 @@ pub fn draw_glyph(dc: HDC, glyph: Glyph, x: i32, y: i32, size: i32, color: u32) 
             }
             Glyph::Chevron => stroke(&[(6, 4), (10, 8), (6, 12)]),
         }
+        SelectObject(dc, old_brush);
         SelectObject(dc, old);
         DeleteObject(pen);
     }

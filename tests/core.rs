@@ -90,3 +90,94 @@ fn settings_tab_is_not_saved_as_a_folder_to_restore() {
     assert!(settings.tabs.is_empty());
     assert_eq!(settings.active, 0);
 }
+
+fn entry_at_local_date(month: u16, day: u16) -> better_explorer::work::Entry {
+    use better_explorer::model::wide;
+    use better_explorer::work::Entry;
+    use windows_sys::Win32::{
+        Foundation::{FILETIME, SYSTEMTIME},
+        Storage::FileSystem::LocalFileTimeToFileTime,
+        System::Time::SystemTimeToFileTime,
+    };
+    let date = SYSTEMTIME {
+        wYear: 2026,
+        wMonth: month,
+        wDay: day,
+        wHour: 17,
+        wMinute: 5,
+        ..unsafe { std::mem::zeroed() }
+    };
+    let mut local: FILETIME = unsafe { std::mem::zeroed() };
+    let mut utc: FILETIME = unsafe { std::mem::zeroed() };
+    assert_ne!(unsafe { SystemTimeToFileTime(&date, &mut local) }, 0);
+    assert_ne!(unsafe { LocalFileTimeToFileTime(&local, &mut utc) }, 0);
+    Entry {
+        path: "example.txt".into(),
+        name: wide("example.txt"),
+        extension: wide("txt"),
+        directory: false,
+        size: 0,
+        modified: u64::from(utc.dwHighDateTime) << 32 | u64::from(utc.dwLowDateTime),
+        location: false,
+        capacity: None,
+        shell_item: None,
+    }
+}
+
+#[test]
+fn date_modified_formats_local_time_day_first_by_default() {
+    use better_explorer::model::Settings;
+    let entry = entry_at_local_date(2, 14);
+    assert_eq!(
+        entry.date(Settings::default().modified_date_format),
+        "14.02.2026 17:05"
+    );
+}
+
+#[test]
+fn existing_settings_without_a_date_format_use_day_first() {
+    use better_explorer::model::{ModifiedDateFormat, Settings};
+    let settings: Settings = serde_json::from_str(r#"{"details":true}"#).unwrap();
+    assert!(settings.details);
+    assert_eq!(
+        settings.modified_date_format,
+        ModifiedDateFormat::DayMonthYear
+    );
+}
+
+#[test]
+fn date_modified_formats_local_time_month_first_using_saved_choice() {
+    use better_explorer::model::{ModifiedDateFormat, Settings};
+    let settings = Settings {
+        modified_date_format: ModifiedDateFormat::MonthDayYear,
+        ..Settings::default()
+    };
+    let saved = serde_json::to_vec(&settings).unwrap();
+    let restored: Settings = serde_json::from_slice(&saved).unwrap();
+    assert_eq!(
+        entry_at_local_date(2, 14).date(restored.modified_date_format),
+        "02/14/2026 17:05"
+    );
+}
+
+#[test]
+fn date_modified_sort_uses_timestamps_across_month_boundaries() {
+    use better_explorer::model::ModifiedDateFormat;
+    use better_explorer::work::{sort_entries, Column};
+    use std::sync::Arc;
+    let mut entries = [
+        Arc::new(entry_at_local_date(2, 14)),
+        Arc::new(entry_at_local_date(1, 28)),
+    ];
+    sort_entries(
+        &mut entries,
+        Sort {
+            column: Column::Modified,
+            descending: false,
+        },
+    );
+    assert_eq!(
+        entries.map(|entry| entry.date(ModifiedDateFormat::DayMonthYear)),
+        ["28.01.2026 17:05", "14.02.2026 17:05"]
+    );
+}

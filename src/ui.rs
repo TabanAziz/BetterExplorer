@@ -1,19 +1,22 @@
 use crate::hotkey;
 use crate::{
     benchmark::{self, Bench},
+    breadcrumb,
     chrome::*,
+    home_page::{Activity, HomePage, Icon, Item},
     preview::{self, Content},
 };
 use better_explorer::{
     model::{
-        from_wide, read_settings, safe_name, wide, write_settings, History, Location, Settings,
-        ThemePreference,
+        from_wide, read_settings, safe_name, wide, write_settings, History, Location,
+        ModifiedDateFormat, Settings, ThemePreference,
     },
+    namespace::Namespace,
     shell::{self, Operation},
     work::{self, Column, Entry, Request, ScanEvent, Scanner, Sort},
 };
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::VecDeque,
     ffi::{OsStr, OsString},
     mem::{size_of, zeroed},
@@ -46,6 +49,20 @@ const BENCH_PRESENT: u32 = WM_APP + 7;
 const BENCH_STARTED: u32 = WM_APP + 8;
 const REFRESH_TIMER: usize = 1;
 const SETTINGS_TIMER: usize = 2;
+const RESIZE_EDGE: i32 = 7;
+
+#[derive(Clone, Copy)]
+struct ControlColors {
+    text: u32,
+    muted: u32,
+    surfaces: [u32; 4],
+    brushes: [HBRUSH; 4],
+}
+
+thread_local! {
+    // Controls can request their brushes during synchronous layout and text changes.
+    static CONTROL_COLORS: Cell<Option<ControlColors>> = const { Cell::new(None) };
+}
 
 const LIST: u16 = 100;
 const ADDRESS: u16 = 101;
@@ -120,17 +137,35 @@ const COMPRESS: u16 = 188;
 const EXTRACT: u16 = 189;
 const HOME: u16 = 170;
 const COMPUTER: u16 = 171;
-const PLACE_START: u16 = 172;
-const PINNED: u16 = 179;
 const NETWORK: u16 = 180;
 const RECYCLE: u16 = 181;
 const LIBRARIES: u16 = 182;
 const OPEN_SETTINGS: u16 = 190;
 const WIN_E_WINDOWS: u16 = 191;
 const WIN_E_BETTER: u16 = 192;
+const NAVIGATION: u16 = 193;
+const SUMMARY: u16 = 205;
+const DATE_FORMAT_DAY_FIRST: u16 = 206;
+const DATE_FORMAT_MONTH_FIRST: u16 = 207;
+const RECYCLE_RESTORE: u16 = 208;
+const RECYCLE_EMPTY: u16 = 209;
+const HOME_RECENT: u16 = 194;
+const HOME_FAVORITES: u16 = 195;
+const HOME_TILES: u16 = 196;
+const HOME_CONTENT: u16 = 197;
+const FAVORITE: u16 = 198;
+const FILTER_TYPES: [(u16, Filter, &str); 6] = [
+    (199, Filter::Word, "Word"),
+    (200, Filter::Excel, "Excel"),
+    (201, Filter::PowerPoint, "PowerPoint"),
+    (202, Filter::Pictures, "Pictures"),
+    (203, Filter::Videos, "Videos"),
+    (204, Filter::Pdf, "PDF"),
+];
+const HOME_QUICK_START: u16 = 600;
+const HOME_ACTIVITY_START: u16 = 700;
 const TAB_START: u16 = 300;
-const BREADCRUMB_START: u16 = 340;
-const PIN_START: u16 = 430;
+const BREADCRUMB_START: u16 = 1000;
 const TAB_LIMIT: usize = 10;
 const FRAME_MIN: u16 = 165;
 const FRAME_MAX: u16 = 166;
@@ -138,7 +173,7 @@ const FRAME_CLOSE: u16 = 167;
 const QUICK_DETAILS: u16 = 168;
 const QUICK_ICONS: u16 = 169;
 const CRUMB_START: u16 = 520;
-const CRUMB_LIMIT: usize = 7;
+const CRUMB_LIMIT: usize = 32;
 const DRIVE_START: u16 = 560;
 const DRIVE_LIMIT: usize = 26;
 const VIEW_CARDS: u32 = 10;
@@ -153,7 +188,7 @@ const COLUMNS: [(&str, i32); 4] = [
 ];
 
 const COMMANDS: &[(u16, &str, i32)] = &[
-    (NEW, "New  ▾", 76),
+    (NEW, "New ▾", 84),
     (CUT, "Cut", 43),
     (COPY, "Copy", 43),
     (PASTE, "Paste", 43),
@@ -174,7 +209,7 @@ const PLACES: [&str; 6] = [
     "Music",
     "Videos",
 ];
-const MENU_IDS: [u16; 8] = [NEW, SORT, VIEW, FILTER, MORE, PATH, PINNED, CONTEXT];
+const MENU_IDS: [u16; 7] = [NEW, SORT, VIEW, FILTER, MORE, PATH, CONTEXT];
 
 enum Event {
     Scan(ScanEvent),
@@ -188,6 +223,7 @@ enum Event {
     Operation {
         result: Result<String, String>,
         refresh: bool,
+        opened: Option<PathBuf>,
     },
 }
 
@@ -232,15 +268,43 @@ enum Filter {
     All,
     Folders,
     Files,
+    Word,
+    Excel,
+    PowerPoint,
+    Pictures,
+    Videos,
+    Pdf,
 }
 
 impl Filter {
     fn shows(self, item: &Entry) -> bool {
-        match self {
-            Self::All => true,
-            Self::Folders => item.directory,
-            Self::Files => !item.directory,
-        }
+        let path = item
+            .shell_item
+            .as_ref()
+            .map_or(item.path.as_path(), |shell| Path::new(&shell.name));
+        self.matches(path, item.directory)
+    }
+
+    fn matches(self, path: &Path, directory: bool) -> bool {
+        let extensions: &[&str] = match self {
+            Self::All => return true,
+            Self::Folders => return directory,
+            Self::Files => return !directory,
+            Self::Word => &["doc", "docx", "docm", "dot", "dotx", "odt", "rtf"],
+            Self::Excel => &["xls", "xlsx", "xlsm", "xlsb", "csv", "ods"],
+            Self::PowerPoint => &["ppt", "pptx", "pptm", "ppsx", "odp"],
+            Self::Pictures => &[
+                "png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "heic", "svg", "ico", "avif",
+            ],
+            Self::Videos => &["mp4", "mov", "mkv", "webm", "avi", "wmv", "m4v", "mpeg"],
+            Self::Pdf => &["pdf"],
+        };
+        !directory
+            && path.extension().is_some_and(|extension| {
+                extensions
+                    .iter()
+                    .any(|kind| extension.eq_ignore_ascii_case(kind))
+            })
     }
 }
 
@@ -254,10 +318,11 @@ enum Edit {
 }
 
 #[derive(Clone, Copy)]
-struct ShortcutControls {
+struct SettingsControls {
     heading: HWND,
     description: HWND,
     state: HWND,
+    date_format_heading: HWND,
 }
 
 #[derive(Clone, Copy)]
@@ -266,10 +331,27 @@ enum HotkeyRequest {
     Change(bool),
 }
 
+#[derive(PartialEq, Eq)]
+struct NavRow {
+    label: String,
+    target: Option<Location>,
+    command: u16,
+    icon: u16,
+    pinned: bool,
+}
+
 struct App {
     window: HWND,
     buttons: Vec<(u16, HWND)>,
     list: HWND,
+    navigation: HWND,
+    nav_rows: Vec<NavRow>,
+    home: Option<HomePage>,
+    home_activity: Activity,
+    home_filter: Filter,
+    popup_items: Vec<MenuItem>,
+    home_quick_paths: Vec<PathBuf>,
+    home_activity_paths: Vec<PathBuf>,
     address: HWND,
     search: HWND,
     title: HWND,
@@ -281,22 +363,23 @@ struct App {
     edit_name: HWND,
     images: [HIMAGELIST; 2],
     icon_size: i32,
+    fitted_columns: Option<[i32; 4]>,
     fonts: [HFONT; 2],
-    brushes: [HBRUSH; 2],
+    brushes: [HBRUSH; 4],
     dpi: u32,
     colors: Palette,
     tabs: Vec<Tab>,
     active: usize,
     settings: Settings,
-    shortcut_controls: Option<ShortcutControls>,
+    settings_controls: Option<SettingsControls>,
     hotkey_status: Option<hotkey::Status>,
     hotkey_request: Option<HotkeyRequest>,
     hotkey_error: Option<String>,
     places: Vec<(PathBuf, &'static str)>,
-    pinned: Vec<PathBuf>,
     crumbs: Vec<PathBuf>,
-    crumb_slots: Vec<Location>,
-    crumb_display: Vec<(String, i32)>,
+    crumb_slots: Vec<Option<Location>>,
+    crumb_segments: Vec<(String, Location)>,
+    crumb_widths: Vec<i32>,
     editing_address: bool,
     header: HWND,
     hover: HWND,
@@ -338,12 +421,6 @@ impl App {
             (UP, "Up"),
             (REFRESH, "Refresh"),
             (PATH, "Path choices"),
-            (HOME, "Home"),
-            (COMPUTER, "This PC"),
-            (PINNED, "Pinned folders  ▾"),
-            (NETWORK, "Network"),
-            (RECYCLE, "Recycle Bin"),
-            (LIBRARIES, "Libraries"),
             (ACCEPT, "Apply"),
             (CANCEL, "Cancel"),
             (STOP_SEARCH, "Stop search"),
@@ -355,10 +432,6 @@ impl App {
         ] {
             buttons.push((id, button(window, label, id)));
         }
-        for (offset, place) in PLACES.iter().enumerate() {
-            let id = PLACE_START + offset as u16;
-            buttons.push((id, button(window, place, id)));
-        }
         for &(id, label, _) in COMMANDS {
             buttons.push((id, button(window, label, id)));
         }
@@ -369,7 +442,7 @@ impl App {
                 "Edit",
                 "",
                 id,
-                WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL as u32,
+                WS_TABSTOP | if id == NAME { WS_BORDER } else { 0 } | ES_AUTOHSCROLL as u32,
                 0,
             )
         };
@@ -382,16 +455,34 @@ impl App {
             WS_TABSTOP | style,
             0,
         );
+        let navigation = new_control(
+            window,
+            "ListBox",
+            "Navigation",
+            NAVIGATION,
+            WS_TABSTOP
+                | WS_VSCROLL
+                | (LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT) as u32,
+            0,
+        );
         let dpi = unsafe { GetDpiForWindow(window) }.max(96);
         let colors = Palette::read(ThemePreference::System);
         let mut app = Self {
             window,
             buttons,
             list,
+            navigation,
+            nav_rows: Vec::new(),
+            home: HomePage::create(window),
+            home_activity: Activity::Recent,
+            home_filter: Filter::All,
+            popup_items: Vec::new(),
+            home_quick_paths: Vec::new(),
+            home_activity_paths: Vec::new(),
             address: input(ADDRESS),
             search: input(SEARCH),
             title: label(0),
-            summary: label(0),
+            summary: label(SUMMARY),
             detail_title: label(0),
             detail_body: label(0),
             status: label(STATUS),
@@ -399,8 +490,9 @@ impl App {
             edit_name: input(NAME),
             images: [0; 2],
             icon_size: 52,
+            fitted_columns: None,
             fonts: [null_mut(); 2],
-            brushes: [null_mut(); 2],
+            brushes: [null_mut(); 4],
             dpi,
             colors,
             tabs: vec![Tab::new(
@@ -411,15 +503,15 @@ impl App {
             )],
             active: 0,
             settings: Settings::default(),
-            shortcut_controls: None,
+            settings_controls: None,
             hotkey_status: None,
             hotkey_request: None,
             hotkey_error: None,
             places: Vec::new(),
-            pinned: Vec::new(),
             crumbs: Vec::new(),
             crumb_slots: Vec::new(),
-            crumb_display: Vec::new(),
+            crumb_segments: Vec::new(),
+            crumb_widths: Vec::new(),
             editing_address: false,
             header: send(list, LVM_GETHEADER, 0, 0) as HWND,
             hover: null_mut(),
@@ -491,6 +583,7 @@ impl App {
         unsafe {
             DragAcceptFiles(window, 1);
         }
+        app.update_sidebar();
         app.update_navigation();
         app.status();
         app.layout();
@@ -510,11 +603,21 @@ impl App {
             .spawn(move || {
                 for operation in receiver {
                     let refresh = operation.updates_listing();
+                    let opened = if let Operation::Open(path) = &operation {
+                        Some(path.clone())
+                    } else {
+                        None
+                    };
                     let result = shell::run(owner, operation);
+                    let opened = opened.filter(|_| result.is_ok());
                     publish(
                         &operation_queue,
                         owner,
-                        Event::Operation { result, refresh },
+                        Event::Operation {
+                            result,
+                            refresh,
+                            opened,
+                        },
                     );
                 }
             })
@@ -548,8 +651,20 @@ impl App {
             PostMessageW(owner as HWND, CHANGE, id as usize, 0);
         });
         self.request_scan();
-        unsafe {
-            SetFocus(self.list);
+        self.focus_content();
+    }
+
+    fn focus_content(&self) {
+        if let Some(home) = self
+            .home
+            .as_ref()
+            .filter(|_| *self.location() == Location::Home)
+        {
+            home.focus();
+        } else {
+            unsafe {
+                SetFocus(self.list);
+            }
         }
     }
 
@@ -588,6 +703,7 @@ impl App {
         }
         for control in [
             self.list,
+            self.navigation,
             self.address,
             self.search,
             self.summary,
@@ -601,8 +717,10 @@ impl App {
         for control in [self.title, self.detail_title, self.header] {
             send(control, WM_SETFONT, self.fonts[1] as usize, 1);
         }
-        if let Some(controls) = self.shortcut_controls {
-            send(controls.heading, WM_SETFONT, self.fonts[1] as usize, 1);
+        if let Some(controls) = self.settings_controls {
+            for control in [controls.heading, controls.date_format_heading] {
+                send(control, WM_SETFONT, self.fonts[1] as usize, 1);
+            }
             for control in [controls.state, controls.description] {
                 send(control, WM_SETFONT, self.fonts[0] as usize, 1);
             }
@@ -614,14 +732,17 @@ impl App {
                 }
             }
         }
-        for (index, width) in [325, 143, 115, 88].into_iter().enumerate() {
-            send(
-                self.list,
-                LVM_SETCOLUMNWIDTH,
-                index,
-                scale(width, dpi) as isize,
-            );
+        self.measure_breadcrumbs();
+        if let Some(home) = &self.home {
+            home.set_style(&self.colors, self.dpi);
         }
+        send(
+            self.navigation,
+            LB_SETITEMHEIGHT,
+            0,
+            scale(31, dpi) as isize,
+        );
+        self.fitted_columns = None;
         for (index, (kind, side)) in [(LVSIL_SMALL, 22), (LVSIL_NORMAL, self.icon_size)]
             .into_iter()
             .enumerate()
@@ -643,9 +764,41 @@ impl App {
             [
                 CreateSolidBrush(self.colors.chrome),
                 CreateSolidBrush(self.colors.content),
+                CreateSolidBrush(self.colors.sidebar),
+                CreateSolidBrush(self.colors.field),
             ]
         });
+        CONTROL_COLORS.set(Some(ControlColors {
+            text: self.colors.text,
+            muted: self.colors.muted,
+            surfaces: [
+                self.colors.chrome,
+                self.colors.content,
+                self.colors.sidebar,
+                self.colors.field,
+            ],
+            brushes: self.brushes,
+        }));
         set_theme(self.window, self.list, &self.colors);
+        if let Some(home) = &self.home {
+            home.set_style(&self.colors, self.dpi);
+        }
+        let theme = wide(if self.colors.dark {
+            "DarkMode_Explorer"
+        } else {
+            "Explorer"
+        });
+        unsafe {
+            SetWindowTheme(
+                self.navigation,
+                if self.colors.contrast {
+                    null()
+                } else {
+                    theme.as_ptr()
+                },
+                null(),
+            );
+        }
         for handle in old {
             if !handle.is_null() {
                 unsafe {
@@ -720,28 +873,45 @@ impl App {
         }
     }
 
-    fn ensure_shortcut_controls(&mut self) {
-        if self.shortcut_controls.is_some() {
+    fn ensure_settings_controls(&mut self) {
+        if self.settings_controls.is_some() {
             return;
         }
         let label = |caption| new_control(self.window, "Static", caption, 0, SS_NOPREFIX, 0);
-        let controls = ShortcutControls {
+        let controls = SettingsControls {
             heading: label("What opens when you press Win+E?"),
             description: label(
                 "BetterExplorer uses a background shortcut helper that starts at sign-in.",
             ),
             state: label(""),
+            date_format_heading: label("Date modified format"),
         };
         for (control, font) in [
             (controls.heading, self.fonts[1]),
             (controls.description, self.fonts[0]),
             (controls.state, self.fonts[0]),
+            (controls.date_format_heading, self.fonts[1]),
         ] {
             send(control, WM_SETFONT, font as usize, 0);
         }
         self.set_dynamic_button(WIN_E_WINDOWS, "Windows File Explorer");
         self.set_dynamic_button(WIN_E_BETTER, "BetterExplorer");
-        self.shortcut_controls = Some(controls);
+        self.set_dynamic_button(DATE_FORMAT_DAY_FIRST, "DD.MM.YYYY");
+        self.set_dynamic_button(DATE_FORMAT_MONTH_FIRST, "MM/DD/YYYY");
+        self.settings_controls = Some(controls);
+        self.update_modified_date_controls();
+    }
+
+    fn update_modified_date_controls(&self) {
+        for id in [DATE_FORMAT_DAY_FIRST, DATE_FORMAT_MONTH_FIRST] {
+            let control = self.button(id);
+            if !control.is_null() {
+                set_enabled(control, self.booted);
+                unsafe {
+                    InvalidateRect(control, null(), 0);
+                }
+            }
+        }
     }
 
     fn request_hotkey(&mut self, request: HotkeyRequest) {
@@ -782,7 +952,7 @@ impl App {
     }
 
     fn update_shortcut_controls(&self) {
-        let Some(controls) = self.shortcut_controls else {
+        let Some(controls) = self.settings_controls else {
             return;
         };
         let message = if let Some(error) = &self.hotkey_error {
@@ -826,20 +996,45 @@ impl App {
         let bounds = rect(self.window);
         let d = |value| scale(value, self.dpi);
         let right = bounds.right - if self.settings.details { d(226) } else { 0 };
-        let columns = ((right - d(174)) / d(255)).max(1) as usize;
+        let columns = ((right - self.sidebar_width(bounds.right) - d(12)) / d(255)).max(1) as usize;
         let lines = ((bounds.bottom - d(186)) / d(64)).max(1) as usize;
         self.visible.len() <= DRIVE_LIMIT.min(columns * lines)
     }
 
-    fn layout(&self) {
+    fn address_bounds(&self, width: i32) -> (i32, i32, i32) {
+        let d = |value| scale(value, self.dpi);
+        let left = d(170);
+        let search = if *self.location() == Location::Settings {
+            0
+        } else {
+            (width / 4).clamp(d(122), d(280))
+        };
+        let right = width - d(10) - if search == 0 { 0 } else { search + d(8) };
+        (left, right, search)
+    }
+
+    fn sidebar_width(&self, width: i32) -> i32 {
+        (width / 6).clamp(scale(151, self.dpi), scale(184, self.dpi))
+    }
+
+    fn compact_toolbar(&self, width: i32) -> bool {
+        width < scale(866, self.dpi)
+    }
+
+    fn layout(&mut self) {
         let bounds = rect(self.window);
         let w = bounds.right;
         let h = bounds.bottom;
-        let d = |value| scale(value, self.dpi);
+        if w == 0 || h == 0 {
+            return;
+        }
+        let dpi = self.dpi;
+        let d = |value| scale(value, dpi);
         let pos = |id, x, y, width, height| move_to(self.button(id), x, y, width, height);
         let margin = d(10);
         let settings_tab = *self.location() == Location::Settings;
-        let tab_width = ((w - d(205)) / self.tabs.len() as i32).clamp(d(38), d(205));
+        let home_tab = self.home.is_some() && *self.location() == Location::Home;
+        let tab_width = ((w - d(193)) / self.tabs.len() as i32 - d(2)).clamp(d(32), d(221));
         let mut x = margin;
         for offset in 0..TAB_LIMIT {
             let id = TAB_START + offset as u16;
@@ -851,16 +1046,33 @@ impl App {
             set_visible(control, shown);
             if shown {
                 let close = if offset == self.active { d(25) } else { 0 };
-                pos(id, x, d(5), tab_width - close, d(29));
+                pos(id, x, d(RESIZE_EDGE), tab_width - close, d(27));
                 if close != 0 {
-                    pos(CLOSE_TAB, x + tab_width - close, d(5), close, d(29));
+                    pos(
+                        CLOSE_TAB,
+                        x + tab_width - close,
+                        d(RESIZE_EDGE),
+                        close,
+                        d(27),
+                    );
                 }
                 x += tab_width + d(2);
             }
         }
-        pos(NEW_TAB, x + d(4), d(5), d(32), d(29));
+        pos(NEW_TAB, x + d(4), d(RESIZE_EDGE), d(32), d(27));
+        let frame_inset = if unsafe { IsZoomed(self.window) } != 0 {
+            0
+        } else {
+            d(RESIZE_EDGE)
+        };
         for (index, id) in [FRAME_CLOSE, FRAME_MAX, FRAME_MIN].into_iter().enumerate() {
-            pos(id, w - d(44 * (index as i32 + 1)), 0, d(44), d(35));
+            pos(
+                id,
+                w - frame_inset - d(44 * (index as i32 + 1)),
+                frame_inset,
+                d(44),
+                d(35) - frame_inset,
+            );
         }
 
         x = margin;
@@ -868,105 +1080,92 @@ impl App {
             pos(id, x, d(43), d(36), d(30));
             x += d(39);
         }
-        let search_width = (w / 4).clamp(d(158), d(280));
-        let address_x = x + d(4);
-        let address_width = w - address_x - search_width - d(28);
-        let address_right = address_x + address_width;
+        let (address_x, address_right, search_width) = self.address_bounds(w);
+        let address_width = address_right - address_x;
         pos(PATH, address_x, d(44), d(32), d(28));
         move_to(
             self.address,
             address_x + d(35),
             d(46),
             address_width - d(42),
-            d(24),
+            d(22),
         );
         set_visible(self.address, self.editing_address && !settings_tab);
         set_visible(self.search, !settings_tab);
         set_visible(self.button(REFRESH), !settings_tab);
-        let mut crumb_x = address_x + d(33);
-        let last = self.crumb_display.len().saturating_sub(1);
-        let current_width = self
-            .crumb_display
-            .get(last)
-            .map_or(0, |(_, width)| d((*width).min(158)));
-        for offset in 0..CRUMB_LIMIT {
-            let id = CRUMB_START + offset as u16;
-            let control = self.button(id);
-            if control.is_null() {
-                continue;
-            }
-            let available = address_right - crumb_x - d(8);
-            let width = self
-                .crumb_display
-                .get(offset)
-                .map(|(_, width)| d((*width).min(158)))
-                .unwrap_or(0);
-            let keep = offset == last || available >= width + current_width;
-            let shown = !self.editing_address && width != 0 && keep && available >= d(46);
-            set_visible(control, shown);
-            if shown {
-                let width = width.min(available);
-                pos(id, crumb_x, d(44), width, d(28));
-                crumb_x += width;
-            }
-        }
         move_to(
             self.search,
-            w - search_width - margin,
-            d(46),
-            search_width - d(9),
-            d(25),
+            w - search_width - margin + d(10),
+            d(49),
+            search_width - d(39),
+            d(20),
         );
+        let compact = self.compact_toolbar(w);
+        let narrow = w < d(650);
         x = margin;
-        for &(id, _, width) in COMMANDS {
-            set_visible(self.button(id), !settings_tab || id == OPEN_SETTINGS);
-            if id == OPEN_SETTINGS {
-                pos(id, w - d(width + 10), d(83), d(width), d(31));
-            } else if id == DETAILS {
-                pos(id, w - d(width + 109), d(83), d(width), d(31));
+        let mut right = w - margin;
+        for id in [OPEN_SETTINGS, DETAILS] {
+            let width = d(if id == OPEN_SETTINGS {
+                103
+            } else if compact {
+                36
             } else {
+                88
+            });
+            right -= width;
+            pos(id, right, d(83), width, d(31));
+            right -= d(4);
+            set_visible(self.button(id), id == OPEN_SETTINGS || !settings_tab);
+        }
+        for &(id, _, width) in COMMANDS {
+            if matches!(id, OPEN_SETTINGS | DETAILS) {
+                continue;
+            }
+            let shown = !settings_tab
+                && !(compact && matches!(id, RENAME | DELETE | FILTER))
+                && !(narrow && matches!(id, CUT | COPY | PASTE));
+            set_visible(self.button(id), shown);
+            if shown {
                 if matches!(id, CUT | SORT | MORE) {
-                    x += d(9);
+                    x += d(5);
                 }
                 pos(id, x, d(83), d(width), d(31));
-                x += d(width + 3);
+                x += d(width + 2);
             }
         }
 
-        let sidebar_width = d(166);
-        let mut y = d(123);
-        for id in [
-            HOME,
-            COMPUTER,
-            PLACE_START,
-            PLACE_START + 1,
-            PLACE_START + 2,
-            PLACE_START + 3,
-            PLACE_START + 4,
-            PLACE_START + 5,
-            PINNED,
-            NETWORK,
-            RECYCLE,
-            LIBRARIES,
-        ] {
-            if matches!(id, PLACE_START | NETWORK) {
-                y += d(13);
-            }
-            pos(id, d(6), y, sidebar_width - d(12), d(29));
-            y += d(29);
-        }
-        let status_y = h - d(27);
+        let sidebar_width = self.sidebar_width(w);
+        let status_y = if settings_tab { h } else { h - d(27) };
+        move_to(
+            self.navigation,
+            d(RESIZE_EDGE),
+            d(126),
+            sidebar_width - d(RESIZE_EDGE + 5),
+            status_y - d(130),
+        );
         let listing_right = if self.settings.details && !settings_tab {
             w - d(226)
         } else {
             w
         };
         let content_x = sidebar_width + d(12);
+        let list_width = listing_right - content_x - d(6);
         let drive_mode = self.drive_cards();
         let section = !matches!(self.location(), Location::Folder(_));
         let list_y = if section { 155 } else { 123 };
-        set_visible(self.title, section);
-        set_visible(self.summary, section && !settings_tab);
+        set_visible(self.title, section && !home_tab);
+        set_visible(self.summary, section && !settings_tab && !home_tab);
+        if let Some(home) = &self.home {
+            home.set_visible(home_tab);
+            if home_tab {
+                home.set_bounds(
+                    content_x - d(6),
+                    d(123),
+                    listing_right - content_x + d(2),
+                    status_y - d(123),
+                );
+            }
+        }
         move_to(
             self.title,
             content_x,
@@ -975,12 +1174,12 @@ impl App {
             d(23),
         );
         move_to(self.summary, listing_right - d(116), d(133), d(100), d(22));
-        set_visible(self.list, !drive_mode && !settings_tab);
+        set_visible(self.list, !home_tab && !drive_mode && !settings_tab);
         move_to(
             self.list,
             content_x - d(3),
             d(list_y),
-            listing_right - content_x - d(6),
+            list_width,
             status_y
                 - d(if self.edit.is_some() {
                     list_y + 48
@@ -988,7 +1187,7 @@ impl App {
                     list_y
                 }),
         );
-        let columns = ((listing_right - d(174)) / d(255)).max(1) as usize;
+        let columns = ((listing_right - content_x) / d(255)).max(1) as usize;
         for index in 0..DRIVE_LIMIT {
             let id = DRIVE_START + index as u16;
             let shown = drive_mode && index < self.visible.len();
@@ -1004,7 +1203,7 @@ impl App {
                     id,
                     content_x + col * d(255),
                     d(155) + row * d(64),
-                    d(245),
+                    d(245).min(listing_right - content_x - d(5)),
                     d(57),
                 );
             }
@@ -1031,15 +1230,18 @@ impl App {
         set_visible(self.detail_title, self.settings.details && !settings_tab);
         set_visible(self.detail_body, self.settings.details && !settings_tab);
         set_visible(self.status, !settings_tab);
-        set_visible(self.button(QUICK_DETAILS), !settings_tab);
-        set_visible(self.button(QUICK_ICONS), !settings_tab);
-        if let Some(controls) = self.shortcut_controls {
+        set_visible(self.button(QUICK_DETAILS), !settings_tab && !home_tab);
+        set_visible(self.button(QUICK_ICONS), !settings_tab && !home_tab);
+        if let Some(controls) = self.settings_controls {
             for control in [
                 controls.heading,
                 controls.description,
                 controls.state,
                 self.button(WIN_E_WINDOWS),
                 self.button(WIN_E_BETTER),
+                controls.date_format_heading,
+                self.button(DATE_FORMAT_DAY_FIRST),
+                self.button(DATE_FORMAT_MONTH_FIRST),
             ] {
                 set_visible(control, settings_tab);
             }
@@ -1047,15 +1249,45 @@ impl App {
                 let x = content_x + d(13);
                 let span = (w - x - d(20)).min(d(690));
                 move_to(controls.heading, x, d(184), span, d(27));
-                pos(WIN_E_WINDOWS, x, d(218), d(221), d(42));
-                pos(WIN_E_BETTER, x + d(231), d(218), d(188), d(42));
-                move_to(controls.state, x, d(278), span, d(58));
-                move_to(controls.description, x, d(351), span, d(48));
+                let gap = d(10);
+                let windows_width = d(221).min((span - gap) * 11 / 20);
+                pos(WIN_E_WINDOWS, x, d(218), windows_width, d(36));
+                pos(
+                    WIN_E_BETTER,
+                    x + windows_width + gap,
+                    d(218),
+                    d(188).min(span - windows_width - gap),
+                    d(36),
+                );
+                move_to(controls.state, x, d(266), span, d(49));
+                move_to(controls.description, x, d(319), span, d(48));
+                move_to(controls.date_format_heading, x, d(373), span, d(27));
+                let format_width = d(136).min((span - gap) / 2);
+                pos(DATE_FORMAT_DAY_FIRST, x, d(402), format_width, d(36));
+                pos(
+                    DATE_FORMAT_MONTH_FIRST,
+                    x + format_width + gap,
+                    d(402),
+                    format_width,
+                    d(36),
+                );
             }
         }
-        move_to(self.status, margin, status_y + d(6), w - d(221), d(19));
-        pos(QUICK_DETAILS, w - d(65), status_y + d(1), d(30), d(24));
-        pos(QUICK_ICONS, w - d(34), status_y + d(1), d(30), d(24));
+        move_to(self.status, margin, status_y + d(5), w - d(198), d(20));
+        pos(
+            QUICK_DETAILS,
+            w - frame_inset - d(61),
+            status_y + d(1),
+            d(30),
+            d(25) - frame_inset,
+        );
+        pos(
+            QUICK_ICONS,
+            w - frame_inset - d(30),
+            status_y + d(1),
+            d(30),
+            d(25) - frame_inset,
+        );
         pos(STOP_SEARCH, w - d(192), status_y + d(1), d(115), d(24));
         set_visible(
             self.button(STOP_SEARCH),
@@ -1082,18 +1314,91 @@ impl App {
             pos(ACCEPT, w - d(147), y, d(63), d(28));
             pos(CANCEL, w - d(76), y, d(63), d(28));
         }
+        if self.tab().view == LV_VIEW_DETAILS || self.tab().view == VIEW_CARDS {
+            let available = (list_width - d(19)).max(d(342));
+            let modified = d(143).min(available / 3);
+            let kind = if self.recycling() {
+                d(265).min(available / 3)
+            } else {
+                d(104).min(available / 5)
+            };
+            let size = d(78).min(available / 6);
+            let widths = [
+                (available - modified - kind - size).min(d(COLUMNS[0].1)),
+                modified,
+                kind,
+                size,
+            ];
+            if self.fitted_columns != Some(widths) {
+                for (index, width) in widths.into_iter().enumerate() {
+                    send(self.list, LVM_SETCOLUMNWIDTH, index, width as isize);
+                }
+                self.fitted_columns = Some(widths);
+            }
+        }
+        let mut crumb_x = address_x + d(33);
+        let placements = if self.editing_address {
+            Vec::new()
+        } else {
+            breadcrumb::fit(
+                &self.crumb_widths,
+                address_right - crumb_x - d(4),
+                d(32),
+                d(72),
+            )
+        };
+        let placements = if placements.len() > CRUMB_LIMIT {
+            let tail = &placements[placements.len() - (CRUMB_LIMIT - 1)..];
+            let mut limited = Vec::with_capacity(CRUMB_LIMIT);
+            limited.push(breadcrumb::Placement {
+                index: None,
+                width: d(32),
+            });
+            limited.extend(tail.iter().map(|placement| breadcrumb::Placement {
+                index: placement.index,
+                width: placement.width,
+            }));
+            limited
+        } else {
+            placements
+        };
+        let new_slots: Vec<_> = placements
+            .iter()
+            .take(CRUMB_LIMIT)
+            .map(|placement| {
+                placement
+                    .index
+                    .map(|index| self.crumb_segments[index].1.clone())
+            })
+            .collect();
+        for (offset, placement) in placements.iter().take(CRUMB_LIMIT).enumerate() {
+            let id = CRUMB_START + offset as u16;
+            if self.crumb_slots.get(offset) != new_slots.get(offset) {
+                let label = placement
+                    .index
+                    .map_or("\u{2026}", |index| &self.crumb_segments[index].0)
+                    .to_owned();
+                self.set_dynamic_button(id, &label);
+            }
+            move_to(self.button(id), crumb_x, d(44), placement.width, d(28));
+            crumb_x += placement.width;
+        }
+        self.crumb_slots = new_slots;
+        for offset in 0..CRUMB_LIMIT {
+            let control = self.button(CRUMB_START + offset as u16);
+            if !control.is_null() {
+                set_visible(control, offset < self.crumb_slots.len());
+            }
+        }
         unsafe {
             InvalidateRect(self.window, null(), 0);
             InvalidateRect(self.header, null(), 0);
-            if settings_tab {
-                // Owner-drawn children may have painted while this layout held the app borrow.
-                RedrawWindow(
-                    self.window,
-                    null(),
-                    null_mut(),
-                    RDW_INVALIDATE | RDW_ALLCHILDREN,
-                );
-            }
+            RedrawWindow(
+                self.window,
+                null(),
+                null_mut(),
+                RDW_INVALIDATE | RDW_ALLCHILDREN,
+            );
         }
     }
 
@@ -1123,6 +1428,11 @@ impl App {
     fn paint(&self) {
         let bounds = rect(self.window);
         let d = |value| scale(value, self.dpi);
+        let footer_height = if *self.location() == Location::Settings {
+            0
+        } else {
+            d(28)
+        };
         let mut paint = unsafe { zeroed() };
         let dc = unsafe { BeginPaint(self.window, &mut paint) };
         fill(dc, &bounds, self.colors.content);
@@ -1138,8 +1448,8 @@ impl App {
             dc,
             &RECT {
                 top: d(122),
-                right: d(166),
-                bottom: bounds.bottom - d(28),
+                right: self.sidebar_width(bounds.right),
+                bottom: bounds.bottom - footer_height,
                 ..bounds
             },
             self.colors.sidebar,
@@ -1147,7 +1457,7 @@ impl App {
         fill(
             dc,
             &RECT {
-                top: bounds.bottom - d(28),
+                top: bounds.bottom - footer_height,
                 ..bounds
             },
             self.colors.chrome,
@@ -1160,39 +1470,38 @@ impl App {
             },
             self.colors.title,
         );
-        let search_width = (bounds.right / 4).clamp(d(158), d(280));
-        let left = d(169);
-        let right = bounds.right - search_width - d(18);
-        fill(
+        let (left, right, search_width) = self.address_bounds(bounds.right);
+        rounded_fill(
             dc,
             &RECT {
                 left,
                 right,
-                top: d(43),
-                bottom: d(74),
+                top: d(42),
+                bottom: d(75),
             },
-            self.colors.chrome,
+            d(6),
+            self.colors.field,
         );
-        fill(
-            dc,
-            &RECT {
-                left: bounds.right - search_width - d(13),
-                top: d(43),
-                right: bounds.right - d(7),
-                bottom: d(74),
-            },
-            self.colors.chrome,
-        );
-        for y in [d(190), d(381)] {
-            fill(
+        if search_width != 0 {
+            let search_right = bounds.right - d(10);
+            rounded_fill(
                 dc,
                 &RECT {
-                    left: d(12),
-                    top: y,
-                    right: d(153),
-                    bottom: y + 1,
+                    left: right + d(8),
+                    top: d(42),
+                    right: search_right,
+                    bottom: d(75),
                 },
-                self.colors.edge,
+                d(6),
+                self.colors.field,
+            );
+            draw_glyph(
+                dc,
+                Glyph::Search,
+                search_right - d(24),
+                d(51),
+                d(15),
+                self.colors.muted,
             );
         }
         for y in [37, 78, 121] {
@@ -1206,12 +1515,12 @@ impl App {
                 self.colors.edge,
             );
         }
-        let right = if self.settings.details {
+        let right = if self.settings.details && *self.location() != Location::Settings {
             bounds.right - d(226)
         } else {
             0
         };
-        for x in [d(166), right] {
+        for x in [self.sidebar_width(bounds.right), right] {
             if x != 0 {
                 fill(
                     dc,
@@ -1219,13 +1528,13 @@ impl App {
                         top: d(122),
                         left: x,
                         right: x + 1,
-                        bottom: bounds.bottom - d(28),
+                        bottom: bounds.bottom - footer_height,
                     },
                     self.colors.edge,
                 );
             }
         }
-        if self.settings.details {
+        if right > 0 {
             if let Some(Content::Bitmap(image)) = &self.preview {
                 image.draw(
                     dc,
@@ -1243,7 +1552,374 @@ impl App {
         }
     }
 
+    fn update_home(&mut self) {
+        let Some(home) = &self.home else {
+            return;
+        };
+        if *self.location() != Location::Home {
+            return;
+        }
+        let mut quick = Vec::new();
+        self.home_quick_paths.clear();
+        for (path, label) in &self.places {
+            let (icon, title) = match *label {
+                "Desktop" => (Icon::Desktop, (*label).into()),
+                "Downloads" => (Icon::Downloads, (*label).into()),
+                "Documents" => (Icon::Documents, (*label).into()),
+                "Pictures" => (Icon::Pictures, (*label).into()),
+                "Music" => (Icon::Music, (*label).into()),
+                "Videos" => (Icon::Videos, (*label).into()),
+                _ => (
+                    Icon::Folder,
+                    path.file_name()
+                        .unwrap_or(path.as_os_str())
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            };
+            quick.push(Item {
+                title,
+                subtitle: "Local folder".into(),
+                id: HOME_QUICK_START + self.home_quick_paths.len() as u16,
+                icon,
+            });
+            self.home_quick_paths.push(path.clone());
+        }
+        for path in self.settings.pins.iter().take(75) {
+            if self.home_quick_paths.contains(path) {
+                continue;
+            }
+            quick.push(Item {
+                title: path
+                    .file_name()
+                    .unwrap_or(path.as_os_str())
+                    .to_string_lossy()
+                    .into_owned(),
+                subtitle: path.parent().unwrap_or(path).display().to_string(),
+                id: HOME_QUICK_START + self.home_quick_paths.len() as u16,
+                icon: Icon::Folder,
+            });
+            self.home_quick_paths.push(path.clone());
+        }
+        let activity_paths = match self.home_activity {
+            Activity::Recent => &self.settings.recent,
+            Activity::Favorites => &self.settings.favorites,
+        };
+        let filter = self.home_filter;
+        let paths: Vec<_> = activity_paths
+            .iter()
+            .filter(|path| filter.matches(path, false))
+            .take(75)
+            .cloned()
+            .collect();
+        let activity = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| Item {
+                title: (if self.settings.hide_extensions {
+                    path.file_stem()
+                } else {
+                    path.file_name()
+                })
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy()
+                .into_owned(),
+                subtitle: path.parent().unwrap_or(path).display().to_string(),
+                id: HOME_ACTIVITY_START + index as u16,
+                icon: Icon::File,
+            })
+            .collect();
+        self.home_activity_paths = paths;
+        home.set_compact(self.settings.home_compact);
+        home.set_content(
+            quick,
+            activity,
+            HOME_RECENT,
+            HOME_FAVORITES,
+            self.home_activity,
+        );
+    }
+
+    fn update_sidebar(&mut self) {
+        let mut rows = vec![NavRow {
+            label: "Home".into(),
+            target: Some(Location::Home),
+            command: HOME,
+            icon: 5,
+            pinned: false,
+        }];
+        for (index, name) in PLACES.iter().enumerate() {
+            if let Some((path, _)) = self.places.iter().find(|(_, label)| label == name) {
+                rows.push(NavRow {
+                    label: (*name).into(),
+                    target: Some(Location::Folder(path.clone())),
+                    command: 0,
+                    icon: 6 + index as u16,
+                    pinned: true,
+                });
+            }
+        }
+        for path in &self.settings.pins {
+            let target = Location::Folder(path.clone());
+            if !rows.iter().any(|row| row.target.as_ref() == Some(&target)) {
+                rows.push(NavRow {
+                    label: target.caption(),
+                    target: Some(target),
+                    command: 0,
+                    icon: 2,
+                    pinned: true,
+                });
+            }
+        }
+        for (label, command, icon, target) in [
+            ("This PC", COMPUTER, 4, Some(Location::Computer)),
+            (
+                "Network",
+                NETWORK,
+                13,
+                Some(Location::namespace(Namespace::Network)),
+            ),
+            (
+                "Recycle Bin",
+                RECYCLE,
+                14,
+                Some(Location::namespace(Namespace::RecycleBin)),
+            ),
+            (
+                "Libraries",
+                LIBRARIES,
+                15,
+                Some(Location::namespace(Namespace::Libraries)),
+            ),
+        ] {
+            rows.push(NavRow {
+                label: label.into(),
+                command,
+                icon,
+                target,
+                pinned: false,
+            });
+        }
+        if self.nav_rows != rows {
+            let top = send(self.navigation, LB_GETTOPINDEX, 0, 0);
+            send(self.navigation, WM_SETREDRAW, 0, 0);
+            send(self.navigation, LB_RESETCONTENT, 0, 0);
+            self.nav_rows = rows;
+            for row in &self.nav_rows {
+                let value = wide(&row.label);
+                send(self.navigation, LB_ADDSTRING, 0, value.as_ptr() as LPARAM);
+            }
+            send(self.navigation, LB_SETTOPINDEX, top.max(0) as usize, 0);
+            send(self.navigation, WM_SETREDRAW, 1, 0);
+        }
+        unsafe {
+            InvalidateRect(self.navigation, null(), 1);
+        }
+    }
+
+    fn select_sidebar(&mut self) {
+        let selected = send(self.navigation, LB_GETCURSEL, 0, 0);
+        let Some(row) = usize::try_from(selected)
+            .ok()
+            .and_then(|index| self.nav_rows.get(index))
+        else {
+            return;
+        };
+        if let Some(location) = row.target.clone() {
+            if self.location() != &location {
+                self.go(location);
+            }
+        } else {
+            self.command(row.command);
+        }
+        unsafe {
+            InvalidateRect(self.navigation, null(), 0);
+        }
+    }
+
+    fn measure_menu(&self, data: &mut MEASUREITEMSTRUCT) {
+        let Some(item) = self.popup_items.get(data.itemData) else {
+            return;
+        };
+        let d = |value| scale(value, self.dpi);
+        data.itemHeight = d(31) as u32;
+        let dc = unsafe { GetDC(self.window) };
+        if dc.is_null() {
+            data.itemWidth = d(205) as u32;
+            return;
+        }
+        let text = wide(item.label.replace('&', ""));
+        let mut extent = unsafe { zeroed() };
+        unsafe {
+            let previous = SelectObject(dc, self.fonts[0]);
+            GetTextExtentPoint32W(dc, text.as_ptr(), text.len() as i32 - 1, &mut extent);
+            SelectObject(dc, previous);
+            ReleaseDC(self.window, dc);
+        }
+        let shortcut = if item.label.contains('\t') { d(82) } else { 0 };
+        data.itemWidth = (extent.cx + d(45) + shortcut).clamp(d(158), d(482)) as u32;
+    }
+
+    fn draw_menu(&self, draw: &DRAWITEMSTRUCT) {
+        let Some(item) = self.popup_items.get(draw.itemData) else {
+            return;
+        };
+        let r = draw.rcItem;
+        let dc = draw.hDC;
+        let d = |value| scale(value, self.dpi);
+        fill(dc, &r, self.colors.chrome);
+        if draw.itemState & ODS_SELECTED != 0 && item.enabled {
+            rounded_fill(
+                dc,
+                &RECT {
+                    left: r.left + d(3),
+                    right: r.right - d(3),
+                    top: r.top + d(1),
+                    bottom: r.bottom - d(1),
+                },
+                d(4),
+                self.colors.active,
+            );
+        }
+        let (label, shortcut) = item.label.split_once('\t').unwrap_or((&item.label, ""));
+        let color = if item.enabled {
+            self.colors.text
+        } else {
+            self.colors.muted
+        };
+        let flags = DT_SINGLELINE | DT_VCENTER;
+        if item.checked {
+            text_at(
+                dc,
+                "\u{2022}",
+                RECT {
+                    left: r.left + d(11),
+                    ..r
+                },
+                self.fonts[1],
+                self.colors.accent,
+                flags,
+            );
+        }
+        let text = RECT {
+            left: r.left + d(29),
+            right: r.right - d(12),
+            ..r
+        };
+        text_at(
+            dc,
+            &label.replace("&&", "&"),
+            RECT {
+                right: text.right - if shortcut.is_empty() { 0 } else { d(87) },
+                ..text
+            },
+            self.fonts[0],
+            color,
+            flags,
+        );
+        if !shortcut.is_empty() {
+            text_at(
+                dc,
+                shortcut,
+                text,
+                self.fonts[0],
+                self.colors.muted,
+                flags | DT_RIGHT,
+            );
+        }
+    }
+
+    fn draw_sidebar(&self, draw: &DRAWITEMSTRUCT) {
+        let dc = draw.hDC;
+        let bounds = draw.rcItem;
+        fill(dc, &bounds, self.colors.sidebar);
+        let Some(row) = self.nav_rows.get(draw.itemID as usize) else {
+            return;
+        };
+        let d = |value| scale(value, self.dpi);
+        let active = row.target.as_ref() == Some(self.location());
+        if active || draw.itemState & ODS_SELECTED != 0 && unsafe { GetFocus() } == self.navigation
+        {
+            fill(
+                dc,
+                &RECT {
+                    top: bounds.top + d(1),
+                    bottom: bounds.bottom - d(1),
+                    ..bounds
+                },
+                self.colors.active,
+            );
+        }
+        let side = d(18);
+        let icon_x = bounds.left + d(8);
+        let icon_y = bounds.top + (bounds.bottom - bounds.top - side) / 2;
+        if self.colors.contrast || !draw_resource_icon(dc, row.icon, icon_x, icon_y, side) {
+            let glyph = match row.target.as_ref() {
+                Some(Location::Home) => Glyph::Home,
+                Some(Location::Computer) => Glyph::Drive,
+                Some(Location::Namespace {
+                    kind: Namespace::Network,
+                    ..
+                }) => Glyph::Network,
+                Some(Location::Namespace {
+                    kind: Namespace::RecycleBin,
+                    ..
+                }) => Glyph::Recycle,
+                Some(Location::Namespace {
+                    kind: Namespace::Libraries,
+                    ..
+                }) => Glyph::Library,
+                _ => Glyph::Folder,
+            };
+            draw_glyph(dc, glyph, icon_x, icon_y, side, self.colors.muted);
+        }
+        if row.pinned {
+            draw_glyph(
+                dc,
+                Glyph::Pin,
+                bounds.right - d(17),
+                icon_y + d(4),
+                d(10),
+                self.colors.muted,
+            );
+        }
+        text_at(
+            dc,
+            &row.label,
+            RECT {
+                left: bounds.left + d(30),
+                right: bounds.right - d(if row.pinned { 21 } else { 5 }),
+                ..bounds
+            },
+            self.fonts[0],
+            self.colors.text,
+            DT_SINGLELINE | DT_VCENTER | DT_LEFT,
+        );
+        if draw.itemState & ODS_FOCUS != 0 && unsafe { GetFocus() } == self.navigation {
+            unsafe {
+                DrawFocusRect(dc, &bounds);
+            }
+        }
+    }
+
     fn update_navigation(&mut self) {
+        let top = send(self.navigation, LB_GETTOPINDEX, 0, 0);
+        let selection = self
+            .nav_rows
+            .iter()
+            .position(|row| row.target.as_ref() == Some(self.location()));
+        send(
+            self.navigation,
+            LB_SETCURSEL,
+            selection.unwrap_or(usize::MAX),
+            0,
+        );
+        send(self.navigation, LB_SETTOPINDEX, top.max(0) as usize, 0);
+        unsafe {
+            InvalidateRect(self.navigation, null(), 0);
+        }
+        self.update_home();
+        self.sync_column_labels();
         for offset in 0..self.tabs.len() {
             let label = self.tabs[offset].history.current().caption();
             self.set_dynamic_button(TAB_START + offset as u16, &label);
@@ -1276,35 +1952,18 @@ impl App {
             .map(|path| {
                 path.ancestors()
                     .filter(|parent| !parent.as_os_str().is_empty())
-                    .take(80)
+                    .take((u16::MAX - BREADCRUMB_START) as usize)
                     .map(Path::to_path_buf)
                     .collect()
             })
             .unwrap_or_default();
         self.editing_address = false;
         self.crumb_slots.clear();
-        self.crumb_display.clear();
-        if self.crumbs.is_empty() {
-            self.crumb_slots.push(self.location().clone());
-            self.crumb_display.push((self.location().caption(), 126));
-        } else {
-            self.crumb_slots.push(Location::Computer);
-            self.crumb_display.push(("This PC".into(), 78));
-            for path in self.crumbs.iter().take(CRUMB_LIMIT - 1).rev() {
-                let label = if let Some(name) = path.file_name() {
-                    name.to_string_lossy().into_owned()
-                } else {
-                    path.display().to_string()
-                };
-                let width = 30 + (label.chars().count() as i32 * 7).clamp(16, 135);
-                self.crumb_slots.push(Location::Folder(path.clone()));
-                self.crumb_display.push((label, width));
-            }
-        }
-        for index in 0..self.crumb_display.len() {
-            let label = self.crumb_display[index].0.clone();
-            self.set_dynamic_button(CRUMB_START + index as u16, &label);
-        }
+        self.crumb_segments = breadcrumb::segments(
+            self.location(),
+            std::env::var("SystemDrive").ok().as_deref(),
+        );
+        self.measure_breadcrumbs();
         let hint = wide(if self.location_dir().is_some() {
             format!("Search {}", self.location().caption())
         } else {
@@ -1313,10 +1972,15 @@ impl App {
         send(self.search, EM_SETCUEBANNER, 1, hint.as_ptr() as isize);
         set_enabled(self.button(BACK), self.tab().history.can_back());
         set_enabled(self.button(FORWARD), self.tab().history.can_forward());
-        set_enabled(self.button(UP), self.location_dir().is_some());
+        set_enabled(
+            self.button(UP),
+            self.location_dir().is_some()
+                || matches!(self.location(), Location::Namespace { child: Some(_), .. }),
+        );
         set_enabled(self.button(NEW), self.dest().is_some());
+        set_enabled(self.button(SORT), *self.location() != Location::Home);
         set_enabled(self.button(PASTE), self.dest().is_some());
-        if self.shortcut_controls.is_some() {
+        if self.settings_controls.is_some() {
             for &(id, control) in &self.buttons {
                 if id == HOME
                     || id == COMPUTER
@@ -1329,6 +1993,31 @@ impl App {
                     }
                 }
             }
+        }
+    }
+
+    fn measure_breadcrumbs(&mut self) {
+        let dc = unsafe { GetDC(self.window) };
+        if dc.is_null() {
+            return;
+        }
+        let font = unsafe { SelectObject(dc, self.fonts[0]) };
+        self.crumb_widths = self
+            .crumb_segments
+            .iter()
+            .enumerate()
+            .map(|(index, (label, _))| {
+                let label = wide(label);
+                let mut size = unsafe { zeroed() };
+                unsafe {
+                    GetTextExtentPoint32W(dc, label.as_ptr(), label.len() as i32 - 1, &mut size);
+                }
+                size.cx + scale(if index == 0 { 20 } else { 40 }, self.dpi)
+            })
+            .collect();
+        unsafe {
+            SelectObject(dc, font);
+            ReleaseDC(self.window, dc);
         }
     }
 
@@ -1426,7 +2115,7 @@ impl App {
         let settings_tab = *self.location() == Location::Settings;
         self.scanning = !settings_tab;
         if settings_tab {
-            self.ensure_shortcut_controls();
+            self.ensure_settings_controls();
         }
         self.layout();
         self.status();
@@ -1567,14 +2256,20 @@ impl App {
                         Location::Folder(_) | Location::Search { .. } => {
                             self.settings.hidden != settings.hidden
                         }
-                        Location::Computer | Location::Settings => false,
+                        Location::Computer | Location::Settings | Location::Namespace { .. } => {
+                            false
+                        }
                     };
                     let view_changed = self.dest().is_some_and(|path| {
                         self.settings.views.get(&path) != settings.views.get(&path)
                     });
                     let details_changed = self.settings.details != settings.details;
+                    let date_format_changed =
+                        self.settings.modified_date_format != settings.modified_date_format;
                     self.places = places;
                     self.settings = settings;
+                    self.update_sidebar();
+                    self.update_home();
                     let restore = self.launch_path.is_none()
                         && !std::env::args_os().any(|arg| arg == "--new-window")
                         && self.id == 1
@@ -1585,6 +2280,12 @@ impl App {
                         && !self.settings.tabs.is_empty();
                     self.booted = true;
                     self.apply_theme();
+                    self.update_modified_date_controls();
+                    if date_format_changed {
+                        unsafe {
+                            InvalidateRect(self.list, null(), 0);
+                        }
+                    }
                     if restore {
                         self.tabs = self
                             .settings
@@ -1622,7 +2323,16 @@ impl App {
                     self.note = Some(error);
                     self.status();
                 }
-                Event::Operation { result, refresh } => {
+                Event::Operation {
+                    result,
+                    refresh,
+                    opened,
+                } => {
+                    if let Some(path) = opened {
+                        self.settings.record_recent(path);
+                        self.update_home();
+                        self.schedule_save();
+                    }
                     self.busy = self.busy.saturating_sub(1);
                     if refresh {
                         self.reload(true);
@@ -1680,14 +2390,18 @@ impl App {
         send(self.list, LVM_GETSELECTEDCOUNT, 0, 0).max(0) as usize
     }
 
-    fn first_selected(&self) -> Option<&Entry> {
+    fn first_selected_index(&self) -> Option<usize> {
         let index = send(
             self.list,
             LVM_GETNEXTITEM,
             usize::MAX,
             LVNI_SELECTED as isize,
         );
-        self.entry(usize::try_from(index).ok()?)
+        usize::try_from(index).ok()
+    }
+
+    fn first_selected(&self) -> Option<&Entry> {
+        self.entry(self.first_selected_index()?)
     }
 
     fn selected_paths(&self) -> Vec<PathBuf> {
@@ -1729,8 +2443,13 @@ impl App {
     }
 
     fn status(&self) {
-        let items = self.visible.len();
-        let count = self.selection_count();
+        let home = self.home.is_some() && *self.location() == Location::Home;
+        let items = if home {
+            self.home_quick_paths.len() + self.home_activity_paths.len()
+        } else {
+            self.visible.len()
+        };
+        let count = if home { 0 } else { self.selection_count() };
         let summary = if self.scanning {
             "Loading…".into()
         } else if items == 1 {
@@ -1738,7 +2457,7 @@ impl App {
         } else {
             format!("{items} items")
         };
-        text(self.summary, summary);
+        text(self.summary, &summary);
         let status = if let Some(message) = self.note.as_ref().or(self.error.as_ref()) {
             message.clone()
         } else if self.busy != 0 {
@@ -1748,27 +2467,57 @@ impl App {
         } else if count != 0 {
             format!("{items} items  ·  {count} selected")
         } else if items == 0 {
-            "No items to show.".into()
+            match self.location() {
+                Location::Namespace {
+                    kind: Namespace::Network,
+                    ..
+                } => "No network devices or shares found.".into(),
+                Location::Namespace {
+                    kind: Namespace::RecycleBin,
+                    ..
+                } => "Recycle Bin is empty.".into(),
+                Location::Namespace {
+                    kind: Namespace::Libraries,
+                    ..
+                } => "No libraries or library folders found.".into(),
+                _ => "No items to show.".into(),
+            }
         } else {
-            format!("{items} items")
+            summary
         };
         text(self.status, status);
         let selected = self.first_selected();
-        let actionable = selected.is_some_and(|entry| !entry.location);
-        for id in [CUT, COPY, DELETE] {
+        let actionable = !home && selected.is_some_and(|entry| !entry.location);
+        for id in [CUT, COPY] {
             set_enabled(self.button(id), actionable);
         }
+        set_enabled(
+            self.button(DELETE),
+            actionable || self.recycling() && selected.is_some(),
+        );
         set_enabled(self.button(RENAME), actionable && count == 1);
         if self.settings.details {
             match selected {
                 Some(entry) => {
                     text(self.detail_title, entry.label());
                     let mut body = format!(
-                        "{}\n\nSize: {}\nModified: {}\n\n{}",
+                        "{}\n\nSize: {}\n{}: {}\n\n{}",
                         entry.kind(),
                         entry.display_size(),
-                        entry.date(),
-                        entry.path.display()
+                        if self.recycling() {
+                            "Deleted"
+                        } else {
+                            "Modified"
+                        },
+                        entry.date(self.settings.modified_date_format),
+                        entry.shell_item.as_ref().map_or_else(
+                            || entry.path.display().to_string(),
+                            |item| item
+                                .original_location
+                                .as_ref()
+                                .or(item.target.as_ref())
+                                .map_or_else(String::new, |path| path.display().to_string()),
+                        )
                     );
                     if let Some(Content::Text(preview)) = &self.preview {
                         body.push_str("\n\nPreview\n");
@@ -1785,9 +2534,52 @@ impl App {
     }
 
     fn show_selected(&mut self, mode: u16) {
-        let Some(entry) = self.first_selected() else {
+        if let Some(index) = self.first_selected_index() {
+            self.activate_row(mode, index);
+        }
+    }
+
+    fn activate_row(&mut self, mode: u16, index: usize) {
+        let Some(entry) = self.entry(index) else {
             return;
         };
+        if let Some(item) = &entry.shell_item {
+            let Location::Namespace { kind, .. } = self.location() else {
+                return;
+            };
+            if *kind == Namespace::RecycleBin {
+                return;
+            }
+            if !matches!(mode, OPEN | OPEN_TAB | OPEN_WINDOW) {
+                return;
+            }
+            let next = if let Some(path) = &item.target {
+                let is_share_or_folder = path.components().count() > 1;
+                if is_share_or_folder
+                    && path
+                        .extension()
+                        .is_none_or(|extension| !extension.eq_ignore_ascii_case("library-ms"))
+                {
+                    Some(Location::Folder(path.clone()))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let next = next.unwrap_or_else(|| Location::Namespace {
+                kind: *kind,
+                child: Some(item.key.clone()),
+                title: Some(item.name.clone()),
+            });
+            if mode == OPEN_TAB {
+                self.new_tab(next);
+            } else {
+                self.go(next);
+                self.focus_content();
+            }
+            return;
+        }
         self.show_entry(mode, entry.path.clone(), entry.directory);
     }
 
@@ -2010,6 +2802,24 @@ impl App {
             self.go(Location::Home);
         } else if input.eq_ignore_ascii_case("This PC") {
             self.go(Location::Computer);
+        } else if input.eq_ignore_ascii_case("Network") {
+            self.go(Location::namespace(Namespace::Network));
+        } else if input.eq_ignore_ascii_case("Recycle Bin") {
+            self.go(Location::namespace(Namespace::RecycleBin));
+        } else if input.eq_ignore_ascii_case("Libraries") {
+            self.go(Location::namespace(Namespace::Libraries));
+        } else if let Some(server) = input
+            .strip_prefix(r"\\")
+            .map(|name| name.trim_end_matches('\\'))
+            .filter(|name| {
+                !name.is_empty() && !name.contains(['\\', '/']) && !matches!(*name, "." | "?")
+            })
+        {
+            self.go(Location::Namespace {
+                kind: Namespace::Network,
+                child: Some(format!(r"\\{server}")),
+                title: Some(server.into()),
+            });
         } else {
             let path = work::input_path(value, self.location_dir().as_deref());
             if !path.is_absolute() {
@@ -2065,6 +2875,11 @@ impl App {
             UP => {
                 let location = match self.location() {
                     Location::Search { root, .. } => Location::Folder(root.clone()),
+                    Location::Namespace {
+                        kind,
+                        child: Some(_),
+                        ..
+                    } => Location::namespace(*kind),
                     Location::Folder(path) => path
                         .parent()
                         .filter(|p| !p.as_os_str().is_empty())
@@ -2077,18 +2892,15 @@ impl App {
             REFRESH => self.refresh(),
             ENTER_PATH => self.go_address(),
             EDIT_ADDRESS => self.address_focus(true),
-            FRAME_MIN => unsafe {
-                ShowWindow(self.window, SW_MINIMIZE);
-            },
-            FRAME_MAX => unsafe {
-                ShowWindow(
-                    self.window,
-                    if IsZoomed(self.window) != 0 {
-                        SW_RESTORE
-                    } else {
-                        SW_MAXIMIZE
-                    },
-                );
+            FRAME_MIN | FRAME_MAX => unsafe {
+                let command = if id == FRAME_MIN {
+                    SC_MINIMIZE
+                } else if IsZoomed(self.window) != 0 {
+                    SC_RESTORE
+                } else {
+                    SC_MAXIMIZE
+                };
+                PostMessageW(self.window, WM_SYSCOMMAND, command as usize, 0);
             },
             FRAME_CLOSE => unsafe {
                 PostMessageW(self.window, WM_CLOSE, 0, 0);
@@ -2098,17 +2910,29 @@ impl App {
             WIN_E_WINDOWS | WIN_E_BETTER if *self.location() == Location::Settings => {
                 self.request_hotkey(HotkeyRequest::Change(id == WIN_E_BETTER));
             }
+            DATE_FORMAT_DAY_FIRST | DATE_FORMAT_MONTH_FIRST
+                if self.booted && *self.location() == Location::Settings =>
+            {
+                let format = if id == DATE_FORMAT_DAY_FIRST {
+                    ModifiedDateFormat::DayMonthYear
+                } else {
+                    ModifiedDateFormat::MonthDayYear
+                };
+                if self.settings.modified_date_format != format {
+                    self.settings.modified_date_format = format;
+                    self.update_modified_date_controls();
+                    unsafe {
+                        InvalidateRect(self.list, null(), 0);
+                    }
+                    self.status();
+                    self.schedule_save();
+                }
+            }
             HOME => self.go(Location::Home),
             COMPUTER => self.go(Location::Computer),
-            NETWORK => {
-                self.operation(Operation::Namespace("shell:NetworkPlacesFolder"));
-            }
-            RECYCLE => {
-                self.operation(Operation::Namespace("shell:RecycleBinFolder"));
-            }
-            LIBRARIES => {
-                self.operation(Operation::Namespace("shell:Libraries"));
-            }
+            NETWORK => self.go(Location::namespace(Namespace::Network)),
+            RECYCLE => self.go(Location::namespace(Namespace::RecycleBin)),
+            LIBRARIES => self.go(Location::namespace(Namespace::Libraries)),
             NEW_TAB => self.new_tab(Location::Home),
             CLOSE_TAB => self.close_tab(),
             NEXT_TAB => self.switch((self.active + 1) % self.tabs.len()),
@@ -2147,6 +2971,23 @@ impl App {
                     );
                     self.operation(Operation::Paste { target, receipt });
                 }
+            }
+            RECYCLE_RESTORE | DELETE | PERMANENT if self.recycling() => {
+                let keys: Vec<_> = self
+                    .selected_indices()
+                    .into_iter()
+                    .filter_map(|index| self.entry(index)?.shell_item.as_ref())
+                    .map(|item| item.key.clone())
+                    .collect();
+                if !keys.is_empty() {
+                    self.operation(Operation::Recycle {
+                        keys,
+                        restore: id == RECYCLE_RESTORE,
+                    });
+                }
+            }
+            RECYCLE_EMPTY if self.recycling() && !self.rows.is_empty() => {
+                self.operation(Operation::EmptyRecycle);
             }
             DELETE | PERMANENT => {
                 let paths = self.selected_paths();
@@ -2314,6 +3155,7 @@ impl App {
             }
             SHOW_EXTENSIONS => {
                 self.settings.hide_extensions = !self.settings.hide_extensions;
+                self.update_home();
                 unsafe {
                     InvalidateRect(self.list, null(), 0);
                 }
@@ -2338,14 +3180,83 @@ impl App {
                 }
                 self.refresh();
             }
-            FILTER_ALL | FILTER_FOLDERS | FILTER_FILES => {
-                self.tab_mut().filter = match id {
+            HOME_RECENT | HOME_FAVORITES => {
+                self.home_activity = if id == HOME_RECENT {
+                    Activity::Recent
+                } else {
+                    Activity::Favorites
+                };
+                self.update_home();
+                self.status();
+            }
+            HOME_TILES | HOME_CONTENT => {
+                self.settings.home_compact = id == HOME_CONTENT;
+                self.update_home();
+                self.schedule_save();
+            }
+            FAVORITE => {
+                if let Some(path) = self
+                    .first_selected()
+                    .filter(|row| !row.directory)
+                    .map(|row| row.path.clone())
+                {
+                    if let Some(index) = self
+                        .settings
+                        .favorites
+                        .iter()
+                        .position(|favorite| favorite == &path)
+                    {
+                        self.settings.favorites.remove(index);
+                        self.note = Some("File removed from Favorites.".into());
+                    } else if self.settings.favorites.len() < 75 {
+                        self.settings.favorites.push(path);
+                        self.note = Some("File added to Favorites.".into());
+                    } else {
+                        self.note = Some("75 files are already in Favorites.".into());
+                    }
+                    self.update_home();
+                    self.status();
+                    self.schedule_save();
+                }
+            }
+            id if (HOME_QUICK_START..HOME_ACTIVITY_START).contains(&id) => {
+                if let Some(path) = self
+                    .home_quick_paths
+                    .get((id - HOME_QUICK_START) as usize)
+                    .cloned()
+                {
+                    self.show_entry(OPEN, path, true);
+                }
+            }
+            id if (HOME_ACTIVITY_START..HOME_ACTIVITY_START + 75).contains(&id) => {
+                if let Some(path) = self
+                    .home_activity_paths
+                    .get((id - HOME_ACTIVITY_START) as usize)
+                    .cloned()
+                {
+                    self.show_entry(OPEN, path, false);
+                }
+            }
+            FILTER_ALL | FILTER_FOLDERS | FILTER_FILES | 199..=204 => {
+                let filter = match id {
                     FILTER_FOLDERS => Filter::Folders,
                     FILTER_FILES => Filter::Files,
-                    _ => Filter::All,
+                    _ => FILTER_TYPES
+                        .iter()
+                        .find(|(command, _, _)| *command == id)
+                        .map_or(Filter::All, |(_, filter, _)| *filter),
                 };
+                if *self.location() == Location::Home {
+                    self.home_filter = filter;
+                    self.update_home();
+                    self.status();
+                    return;
+                }
+                self.tab_mut().filter = filter;
                 self.clear_selection();
                 self.rebuild_visible();
+                self.update_drive_buttons();
+                self.layout();
                 self.status();
             }
             THEME_SYSTEM | THEME_DARK | THEME_LIGHT => {
@@ -2364,7 +3275,7 @@ impl App {
             PIN => {
                 let path = self
                     .first_selected()
-                    .filter(|entry| entry.directory)
+                    .filter(|entry| entry.directory && entry.shell_item.is_none())
                     .map(|entry| entry.path.clone())
                     .or_else(|| self.dest());
                 if let Some(path) = path {
@@ -2378,6 +3289,7 @@ impl App {
                         self.note = Some("75 folders are already pinned.".into());
                     }
                     let note = self.note.clone();
+                    self.update_sidebar();
                     if matches!(self.location(), Location::Home) {
                         self.refresh();
                     }
@@ -2386,12 +3298,29 @@ impl App {
                     self.schedule_save();
                 }
             }
+            id if (TAB_START..TAB_START + TAB_LIMIT as u16).contains(&id) => {
+                self.switch((id - TAB_START) as usize);
+            }
             id if (CRUMB_START..CRUMB_START + CRUMB_LIMIT as u16).contains(&id) => {
-                if let Some(location) = self.crumb_slots.get((id - CRUMB_START) as usize).cloned() {
+                if let Some(location) = self
+                    .crumb_slots
+                    .get((id - CRUMB_START) as usize)
+                    .cloned()
+                    .flatten()
+                {
                     if self.location() == &location {
                         self.address_focus(true);
                     } else {
                         self.go(location);
+                    }
+                } else {
+                    unsafe {
+                        PostMessageW(
+                            self.window,
+                            SHOW_MENU,
+                            PATH as usize,
+                            self.button(id) as LPARAM,
+                        );
                     }
                 }
             }
@@ -2408,25 +3337,8 @@ impl App {
                     }
                 }
             }
-            id if (PLACE_START..PLACE_START + PLACES.len() as u16).contains(&id) => {
-                let title = PLACES[(id - PLACE_START) as usize];
-                if let Some((path, _)) = self.places.iter().find(|(_, label)| *label == title) {
-                    self.go(Location::Folder(path.clone()));
-                } else {
-                    self.note = Some(format!("{title} is unavailable."));
-                    self.status();
-                }
-            }
-            id if (TAB_START..TAB_START + TAB_LIMIT as u16).contains(&id) => {
-                self.switch((id - TAB_START) as usize)
-            }
-            id if (BREADCRUMB_START..BREADCRUMB_START + 80).contains(&id) => {
+            id if id >= BREADCRUMB_START => {
                 if let Some(path) = self.crumbs.get((id - BREADCRUMB_START) as usize) {
-                    self.go(Location::Folder(path.clone()));
-                }
-            }
-            id if (PIN_START..PIN_START + 75).contains(&id) => {
-                if let Some(path) = self.pinned.get((id - PIN_START) as usize) {
                     self.go(Location::Folder(path.clone()));
                 }
             }
@@ -2494,8 +3406,9 @@ impl App {
                 let sort = self.tab().sort;
                 vec![
                     item(SORT_NAME, "Name").checked(sort.column == Column::Name),
-                    item(SORT_MODIFIED, "Date modified").checked(sort.column == Column::Modified),
-                    item(SORT_KIND, "Type").checked(sort.column == Column::Kind),
+                    item(SORT_MODIFIED, self.column_label(1))
+                        .checked(sort.column == Column::Modified),
+                    item(SORT_KIND, self.column_label(2)).checked(sort.column == Column::Kind),
                     item(SORT_SIZE, "Size").checked(sort.column == Column::Size),
                     line(),
                     item(SORT_REVERSE, "Descending").checked(sort.descending),
@@ -2504,6 +3417,17 @@ impl App {
             VIEW => {
                 let view = self.tab().view;
                 let mut items = vec![];
+                if self.home.is_some() && *self.location() == Location::Home {
+                    return vec![
+                        item(HOME_TILES, "Tiles").checked(!self.settings.home_compact),
+                        item(HOME_CONTENT, "Content").checked(self.settings.home_compact),
+                        line(),
+                        item(DETAILS, "Details pane").checked(self.settings.details),
+                        item(SHOW_HIDDEN, "Hidden items").checked(self.settings.hidden),
+                        item(SHOW_EXTENSIONS, "File name extensions")
+                            .checked(!self.settings.hide_extensions),
+                    ];
+                }
                 if matches!(self.location(), Location::Computer) {
                     items.push(item(CARDS_VIEW, "Drive cards").checked(view == VIEW_CARDS));
                 }
@@ -2523,36 +3447,86 @@ impl App {
                 items
             }
             FILTER => {
-                let filter = self.tab().filter;
-                vec![
-                    item(FILTER_ALL, "All items").checked(filter == Filter::All),
-                    item(FILTER_FOLDERS, "Folders only").checked(filter == Filter::Folders),
-                    item(FILTER_FILES, "Files only").checked(filter == Filter::Files),
-                ]
+                let filter = if *self.location() == Location::Home {
+                    self.home_filter
+                } else {
+                    self.tab().filter
+                };
+                let mut items =
+                    vec![item(FILTER_ALL, "All file types").checked(filter == Filter::All)];
+                if *self.location() != Location::Home {
+                    items.extend([
+                        item(FILTER_FOLDERS, "Folders only").checked(filter == Filter::Folders),
+                        item(FILTER_FILES, "Files only").checked(filter == Filter::Files),
+                    ]);
+                }
+                items.extend(
+                    FILTER_TYPES.map(|(id, value, label)| item(id, label).checked(filter == value)),
+                );
+                items
             }
-            MORE => vec![
-                item(OPEN_SETTINGS, "Settings\tCtrl+,"),
-                line(),
-                item(NEW_WINDOW, "New window\tCtrl+N"),
-                item(CLOSE_TAB, "Close tab\tCtrl+W"),
-                item(MOVE_TAB_LEFT, "Move tab left").enabled(self.active > 0),
-                item(MOVE_TAB_RIGHT, "Move tab right").enabled(self.active + 1 < self.tabs.len()),
-                line(),
-                item(PIN, "Pin or unpin folder").enabled(
-                    self.location_dir().is_some()
-                        || self.first_selected().is_some_and(|row| row.directory),
-                ),
-                item(SELECT_ALL, "Select all\tCtrl+A").enabled(!self.visible.is_empty()),
-                line(),
-                item(RESTORE_TABS, "Restore tabs on startup").checked(self.settings.restore_tabs),
-                line(),
-                item(THEME_SYSTEM, "Use system theme")
-                    .checked(matches!(self.settings.theme, ThemePreference::System)),
-                item(THEME_DARK, "Dark theme")
-                    .checked(matches!(self.settings.theme, ThemePreference::Dark)),
-                item(THEME_LIGHT, "Light theme")
-                    .checked(matches!(self.settings.theme, ThemePreference::Light)),
-            ],
+            MORE => {
+                let width = rect(self.window).right;
+                let selection = self.first_selected();
+                let mut commands = vec![item(OPEN_SETTINGS, "Settings\tCtrl+,")];
+                if self.recycling() {
+                    commands.extend([
+                        line(),
+                        item(RECYCLE_RESTORE, "Restore selected items")
+                            .enabled(selection.is_some()),
+                        item(RECYCLE_EMPTY, "Empty Recycle Bin").enabled(!self.rows.is_empty()),
+                    ]);
+                }
+                if self.compact_toolbar(width) {
+                    commands.push(line());
+                    if width < scale(650, self.dpi) {
+                        commands.extend([
+                            item(CUT, "Cut\tCtrl+X")
+                                .enabled(selection.is_some_and(|row| !row.location)),
+                            item(COPY, "Copy\tCtrl+C")
+                                .enabled(selection.is_some_and(|row| !row.location)),
+                            item(PASTE, "Paste\tCtrl+V").enabled(self.dest().is_some()),
+                        ]);
+                    }
+                    commands.extend([
+                        item(RENAME, "Rename\tF2").enabled(
+                            self.selection_count() == 1
+                                && selection.is_some_and(|entry| !entry.location),
+                        ),
+                        item(DELETE, "Delete\tDel")
+                            .enabled(selection.is_some_and(|entry| !entry.location)),
+                    ]);
+                    commands.extend(self.menu(FILTER));
+                }
+                commands.extend([
+                    line(),
+                    item(NEW_WINDOW, "New window\tCtrl+N"),
+                    item(CLOSE_TAB, "Close tab\tCtrl+W"),
+                    item(MOVE_TAB_LEFT, "Move tab left").enabled(self.active > 0),
+                    item(MOVE_TAB_RIGHT, "Move tab right")
+                        .enabled(self.active + 1 < self.tabs.len()),
+                    line(),
+                    item(PIN, "Pin or unpin folder").enabled(
+                        self.location_dir().is_some()
+                            || self
+                                .first_selected()
+                                .is_some_and(|row| row.directory && row.shell_item.is_none()),
+                    ),
+                    item(SELECT_ALL, "Select all\tCtrl+A")
+                        .enabled(*self.location() != Location::Home && !self.visible.is_empty()),
+                    line(),
+                    item(RESTORE_TABS, "Restore tabs on startup")
+                        .checked(self.settings.restore_tabs),
+                    line(),
+                    item(THEME_SYSTEM, "Use system theme")
+                        .checked(matches!(self.settings.theme, ThemePreference::System)),
+                    item(THEME_DARK, "Dark theme")
+                        .checked(matches!(self.settings.theme, ThemePreference::Dark)),
+                    item(THEME_LIGHT, "Light theme")
+                        .checked(matches!(self.settings.theme, ThemePreference::Light)),
+                ]);
+                commands
+            }
             PATH => {
                 let mut items = vec![
                     item(EDIT_ADDRESS, "Edit address\tCtrl+L"),
@@ -2569,31 +3543,50 @@ impl App {
                 }
                 items
             }
-            PINNED => {
-                self.pinned = self.settings.pins.clone();
-                let mut items: Vec<_> = self
-                    .pinned
-                    .iter()
-                    .enumerate()
-                    .map(|(index, path)| {
-                        item(
-                            PIN_START + index as u16,
-                            &path.to_string_lossy().replace('&', "&&"),
-                        )
-                    })
-                    .collect();
-                if !items.is_empty() {
-                    items.push(line());
-                }
-                items.push(
-                    item(PIN, "Pin or unpin current folder").enabled(self.location_dir().is_some()),
-                );
-                items
-            }
             CONTEXT => {
+                if self.recycling() && self.first_selected().is_none() {
+                    return vec![
+                        item(RECYCLE_EMPTY, "Empty Recycle Bin").enabled(!self.rows.is_empty()),
+                        item(REFRESH, "Refresh\tF5"),
+                    ];
+                }
                 if let Some(entry) = self.first_selected() {
                     let count = self.selection_count();
+                    if entry.shell_item.is_some() {
+                        return if matches!(
+                            self.location(),
+                            Location::Namespace {
+                                kind: Namespace::RecycleBin,
+                                ..
+                            }
+                        ) {
+                            vec![
+                                item(RECYCLE_RESTORE, "Restore"),
+                                item(DELETE, "Delete permanently"),
+                                line(),
+                                item(RECYCLE_EMPTY, "Empty Recycle Bin"),
+                                item(REFRESH, "Refresh\tF5"),
+                            ]
+                        } else {
+                            vec![
+                                item(OPEN, "Open\tEnter"),
+                                item(OPEN_TAB, "Open in new tab"),
+                                line(),
+                                item(REFRESH, "Refresh\tF5"),
+                            ]
+                        };
+                    }
                     let mut items = vec![item(OPEN, "Open\tEnter")];
+                    if !entry.directory && count == 1 {
+                        items.push(item(
+                            FAVORITE,
+                            if self.settings.favorites.contains(&entry.path) {
+                                "Remove from Favorites"
+                            } else {
+                                "Add to Favorites"
+                            },
+                        ));
+                    }
                     if entry.directory {
                         items.push(item(OPEN_TAB, "Open in new tab"));
                         items.push(item(OPEN_WINDOW, "Open in new window"));
@@ -2647,13 +3640,6 @@ impl App {
     fn button_style(&self, id: u16, control: HWND) -> ButtonStyle {
         let tab = (TAB_START..TAB_START + TAB_LIMIT as u16).contains(&id);
         let crumb = (CRUMB_START..CRUMB_START + CRUMB_LIMIT as u16).contains(&id);
-        let place = (PLACE_START..PLACE_START + PLACES.len() as u16).contains(&id);
-        let sidebar = (HOME..=LIBRARIES).contains(&id);
-        let active_place = place
-            && self.places.iter().any(|(path, label)| {
-                *label == PLACES[(id - PLACE_START) as usize]
-                    && self.location().directory() == Some(path.as_path())
-            });
         let glyph = match id {
             BACK => Some(Glyph::Back),
             FORWARD => Some(Glyph::Forward),
@@ -2674,9 +3660,25 @@ impl App {
             OPEN_SETTINGS => Some(Glyph::Settings),
             WIN_E_WINDOWS => Some(Glyph::Drive),
             WIN_E_BETTER => Some(Glyph::Folder),
-            PATH | COMPUTER => Some(Glyph::Drive),
+            PATH => Some(match self.location() {
+                Location::Home => Glyph::Home,
+                Location::Settings => Glyph::Settings,
+                Location::Namespace {
+                    kind: Namespace::Network,
+                    ..
+                } => Glyph::Network,
+                Location::Namespace {
+                    kind: Namespace::RecycleBin,
+                    ..
+                } => Glyph::Recycle,
+                Location::Namespace {
+                    kind: Namespace::Libraries,
+                    ..
+                } => Glyph::Library,
+                _ => Glyph::Drive,
+            }),
+            COMPUTER => Some(Glyph::Drive),
             HOME => Some(Glyph::Home),
-            PINNED => Some(Glyph::Pin),
             NETWORK => Some(Glyph::Network),
             RECYCLE => Some(Glyph::Recycle),
             LIBRARIES => Some(Glyph::Library),
@@ -2686,8 +3688,15 @@ impl App {
             } else {
                 Glyph::Maximize
             }),
-            id if crumb && id != CRUMB_START => Some(Glyph::Chevron),
-            _ if place => Some(Glyph::Folder),
+            id if crumb
+                && id != CRUMB_START
+                && self
+                    .crumb_slots
+                    .get((id - CRUMB_START) as usize)
+                    .is_some_and(Option::is_some) =>
+            {
+                Some(Glyph::Chevron)
+            }
             _ if tab => Some(
                 match self
                     .tabs
@@ -2698,6 +3707,18 @@ impl App {
                     Some(Location::Computer) => Glyph::Drive,
                     Some(Location::Settings) => Glyph::Settings,
                     Some(Location::Search { .. }) => Glyph::Search,
+                    Some(Location::Namespace {
+                        kind: Namespace::Network,
+                        ..
+                    }) => Glyph::Network,
+                    Some(Location::Namespace {
+                        kind: Namespace::RecycleBin,
+                        ..
+                    }) => Glyph::Recycle,
+                    Some(Location::Namespace {
+                        kind: Namespace::Libraries,
+                        ..
+                    }) => Glyph::Library,
                     _ => Glyph::Folder,
                 },
             ),
@@ -2716,19 +3737,14 @@ impl App {
                     | UP
                     | REFRESH
             );
-        let surface = if sidebar {
-            self.colors.sidebar
-        } else if title {
+        let surface = if title {
             self.colors.title
+        } else if crumb || id == PATH {
+            self.colors.field
         } else {
             self.colors.chrome
         };
-        let accent = place
-            || tab
-            || matches!(
-                id,
-                HOME | SORT | VIEW | FILTER | NEW | PINNED | RECYCLE | LIBRARIES
-            );
+        let accent = tab || matches!(id, SORT | VIEW | FILTER | NEW);
         let icon_color = if accent {
             self.colors.accent
         } else {
@@ -2738,29 +3754,32 @@ impl App {
             glyph,
             icon_color,
             surface,
-            label: sidebar
-                || crumb
-                || tab
-                || matches!(
-                    id,
-                    NEW | SORT
-                        | VIEW
-                        | FILTER
-                        | DETAILS
-                        | OPEN_SETTINGS
-                        | WIN_E_WINDOWS
-                        | WIN_E_BETTER
-                )
-                || glyph.is_none(),
-            left: sidebar || crumb || tab || matches!(id, WIN_E_WINDOWS | WIN_E_BETTER),
+            label: (id != DETAILS || !self.compact_toolbar(rect(self.window).right))
+                && (crumb
+                    || tab
+                    || matches!(
+                        id,
+                        NEW | SORT
+                            | VIEW
+                            | FILTER
+                            | DETAILS
+                            | OPEN_SETTINGS
+                            | WIN_E_WINDOWS
+                            | WIN_E_BETTER
+                    )
+                    || glyph.is_none()),
+            left: crumb || tab || matches!(id, WIN_E_WINDOWS | WIN_E_BETTER),
             active: (tab && id == TAB_START + self.active as u16)
-                || active_place
                 || (id == OPEN_SETTINGS && *self.location() == Location::Settings)
                 || (matches!(id, WIN_E_WINDOWS | WIN_E_BETTER)
                     && self.hotkey_status.as_ref().is_some_and(|status| {
                         !status.another_copy
                             && (status.configured || status.running) == (id == WIN_E_BETTER)
                     }))
+                || (id == DATE_FORMAT_DAY_FIRST
+                    && self.settings.modified_date_format == ModifiedDateFormat::DayMonthYear)
+                || (id == DATE_FORMAT_MONTH_FIRST
+                    && self.settings.modified_date_format == ModifiedDateFormat::MonthDayYear)
                 || (id == DETAILS && self.settings.details)
                 || (id == HOME && matches!(self.location(), Location::Home))
                 || (id == COMPUTER && matches!(self.location(), Location::Computer))
@@ -2864,6 +3883,44 @@ impl App {
         }
     }
 
+    fn recycling(&self) -> bool {
+        matches!(
+            self.location(),
+            Location::Namespace {
+                kind: Namespace::RecycleBin,
+                ..
+            }
+        )
+    }
+
+    fn column_label(&self, index: usize) -> &'static str {
+        if self.recycling() {
+            match index {
+                1 => return "Date deleted",
+                2 => return "Original location",
+                _ => {}
+            }
+        }
+        COLUMNS[index].0
+    }
+
+    fn sync_column_labels(&self) {
+        for index in [1, 2] {
+            let mut label = wide(self.column_label(index));
+            let column = LVCOLUMNW {
+                mask: LVCF_TEXT,
+                pszText: label.as_mut_ptr(),
+                ..unsafe { zeroed() }
+            };
+            send(
+                self.list,
+                LVM_SETCOLUMNW,
+                index,
+                &column as *const _ as LPARAM,
+            );
+        }
+    }
+
     fn draw_header(&self) {
         let header = self.header;
         let mut paint = unsafe { zeroed() };
@@ -2872,7 +3929,8 @@ impl App {
         let d = |v| scale(v, self.dpi);
         fill(dc, &bounds, self.colors.sidebar);
         let sort = self.tab().sort;
-        for (index, (label, _)) in COLUMNS.into_iter().enumerate() {
+        for index in 0..COLUMNS.len() {
+            let label = self.column_label(index);
             let mut r: RECT = unsafe { zeroed() };
             if send(header, HDM_GETITEMRECT, index, &mut r as *mut _ as LPARAM) == 0 {
                 continue;
@@ -2923,7 +3981,7 @@ impl App {
             GetWindowRect(self.window, &mut r);
         }
         if unsafe { IsZoomed(self.window) } == 0 {
-            let edge = scale(6, self.dpi);
+            let edge = scale(RESIZE_EDGE, self.dpi);
             let left = x < r.left + edge;
             let right = x >= r.right - edge;
             let top = y < r.top + edge;
@@ -2980,7 +4038,14 @@ impl App {
                             0 => entry.display_name(self.settings.hide_extensions),
                             col => {
                                 let field = match col {
-                                    1 => entry.date(),
+                                    1 => entry.date(self.settings.modified_date_format),
+                                    2 if self.recycling() => entry
+                                        .shell_item
+                                        .as_ref()
+                                        .and_then(|item| item.original_location.as_ref())
+                                        .map_or_else(String::new, |path| {
+                                            path.display().to_string()
+                                        }),
                                     2 => entry.kind(),
                                     3 => entry.display_size(),
                                     _ => String::new(),
@@ -3007,11 +4072,8 @@ impl App {
             }
             NM_DBLCLK => {
                 let event = unsafe { &*(notification as *const NMITEMACTIVATE) };
-                if let Some(entry) = usize::try_from(event.iItem)
-                    .ok()
-                    .and_then(|index| self.entry(index))
-                {
-                    self.show_entry(OPEN, entry.path.clone(), entry.directory);
+                if let Ok(index) = usize::try_from(event.iItem) {
+                    self.activate_row(OPEN, index);
                 }
             }
             NM_RCLICK => {
@@ -3047,6 +4109,8 @@ fn show_menu(app: &RefCell<App>, id: u16, coordinates: LPARAM) {
         return;
     };
     let items = state.menu(id);
+    let painted = state.colors.dark && !state.colors.contrast;
+    let menu_color = state.colors.chrome;
     let window = state.window;
     let mut anchor: POINT = unsafe { zeroed() };
     unsafe {
@@ -3076,7 +4140,12 @@ fn show_menu(app: &RefCell<App>, id: u16, coordinates: LPARAM) {
             }
         } else {
             let mut bounds = zeroed();
-            GetWindowRect(state.button(id), &mut bounds);
+            let source = if id == PATH && coordinates != 0 {
+                coordinates as HWND
+            } else {
+                state.button(id)
+            };
+            GetWindowRect(source, &mut bounds);
             anchor.x = bounds.left;
             anchor.y = bounds.bottom;
         }
@@ -3090,15 +4159,48 @@ fn show_menu(app: &RefCell<App>, id: u16, coordinates: LPARAM) {
         if menu.is_null() {
             return;
         }
-        for item in items {
-            let flags = if item.id == 0 {
-                MF_SEPARATOR
-            } else {
-                MF_STRING
-                    | if !item.enabled { MF_GRAYED } else { 0 }
-                    | if item.checked { MF_CHECKED } else { 0 }
+        let brush = if painted {
+            CreateSolidBrush(menu_color)
+        } else {
+            null_mut()
+        };
+        if !brush.is_null() {
+            let info = MENUINFO {
+                cbSize: size_of::<MENUINFO>() as u32,
+                fMask: MIM_BACKGROUND,
+                hbrBack: brush,
+                ..zeroed()
             };
-            AppendMenuW(menu, flags, item.id as usize, wide(item.label).as_ptr());
+            SetMenuInfo(menu, &info);
+        }
+        for (index, item) in items.iter().enumerate() {
+            if item.id == 0 {
+                AppendMenuW(menu, MF_SEPARATOR, 0, null());
+            } else {
+                let mut label = wide(&item.label);
+                let info = MENUITEMINFOW {
+                    cbSize: size_of::<MENUITEMINFOW>() as u32,
+                    fMask: MIIM_FTYPE | MIIM_STATE | MIIM_STRING | MIIM_ID | MIIM_DATA,
+                    fType: if painted { MFT_OWNERDRAW } else { MFT_STRING },
+                    fState: (if item.enabled {
+                        MFS_ENABLED
+                    } else {
+                        MFS_DISABLED
+                    }) | if item.checked {
+                        MFS_CHECKED
+                    } else {
+                        MFS_UNCHECKED
+                    },
+                    wID: item.id as u32,
+                    dwItemData: index,
+                    dwTypeData: label.as_mut_ptr(),
+                    ..zeroed()
+                };
+                InsertMenuItemW(menu, index as u32, 1, &info);
+            }
+        }
+        if painted {
+            app.borrow_mut().popup_items = items;
         }
         let selected = TrackPopupMenu(
             menu,
@@ -3110,6 +4212,12 @@ fn show_menu(app: &RefCell<App>, id: u16, coordinates: LPARAM) {
             null(),
         );
         DestroyMenu(menu);
+        if painted {
+            app.borrow_mut().popup_items.clear();
+        }
+        if !brush.is_null() {
+            DeleteObject(brush);
+        }
         if selected > 0 {
             PostMessageW(window, WM_COMMAND, selected as usize, 0);
         }
@@ -3151,8 +4259,18 @@ fn key(app: &RefCell<App>, message: &MSG) -> bool {
     }
     let shortcut = match (vk, ctrl, alt, shift) {
         (VK_OEM_COMMA, true, false, _) => OPEN_SETTINGS,
+        (VK_RETURN, false, false, _) if focus == app.navigation => {
+            app.select_sidebar();
+            return true;
+        }
         (VK_RETURN, false, false, _) if focus == app.button(WIN_E_WINDOWS) => WIN_E_WINDOWS,
         (VK_RETURN, false, false, _) if focus == app.button(WIN_E_BETTER) => WIN_E_BETTER,
+        (VK_RETURN, false, false, _) if focus == app.button(DATE_FORMAT_DAY_FIRST) => {
+            DATE_FORMAT_DAY_FIRST
+        }
+        (VK_RETURN, false, false, _) if focus == app.button(DATE_FORMAT_MONTH_FIRST) => {
+            DATE_FORMAT_MONTH_FIRST
+        }
         (0x4C, true, false, _) | (VK_D, false, true, _) => {
             app.address_focus(true);
             return true;
@@ -3196,7 +4314,7 @@ fn key(app: &RefCell<App>, message: &MSG) -> bool {
         {
             STOP_SEARCH
         }
-        (0x41, true, false, false) if !typing => SELECT_ALL,
+        (0x41, true, false, false) if !typing && *app.location() != Location::Home => SELECT_ALL,
         (0x58, true, false, false) if !typing => CUT,
         (0x43, true, false, false) if !typing => COPY,
         (0x56, true, false, false) if !typing => PASTE,
@@ -3218,8 +4336,37 @@ fn key(app: &RefCell<App>, message: &MSG) -> bool {
 
 // GWLP_USERDATA borrows the RefCell owned by run(). It outlives the message pump.
 unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    if message == WM_NCCALCSIZE && wp != 0 {
+    if matches!(message, WM_NCCALCSIZE | WM_NCPAINT) {
         return 0;
+    }
+    if message == WM_NCACTIVATE {
+        return unsafe { DefWindowProcW(window, message, wp, -1) };
+    }
+    if matches!(
+        message,
+        WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX
+    ) {
+        if let Some(colors) = CONTROL_COLORS.get() {
+            let id = unsafe { GetDlgCtrlID(lp as HWND) } as u16;
+            let surface = match id {
+                STATUS => 0,
+                NAVIGATION => 2,
+                ADDRESS | SEARCH => 3,
+                _ => 1,
+            };
+            unsafe {
+                SetTextColor(
+                    wp as HDC,
+                    if matches!(id, STATUS | SUMMARY) {
+                        colors.muted
+                    } else {
+                        colors.text
+                    },
+                );
+                SetBkColor(wp as HDC, colors.surfaces[surface]);
+            }
+            return colors.brushes[surface] as LRESULT;
+        }
     }
     let pointer = unsafe { GetWindowLongPtrW(window, GWLP_USERDATA) } as *const RefCell<App>;
     if pointer.is_null() {
@@ -3289,6 +4436,10 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
     };
     match message {
         WM_COMMAND => {
+            if wp as u16 == NAVIGATION && wp >> 16 == LBN_SELCHANGE as usize {
+                app.select_sidebar();
+                return 0;
+            }
             if wp as u16 == ADDRESS && wp >> 16 == EN_KILLFOCUS as usize {
                 app.address_focus(false);
                 return 0;
@@ -3373,9 +4524,8 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
             let y = (lp >> 16) as i16 as i32;
             let d = |v| scale(v, app.dpi);
             let width = rect(window).right;
-            if (d(169)..width - (width / 4).clamp(d(158), d(280)) - d(16)).contains(&x)
-                && (d(43)..d(74)).contains(&y)
-            {
+            let (left, right, _) = app.address_bounds(width);
+            if (left..right).contains(&x) && (d(43)..d(74)).contains(&y) {
                 app.address_focus(true);
             }
             0
@@ -3398,7 +4548,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
             }
             0
         }
-        WM_SIZE => {
+        WM_SIZE | WM_EXITSIZEMOVE => {
             app.layout();
             0
         }
@@ -3425,8 +4575,8 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
         }
         WM_GETMINMAXINFO => {
             let info = unsafe { &mut *(lp as *mut MINMAXINFO) };
-            info.ptMinTrackSize.x = scale(834, app.dpi);
-            info.ptMinTrackSize.y = scale(590, app.dpi);
+            info.ptMinTrackSize.x = scale(552, app.dpi);
+            info.ptMinTrackSize.y = scale(450, app.dpi);
             unsafe {
                 let monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
                 let mut bounds: MONITORINFO = zeroed();
@@ -3441,10 +4591,23 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
             0
         }
         WM_NOTIFY => app.on_notify(lp),
+        WM_MEASUREITEM => {
+            let measure = unsafe { &mut *(lp as *mut MEASUREITEMSTRUCT) };
+            if measure.CtlType == ODT_MENU {
+                app.measure_menu(measure);
+                1
+            } else {
+                0
+            }
+        }
         WM_DRAWITEM => {
             let draw = unsafe { &*(lp as *const DRAWITEMSTRUCT) };
             let id = draw.CtlID as u16;
-            if (DRIVE_START..DRIVE_START + DRIVE_LIMIT as u16).contains(&id) {
+            if draw.CtlType == ODT_MENU {
+                app.draw_menu(draw);
+            } else if id == NAVIGATION {
+                app.draw_sidebar(draw);
+            } else if (DRIVE_START..DRIVE_START + DRIVE_LIMIT as u16).contains(&id) {
                 app.draw_drive(draw, (id - DRIVE_START) as usize);
             } else {
                 let style = app.button_style(id, draw.hwndItem);
@@ -3457,30 +4620,6 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
                 );
             }
             1
-        }
-        WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT => {
-            let dc = wp as HDC;
-            let control = lp as HWND;
-            let chrome = control == app.status;
-            unsafe {
-                SetTextColor(
-                    dc,
-                    if control == app.status || control == app.summary {
-                        app.colors.muted
-                    } else {
-                        app.colors.text
-                    },
-                );
-                SetBkColor(
-                    dc,
-                    if chrome {
-                        app.colors.chrome
-                    } else {
-                        app.colors.content
-                    },
-                );
-            }
-            app.brushes[usize::from(!chrome)] as isize
         }
         WM_DROPFILES => {
             let handle = wp as HDROP;
@@ -3509,7 +4648,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
             if app.busy > 0 {
                 let message = "Wait for Windows to finish the file operation before closing.";
                 if *app.location() == Location::Settings {
-                    if let Some(controls) = app.shortcut_controls {
+                    if let Some(controls) = app.settings_controls {
                         text(controls.state, message);
                     }
                 } else {
@@ -3524,7 +4663,11 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
             }
             0
         }
-        _ => unsafe { DefWindowProcW(window, message, wp, lp) },
+        _ => {
+            // Default handling can synchronously dispatch size and command messages.
+            drop(app);
+            unsafe { DefWindowProcW(window, message, wp, lp) }
+        }
     }
 }
 
@@ -3656,10 +4799,15 @@ pub fn run(path: Option<PathBuf>) -> Result<(), std::io::Error> {
             return Err(std::io::Error::last_os_error());
         }
         let window = CreateWindowExW(
-            0,
+            WS_EX_APPWINDOW,
             class.as_ptr(),
             wide("BetterExplorer").as_ptr(),
-            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+            WS_POPUP
+                | WS_THICKFRAME
+                | WS_SYSMENU
+                | WS_MINIMIZEBOX
+                | WS_MAXIMIZEBOX
+                | WS_CLIPCHILDREN,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             1136,

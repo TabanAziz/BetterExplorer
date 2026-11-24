@@ -20,7 +20,9 @@ To remove the installed program, run Setup.exe from the extracted bundle with th
 
     .\Setup.exe --uninstall
 
-- Open folders from Home or This PC, use the breadcrumb bar, or press Ctrl+L to enter a path.
+- Open folders from Home or This PC, use the breadcrumb bar, or press Ctrl+L to enter a path. Home shows Quick access, Recent and Favorites.
+- Network, Recycle Bin and Libraries open inside BetterExplorer. Use the Recycle Bin context menu to restore or permanently delete items.
+- In Settings under **Date modified format**, choose DD.MM.YYYY or MM/DD/YYYY. Both include the local time.
 - Ctrl+T and Ctrl+W manage tabs. Use More to reorder tabs and enable tab restoration.
 - Wheel scrolling eases toward the new position, including the first row at the upper edge.
 - View offers Details, List and four icon sizes. This PC shows available space on local fixed drives.
@@ -44,7 +46,7 @@ The application is built as `target\release\BetterExplorer.exe`. See the [test p
 
 ## Preview limits
 
-The application handles ordinary file browsing and file operations. Windows File Explorer opens the Recycle Bin, Network and Libraries. Gallery, Shell extensions, cloud overlays and advanced Search options are still outside this preview. The [parity matrix](docs/parity-matrix.csv) records the current state of individual features. See [known limitations](docs/limitations.md).
+Gallery, Shell extensions, cloud overlays and advanced Search options are still outside this preview. The [parity matrix](docs/parity-matrix.csv) records the current state of individual features. See [known limitations](docs/limitations.md).
 
 ## License
 

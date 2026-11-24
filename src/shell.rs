@@ -51,8 +51,12 @@ pub enum Operation {
     Open(PathBuf),
     OpenWith(PathBuf),
     Properties(PathBuf),
-    Namespace(&'static str),
     Reveal(PathBuf),
+    Recycle {
+        keys: Vec<String>,
+        restore: bool,
+    },
+    EmptyRecycle,
     Clipboard {
         paths: Vec<PathBuf>,
         cut: bool,
@@ -104,6 +108,8 @@ impl Operation {
                 | Self::Create { .. }
                 | Self::Rename { .. }
                 | Self::Delete { .. }
+                | Self::Recycle { .. }
+                | Self::EmptyRecycle
                 | Self::Shortcut { .. }
                 | Self::Compress { .. }
                 | Self::Extract { .. }
@@ -141,8 +147,14 @@ pub fn run(owner: usize, operation: Operation) -> Result<String, String> {
             unsafe { SHOpenWithDialog(Some(owner), &options) }.map_err(|e| e.to_string())
         }
         Operation::Properties(path) => execute(owner, "properties", path.as_os_str(), None),
-        Operation::Namespace(name) => execute(owner, "open", OsStr::new(name), None),
         Operation::Reveal(path) => reveal(owner, &path),
+        Operation::Recycle { keys, restore } => {
+            crate::namespace::recycle_action(&keys, restore, owner.0 as usize)
+        }
+        Operation::EmptyRecycle => unsafe {
+            windows::Win32::UI::Shell::SHEmptyRecycleBinW(Some(owner), PCWSTR::null(), 0)
+                .map_err(|error| error.to_string())
+        },
         Operation::Clipboard {
             paths,
             cut,

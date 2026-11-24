@@ -1,4 +1,7 @@
-use crate::model::{from_wide, wide, Location};
+use crate::{
+    model::{from_wide, wide, Location, ModifiedDateFormat},
+    namespace,
+};
 use std::{
     cmp::Ordering as Order,
     ffi::{OsStr, OsString},
@@ -75,6 +78,7 @@ pub struct Entry {
     pub modified: u64,
     pub location: bool,
     pub capacity: Option<Capacity>,
+    pub shell_item: Option<namespace::Item>,
 }
 
 impl Entry {
@@ -88,6 +92,7 @@ impl Entry {
             modified: 0,
             location: true,
             capacity: None,
+            shell_item: None,
         }
     }
     pub fn label(&self) -> String {
@@ -101,7 +106,9 @@ impl Entry {
         }
     }
     pub fn kind(&self) -> String {
-        if self.location {
+        if let Some(item) = &self.shell_item {
+            item.kind.clone()
+        } else if self.location {
             "Location".into()
         } else if self.directory {
             "File folder".into()
@@ -114,7 +121,7 @@ impl Entry {
             )
         }
     }
-    pub fn date(&self) -> String {
+    pub fn date(&self, format: ModifiedDateFormat) -> String {
         if self.modified == 0 {
             return String::new();
         }
@@ -128,10 +135,22 @@ impl Entry {
             FileTimeToLocalFileTime(&utc, &mut local) != 0
                 && FileTimeToSystemTime(&local, &mut date) != 0
         } {
-            format!(
-                "{:04}-{:02}-{:02}  {:02}:{:02}",
-                date.wYear, date.wMonth, date.wDay, date.wHour, date.wMinute
-            )
+            let SYSTEMTIME {
+                wYear: year,
+                wMonth: month,
+                wDay: day,
+                wHour: hour,
+                wMinute: minute,
+                ..
+            } = date;
+            match format {
+                ModifiedDateFormat::DayMonthYear => {
+                    format!("{day:02}.{month:02}.{year:04} {hour:02}:{minute:02}")
+                }
+                ModifiedDateFormat::MonthDayYear => {
+                    format!("{month:02}/{day:02}/{year:04} {hour:02}:{minute:02}")
+                }
+            }
         } else {
             String::new()
         }
@@ -171,7 +190,15 @@ pub fn sort_entries(entries: &mut [Arc<Entry>], sort: Sort) {
         let field = match sort.column {
             Column::Name => name_order(),
             Column::Modified => left.modified.cmp(&right.modified),
-            Column::Kind => left.extension.cmp(&right.extension),
+            Column::Kind => match (&left.shell_item, &right.shell_item) {
+                (Some(left), Some(right))
+                    if left.original_location.is_some() || right.original_location.is_some() =>
+                {
+                    left.original_location.cmp(&right.original_location)
+                }
+                (Some(left), Some(right)) => left.kind.cmp(&right.kind),
+                _ => left.extension.cmp(&right.extension),
+            },
             Column::Size => left.size.cmp(&right.size),
         }
         .then_with(name_order);
@@ -296,6 +323,33 @@ pub fn scan(request: Request, latest: &AtomicU64, mut publish: impl FnMut(ScanEv
     let mut error = None;
     match location {
         Location::Settings => (),
+        Location::Namespace { kind, child, .. } => {
+            let result = if let Some(child) = child {
+                namespace::enumerate_child(kind, &child, stale)
+            } else {
+                namespace::enumerate(kind, stale)
+            };
+            match result {
+                Ok(items) => entries.extend(items.into_iter().map(|item| {
+                    Arc::new(Entry {
+                        path: PathBuf::from(&item.key),
+                        name: wide(&item.name),
+                        extension: Vec::new(),
+                        directory: item.directory,
+                        size: item.size,
+                        modified: if kind == namespace::Namespace::RecycleBin {
+                            item.deleted
+                        } else {
+                            item.modified
+                        },
+                        location: true,
+                        capacity: None,
+                        shell_item: Some(item),
+                    })
+                })),
+                Err(message) => error = Some(message),
+            }
+        }
         Location::Home => {
             let places = known_places();
             entries.extend(
@@ -412,6 +466,7 @@ fn enumerate(
                     modified: metadata.last_write_time(),
                     location: false,
                     capacity: None,
+                    shell_item: None,
                 }));
             }
             if entries.len() > delivered
@@ -475,7 +530,14 @@ impl Scanner {
 
     pub fn request(&self, request: Request) {
         self.cancel(request.id);
-        let lane = if request.location.directory().is_some_and(network_path) {
+        let lane = if matches!(
+            request.location,
+            Location::Namespace {
+                kind: namespace::Namespace::Network,
+                ..
+            }
+        ) || request.location.directory().is_some_and(network_path)
+        {
             &self.remote
         } else {
             &self.local

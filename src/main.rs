@@ -3,7 +3,11 @@
 #[cfg(windows)]
 mod benchmark;
 #[cfg(windows)]
+mod breadcrumb;
+#[cfg(windows)]
 mod chrome;
+#[cfg(windows)]
+mod home_page;
 #[cfg(windows)]
 mod hotkey;
 #[cfg(windows)]
