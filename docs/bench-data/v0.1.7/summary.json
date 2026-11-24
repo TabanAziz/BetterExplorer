@@ -1,0 +1,56 @@
+{
+    "started_utc":  "2026-11-24T15:59:08.1879683Z",
+    "environment":  {
+                        "windows_version":  "25H2",
+                        "windows_build":  "26200.9974",
+                        "processor":  "11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz",
+                        "logical_processors":  16,
+                        "ui_culture":  "de-DE",
+                        "powershell":  "5.1.26100.9818",
+                        "fixture_drive":  "C:\\",
+                        "fixture_file_system":  "NTFS",
+                        "binary_sha256":  "204C51D3DEB147A53E881EAAE3F208025664799D4D9F9A990AB43D4D248EE791"
+                    },
+    "method":  {
+                   "cache":  "Warm Windows cache. One unmeasured startup process and one in-process navigation warm-up.",
+                   "startup":  "Time to the first DWM-flushed paint from a dispatched window message. One process per sample.",
+                   "navigation":  "App-internal timings in one visible process. Dispatch reports the longest sampled message dispatch for each navigation.",
+                   "measurement_limits":  "App timings do not independently verify desktop composition, queued message delivery or real input latency. Windows scheduling and background activity affect the samples.",
+                   "idle":  "Process CPU time divided by elapsed time, expressed as a percent of one logical core.",
+                   "percentile":  "Nearest rank.",
+                   "small_entries":  16,
+                   "large_entries":  100000,
+                   "fixture":  "Zero-length text files in local temporary directories."
+               },
+    "startup_ms":  {
+                       "count":  30,
+                       "p50":  104.444,
+                       "p95":  124.074,
+                       "p99":  125.758
+                   },
+    "navigation_first_ms":  {
+                                "count":  30,
+                                "p50":  55.639,
+                                "p95":  69.349,
+                                "p99":  69.539
+                            },
+    "navigation_complete_ms":  {
+                                   "count":  30,
+                                   "p50":  208.134,
+                                   "p95":  256.88,
+                                   "p99":  263.531
+                               },
+    "navigation_max_dispatch_ms":  {
+                                       "count":  30,
+                                       "p50":  5.332,
+                                       "p95":  6.946,
+                                       "p99":  8.453
+                                   },
+    "idle":  {
+                 "requested_seconds":  30,
+                 "settle_seconds":  5,
+                 "elapsed_seconds":  30.015,
+                 "process_cpu_ms":  0,
+                 "percent_one_logical_core":  0
+             }
+}

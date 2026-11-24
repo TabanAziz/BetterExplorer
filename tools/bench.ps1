@@ -6,7 +6,8 @@ param(
     [ValidateRange(1, 10000)] [int] $NavigationRuns = 30,
     [ValidateRange(1, 100000)] [int] $Entries = 100000,
     [ValidateRange(0, 3600)] [int] $IdleSeconds = 0,
-    [ValidateRange(5, 86400)] [int] $TimeoutSeconds = 180
+    [ValidateRange(5, 86400)] [int] $TimeoutSeconds = 180,
+    [string] $BinaryPath
 )
 
 Set-StrictMode -Version Latest
@@ -142,8 +143,9 @@ if (-not [Environment]::UserInteractive -or (Get-Process -Id $PID).SessionId -eq
 }
 
 $repo = Split-Path -Parent $PSScriptRoot
-$binary = Join-Path $repo 'target/release/BetterExplorer.exe'
-if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) { throw 'Run cargo build --release before benchmarking.' }
+$binary = if ($BinaryPath) { $BinaryPath } else { Join-Path $repo 'target/release/BetterExplorer.exe' }
+if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) { throw 'Build the release or pass an existing BetterExplorer.exe with -BinaryPath.' }
+$binary = (Resolve-Path -LiteralPath $binary).ProviderPath
 
 $runId = [guid]::NewGuid().ToString('N')
 $startedAt = [DateTime]::UtcNow

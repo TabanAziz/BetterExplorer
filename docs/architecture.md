@@ -3,11 +3,11 @@
 BetterExplorer targets Windows 11 x64. The reference machine runs Windows 11 Pro 25H2 build 26200.9974 with the German Windows interface. The application uses its own Better series branding, a native command bar and a virtual Win32 list view.
 
 - The window thread owns controls, navigation history, selection and visible data. It never enumerates directories or runs a transfer.
-- Enumeration workers publish the first results in small batches, then produce the sorted snapshot. Navigation supersedes old requests. An in-flight kernel call may finish before cancellation takes effect.
-- The file list uses `LVS_OWNERDATA`. The application supplies text and icons for the requested rows. Wheel motion uses a timer only while scrolling and clamps the icon view to its native origin. Folder notifications refresh the layout without discarding the visible rows first. Grouping and tile view are not built into this mode.
-- A separate COM apartment runs Windows Shell operations. The operating system handles conflict prompts, progress and Recycle Bin integration.
-- An explicitly opened shell destination can use File Explorer for Windows-managed virtual locations. The default Windows shell remains installed and available.
-- Store per-user settings locally and keep diagnostic data opt-in. No network services or telemetry are bundled.
+- Enumeration workers publish the first results in small batches, then produce the sorted snapshot. Windows-indexed PC search and remote folders use a separate scan lane. Navigation supersedes old requests. An in-flight kernel call may finish before cancellation takes effect.
+- The file list uses `LVS_OWNERDATA`. It supplies text and icons on demand and uses date headings in Details. File type icons resolve on a worker and reuse bounded caches. The scroll timer runs during wheel motion, and folder notifications refresh the layout while keeping the current rows visible.
+- A separate COM apartment runs Windows Shell operations and the per-window undo queue. The operating system handles conflict prompts, progress, and Recycle Bin integration. Outgoing drag-and-drop uses native OLE file data and offers Copy.
+- Network, Recycle Bin, and Libraries are listed through Windows Shell namespaces. An explicit menu action can reveal an item in Windows File Explorer.
+- Settings and window placement are stored locally per user. Benchmarks and diagnostics run on request.
 
 ## Win+E
 

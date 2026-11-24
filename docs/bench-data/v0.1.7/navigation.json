@@ -1,0 +1,185 @@
+{
+  "startup_ms": 141.7148,
+  "navigation": [
+    {
+      "first_ms": 55.6633,
+      "complete_ms": 215.09320000000002,
+      "rows": 100000,
+      "max_dispatch_ms": 4.9891
+    },
+    {
+      "first_ms": 55.7382,
+      "complete_ms": 194.3174,
+      "rows": 100000,
+      "max_dispatch_ms": 5.3456
+    },
+    {
+      "first_ms": 55.591300000000004,
+      "complete_ms": 194.1729,
+      "rows": 100000,
+      "max_dispatch_ms": 4.9229
+    },
+    {
+      "first_ms": 62.248900000000006,
+      "complete_ms": 194.2142,
+      "rows": 100000,
+      "max_dispatch_ms": 5.164499999999999
+    },
+    {
+      "first_ms": 55.3431,
+      "complete_ms": 187.266,
+      "rows": 100000,
+      "max_dispatch_ms": 5.2726
+    },
+    {
+      "first_ms": 55.3173,
+      "complete_ms": 194.3961,
+      "rows": 100000,
+      "max_dispatch_ms": 4.9121
+    },
+    {
+      "first_ms": 55.1558,
+      "complete_ms": 187.0865,
+      "rows": 100000,
+      "max_dispatch_ms": 4.958200000000001
+    },
+    {
+      "first_ms": 55.582699999999996,
+      "complete_ms": 201.0868,
+      "rows": 100000,
+      "max_dispatch_ms": 5.1722
+    },
+    {
+      "first_ms": 55.650400000000005,
+      "complete_ms": 194.21710000000002,
+      "rows": 100000,
+      "max_dispatch_ms": 4.713
+    },
+    {
+      "first_ms": 55.5576,
+      "complete_ms": 201.234,
+      "rows": 100000,
+      "max_dispatch_ms": 4.852399999999999
+    },
+    {
+      "first_ms": 55.3446,
+      "complete_ms": 194.2884,
+      "rows": 100000,
+      "max_dispatch_ms": 5.1764
+    },
+    {
+      "first_ms": 55.3057,
+      "complete_ms": 194.11339999999998,
+      "rows": 100000,
+      "max_dispatch_ms": 4.8144
+    },
+    {
+      "first_ms": 55.2637,
+      "complete_ms": 187.09509999999997,
+      "rows": 100000,
+      "max_dispatch_ms": 4.8122
+    },
+    {
+      "first_ms": 55.5191,
+      "complete_ms": 187.3175,
+      "rows": 100000,
+      "max_dispatch_ms": 4.4060999999999995
+    },
+    {
+      "first_ms": 55.482,
+      "complete_ms": 214.947,
+      "rows": 100000,
+      "max_dispatch_ms": 5.865
+    },
+    {
+      "first_ms": 62.8238,
+      "complete_ms": 242.79819999999998,
+      "rows": 100000,
+      "max_dispatch_ms": 6.6160000000000005
+    },
+    {
+      "first_ms": 69.3489,
+      "complete_ms": 256.88,
+      "rows": 100000,
+      "max_dispatch_ms": 8.4531
+    },
+    {
+      "first_ms": 69.0107,
+      "complete_ms": 228.5451,
+      "rows": 100000,
+      "max_dispatch_ms": 6.5829
+    },
+    {
+      "first_ms": 55.638600000000004,
+      "complete_ms": 215.11739999999998,
+      "rows": 100000,
+      "max_dispatch_ms": 5.4127
+    },
+    {
+      "first_ms": 62.4067,
+      "complete_ms": 222.022,
+      "rows": 100000,
+      "max_dispatch_ms": 4.9318
+    },
+    {
+      "first_ms": 55.387499999999996,
+      "complete_ms": 194.161,
+      "rows": 100000,
+      "max_dispatch_ms": 6.209499999999999
+    },
+    {
+      "first_ms": 62.476499999999994,
+      "complete_ms": 235.86489999999998,
+      "rows": 100000,
+      "max_dispatch_ms": 5.542400000000001
+    },
+    {
+      "first_ms": 69.5388,
+      "complete_ms": 263.53110000000004,
+      "rows": 100000,
+      "max_dispatch_ms": 5.4837
+    },
+    {
+      "first_ms": 55.4995,
+      "complete_ms": 221.9449,
+      "rows": 100000,
+      "max_dispatch_ms": 5.332199999999999
+    },
+    {
+      "first_ms": 55.588,
+      "complete_ms": 208.1339,
+      "rows": 100000,
+      "max_dispatch_ms": 6.1478
+    },
+    {
+      "first_ms": 62.53509999999999,
+      "complete_ms": 242.8755,
+      "rows": 100000,
+      "max_dispatch_ms": 6.9465
+    },
+    {
+      "first_ms": 62.3417,
+      "complete_ms": 249.866,
+      "rows": 100000,
+      "max_dispatch_ms": 5.6707
+    },
+    {
+      "first_ms": 62.1901,
+      "complete_ms": 235.8115,
+      "rows": 100000,
+      "max_dispatch_ms": 6.8778
+    },
+    {
+      "first_ms": 62.22,
+      "complete_ms": 235.5652,
+      "rows": 100000,
+      "max_dispatch_ms": 6.843100000000001
+    },
+    {
+      "first_ms": 62.554399999999994,
+      "complete_ms": 243.05679999999998,
+      "rows": 100000,
+      "max_dispatch_ms": 5.6003
+    }
+  ]
+}

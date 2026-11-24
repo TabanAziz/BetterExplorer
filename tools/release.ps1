@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 
 [CmdletBinding()]
-param([switch] $SkipBuild)
+param([switch] $SkipBuild, [switch] $PortableOnly)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -58,7 +58,7 @@ function Build-SetupLauncher {
 }
 
 $repo = Split-Path -Parent $PSScriptRoot
-$documents = @('README.md', 'LICENSE', 'THIRD-PARTY-LICENSES')
+$documents = @('README.md', 'LICENSE', 'THIRD-PARTY-LICENSES', 'CHANGELOG.md', 'CONTRIBUTING.md', 'SECURITY.md')
 foreach ($name in $documents) { $null = Get-OwnedFileHash (Join-Path $repo $name) }
 
 Push-Location -LiteralPath $repo
@@ -97,44 +97,52 @@ $destination = Join-Path $dist "$prefix-$timestamp"
 
 $null = New-Item -ItemType Directory -Path $work
 try {
-    foreach ($directory in @($portable, $install, $output)) { $null = [IO.Directory]::CreateDirectory($directory) }
-    [IO.File]::Copy($binary, (Join-Path $portable 'BetterExplorer.exe'))
-    foreach ($name in $documents) {
-        [IO.File]::Copy((Join-Path $repo $name), (Join-Path $portable $name))
-    }
-    foreach ($name in @('BetterExplorer.exe') + $documents) {
-        [IO.File]::Copy((Join-Path $portable $name), (Join-Path $install $name))
-    }
-    foreach ($packageRoot in @($portable, $install)) {
+    $packageRoots = @($portable)
+    if (-not $PortableOnly) { $packageRoots += $install }
+    $null = [IO.Directory]::CreateDirectory($output)
+    foreach ($packageRoot in $packageRoots) {
+        $null = [IO.Directory]::CreateDirectory($packageRoot)
+        [IO.File]::Copy($binary, (Join-Path $packageRoot 'BetterExplorer.exe'))
+        foreach ($name in $documents) {
+            [IO.File]::Copy((Join-Path $repo $name), (Join-Path $packageRoot $name))
+        }
         $assetDirectory = Join-Path $packageRoot 'assets'
         $null = [IO.Directory]::CreateDirectory($assetDirectory)
         [IO.File]::Copy((Join-Path $repo 'assets/bex.png'), (Join-Path $assetDirectory 'bex.png'))
+        $screenshots = Join-Path $repo 'assets/screenshots'
+        if (Test-Path -LiteralPath $screenshots -PathType Container) {
+            Copy-Item -LiteralPath $screenshots -Destination $assetDirectory -Recurse
+        }
         Copy-Item -LiteralPath (Join-Path $repo 'docs') -Destination $packageRoot -Recurse
     }
-    foreach ($name in @('install.ps1', 'uninstall.ps1', 'install-common.ps1')) {
-        [IO.File]::Copy((Join-Path $PSScriptRoot $name), (Join-Path $install $name))
-    }
-    Build-SetupLauncher -Repo $repo -Work $work -Destination $install
-
-    $checksums = [ordered] @{}
-    foreach ($name in $script:BetterExplorerPayload) {
-        $checksums[$name] = Get-OwnedFileHash (Join-Path $install $name)
-    }
-    $manifest = [ordered] @{
-        product = 'BetterExplorer'
-        schema = 1
-        version = $version
-        files = $checksums
-        shortcut_sha256 = $null
-    }
-    Write-PayloadManifest $manifest (Join-Path $install 'bundle-manifest.json')
 
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $portableZip = "$prefix-portable.zip"
-    $installZip = "$prefix-install.zip"
     [IO.Compression.ZipFile]::CreateFromDirectory($portable, (Join-Path $output $portableZip))
-    [IO.Compression.ZipFile]::CreateFromDirectory($install, (Join-Path $output $installZip))
-    $sumLines = foreach ($name in @($portableZip, $installZip)) {
+    $archives = @($portableZip)
+    if (-not $PortableOnly) {
+        foreach ($name in @('install.ps1', 'uninstall.ps1', 'install-common.ps1')) {
+            [IO.File]::Copy((Join-Path $PSScriptRoot $name), (Join-Path $install $name))
+        }
+        Build-SetupLauncher -Repo $repo -Work $work -Destination $install
+
+        $checksums = [ordered] @{}
+        foreach ($name in $script:BetterExplorerPayload) {
+            $checksums[$name] = Get-OwnedFileHash (Join-Path $install $name)
+        }
+        $manifest = [ordered] @{
+            product = 'BetterExplorer'
+            schema = 1
+            version = $version
+            files = $checksums
+            shortcut_sha256 = $null
+        }
+        Write-PayloadManifest $manifest (Join-Path $install 'bundle-manifest.json')
+        $installZip = "$prefix-install.zip"
+        [IO.Compression.ZipFile]::CreateFromDirectory($install, (Join-Path $output $installZip))
+        $archives += $installZip
+    }
+    $sumLines = foreach ($name in $archives) {
         $hash = Get-OwnedFileHash (Join-Path $output $name)
         "$hash *$name"
     }

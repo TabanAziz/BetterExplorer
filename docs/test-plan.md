@@ -16,6 +16,10 @@ Reference desktop is Windows 11 Pro 25H2 build 26200.9974, German UI, 1920 × 10
 - The native icon-grid regression scrolls a real Windows list control, checks an intermediate position and verifies that the first row is fully visible at the upper edge.
 - The benchmark exercises release startup and the same Win32 navigation and paint paths used in the app, with a generated 100,000-file NTFS folder.
 
+## 0.1.7 preview verification
+
+On the reference Windows 11 desktop, 76 tests ran with `cargo test --locked -- --include-ignored`. Formatting, Clippy with warnings denied, and the optimized build passed. The portable executable was exercised in native windows for Settings, theme selection, minimum-size scrolling and keyboard focus, and theme artwork with ten open tabs. The benchmark records the exact portable executable's SHA-256. See [results](benchmarks.md).
+
 ## Manual desktop checks
 
 Use a disposable fixture folder for write tests.
