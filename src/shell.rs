@@ -628,7 +628,7 @@ impl Drop for Clipboard {
     }
 }
 
-fn drop_effect_format() -> u32 {
+pub(crate) fn drop_effect_format() -> u32 {
     unsafe { RegisterClipboardFormatW(wide("Preferred DropEffect").as_ptr()) }
 }
 
@@ -637,12 +637,7 @@ fn as_bytes(units: &[u16]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(units.as_ptr().cast(), std::mem::size_of_val(units)) }
 }
 
-fn put_files(
-    owner: HWND,
-    paths: &[PathBuf],
-    cut: bool,
-    receipt: &ClipboardWriteReceipt,
-) -> Result<(), String> {
+pub(crate) fn file_drop_bytes(paths: &[PathBuf]) -> Vec<u8> {
     let mut list = Vec::new();
     for path in paths {
         list.extend(wide(path));
@@ -652,6 +647,16 @@ fn put_files(
     storage[..4].copy_from_slice(&(size_of::<DROPFILES>() as u32).to_le_bytes());
     storage[16..20].copy_from_slice(&1u32.to_le_bytes());
     storage.extend_from_slice(as_bytes(&list));
+    storage
+}
+
+fn put_files(
+    owner: HWND,
+    paths: &[PathBuf],
+    cut: bool,
+    receipt: &ClipboardWriteReceipt,
+) -> Result<(), String> {
+    let storage = file_drop_bytes(paths);
     let effect = (if cut { 2u32 } else { 1u32 }).to_le_bytes();
     write_clipboard(
         owner,
@@ -670,19 +675,7 @@ fn write_clipboard(
         if format == 0 {
             return Err("Windows could not register the clipboard format.".into());
         }
-        let block = GlobalBlock(unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len()) });
-        if block.0.is_null() {
-            return Err(io::Error::last_os_error().to_string());
-        }
-        unsafe {
-            let data = GlobalLock(block.0);
-            if data.is_null() {
-                return Err(io::Error::last_os_error().to_string());
-            }
-            copy_nonoverlapping(bytes.as_ptr(), data.cast(), bytes.len());
-            GlobalUnlock(block.0);
-        }
-        blocks.push((format, block));
+        blocks.push((format, GlobalBlock::from_bytes(bytes)?));
     }
     let _clipboard = Clipboard::open(owner)?;
     let previous = receipt.map(|receipt| {
@@ -694,11 +687,11 @@ fn write_clipboard(
         return Err(io::Error::last_os_error().to_string());
     }
     // Store the effect first so a failed cut never puts a copy-only payload on the clipboard.
-    for (format, mut block) in blocks.into_iter().rev() {
-        if unsafe { SetClipboardData(format, block.0) }.is_null() {
+    for (format, block) in blocks.into_iter().rev() {
+        if unsafe { SetClipboardData(format, block.as_raw()) }.is_null() {
             return Err(io::Error::last_os_error().to_string());
         }
-        block.0 = std::ptr::null_mut();
+        block.into_raw();
     }
     if let Some((receipt, previous)) = receipt.zip(previous) {
         // Capture the published version before another window can open the clipboard.
@@ -710,7 +703,34 @@ fn write_clipboard(
     Ok(())
 }
 
-struct GlobalBlock(windows_sys::Win32::Foundation::HGLOBAL);
+pub(crate) struct GlobalBlock(windows_sys::Win32::Foundation::HGLOBAL);
+
+impl GlobalBlock {
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let block = Self(unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len()) });
+        if block.0.is_null() {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        unsafe {
+            let data = GlobalLock(block.0);
+            if data.is_null() {
+                return Err(io::Error::last_os_error().to_string());
+            }
+            copy_nonoverlapping(bytes.as_ptr(), data.cast(), bytes.len());
+            GlobalUnlock(block.0);
+        }
+        Ok(block)
+    }
+
+    pub(crate) fn as_raw(&self) -> windows_sys::Win32::Foundation::HGLOBAL {
+        self.0
+    }
+
+    pub(crate) fn into_raw(mut self) -> windows_sys::Win32::Foundation::HGLOBAL {
+        std::mem::replace(&mut self.0, std::ptr::null_mut())
+    }
+}
+
 impl Drop for GlobalBlock {
     fn drop(&mut self) {
         if !self.0.is_null() {

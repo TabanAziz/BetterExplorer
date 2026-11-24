@@ -1,6 +1,6 @@
 use better_explorer::model::{from_wide, wide, ThemePreference};
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::HashMap,
     ffi::OsString,
     mem::{size_of, zeroed},
@@ -18,11 +18,14 @@ use windows_sys::Win32::{
     System::{
         LibraryLoader::GetModuleHandleW,
         Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD},
-        Threading::GetCurrentThreadId,
+        Threading::{GetCurrentProcessId, GetCurrentThreadId},
     },
     UI::{
-        Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
+        Accessibility::{
+            SetWinEventHook, UnhookWinEvent, HCF_HIGHCONTRASTON, HIGHCONTRASTW, HWINEVENTHOOK,
+        },
         Controls::*,
+        HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi},
         WindowsAndMessaging::*,
     },
 };
@@ -514,84 +517,86 @@ pub fn rounded_fill(dc: HDC, bounds: &RECT, radius: i32, color: u32) {
     }
 }
 
-thread_local! {
-    static POPUP_BORDER: Cell<Option<u32>> = const { Cell::new(None) };
-}
-
 pub struct PopupBorder {
-    hook: HHOOK,
-    previous: Option<u32>,
+    hook: HWINEVENTHOOK,
 }
 
 impl PopupBorder {
-    pub fn apply(color: u32) -> Self {
-        let previous = POPUP_BORDER.replace(Some(color));
+    pub fn apply() -> Self {
         let hook = unsafe {
-            SetWindowsHookExW(
-                WH_CALLWNDPROCRET,
-                Some(paint_popup_border),
+            SetWinEventHook(
+                EVENT_OBJECT_SHOW,
+                EVENT_OBJECT_SHOW,
                 null_mut(),
+                Some(shape_popup),
+                GetCurrentProcessId(),
                 GetCurrentThreadId(),
+                WINEVENT_OUTOFCONTEXT,
             )
         };
-        Self { hook, previous }
+        Self { hook }
     }
 }
 
 impl Drop for PopupBorder {
     fn drop(&mut self) {
         if !self.hook.is_null() {
-            unsafe {
-                UnhookWindowsHookEx(self.hook);
-            }
+            unsafe { UnhookWinEvent(self.hook) };
         }
-        POPUP_BORDER.set(self.previous);
     }
 }
 
-// A menu's non-client frame is painted by Windows after the owner draws its rows.
-// Repaint only menu windows on this UI thread, including native submenus.
-unsafe extern "system" fn paint_popup_border(code: i32, wp: WPARAM, lp: LPARAM) -> isize {
-    if code >= 0 && lp != 0 {
-        let event = unsafe { &*(lp as *const CWPRETSTRUCT) };
-        let printing = event.message == WM_PRINT && event.lParam as i32 & PRF_NONCLIENT != 0;
-        if printing || matches!(event.message, WM_PAINT | WM_NCPAINT) {
-            let mut class = [0u16; 8];
-            let length =
-                unsafe { GetClassNameW(event.hwnd, class.as_mut_ptr(), class.len() as i32) };
-            if length == 6 && class[..6].iter().copied().eq("#32768".encode_utf16()) {
-                if let Some(color) = POPUP_BORDER.get() {
-                    let mut rect: RECT = unsafe { zeroed() };
-                    if unsafe { GetWindowRect(event.hwnd, &mut rect) } != 0 {
-                        let rect = RECT {
-                            left: 0,
-                            top: 0,
-                            right: rect.right - rect.left,
-                            bottom: rect.bottom - rect.top,
-                        };
-                        let dc = if printing {
-                            event.wParam as HDC
-                        } else {
-                            unsafe { GetWindowDC(event.hwnd) }
-                        };
-                        if !dc.is_null() {
-                            unsafe {
-                                let brush = CreateSolidBrush(color);
-                                if !brush.is_null() {
-                                    FrameRect(dc, &rect, brush);
-                                    DeleteObject(brush);
-                                }
-                                if !printing {
-                                    ReleaseDC(event.hwnd, dc);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+unsafe extern "system" fn shape_popup(
+    _: HWINEVENTHOOK,
+    _: u32,
+    window: HWND,
+    object: i32,
+    child: i32,
+    _: u32,
+    _: u32,
+) {
+    if object != OBJID_WINDOW || child != CHILDID_SELF as i32 || window.is_null() {
+        return;
     }
-    unsafe { CallNextHookEx(null_mut(), code, wp, lp) }
+    let mut class = [0u16; 8];
+    let length = unsafe { GetClassNameW(window, class.as_mut_ptr(), class.len() as i32) };
+    if length == 6
+        && class[..6].iter().copied().eq("#32768".encode_utf16())
+        && unsafe { IsWindowVisible(window) } != 0
+    {
+        clip_popup_frame(window);
+    }
+}
+
+// Windows paints the frame in its native menu loop. Clip it on show, including submenus.
+fn clip_popup_frame(window: HWND) {
+    let mut bounds: RECT = unsafe { zeroed() };
+    if unsafe { GetWindowRect(window, &mut bounds) } == 0 {
+        return;
+    }
+    let dpi = unsafe { GetDpiForWindow(window) }.max(96);
+    let x_edge = unsafe { GetSystemMetricsForDpi(SM_CXBORDER, dpi) }.max(1);
+    let y_edge = unsafe { GetSystemMetricsForDpi(SM_CYBORDER, dpi) }.max(1);
+    let width = bounds.right - bounds.left - 2 * x_edge;
+    let height = bounds.bottom - bounds.top - 2 * y_edge;
+    let diameter = scale(16, dpi).min(width).min(height);
+    if diameter <= 1 {
+        return;
+    }
+    // GDI leaves an extra pixel off the right and bottom of a rounded region.
+    let region = unsafe {
+        CreateRoundRectRgn(
+            x_edge,
+            y_edge,
+            x_edge + width + 1,
+            y_edge + height + 1,
+            diameter,
+            diameter,
+        )
+    };
+    if !region.is_null() && unsafe { SetWindowRgn(window, region, 1) } == 0 {
+        unsafe { DeleteObject(region) };
+    }
 }
 
 struct IconBitmap {

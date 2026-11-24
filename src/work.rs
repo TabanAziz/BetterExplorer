@@ -223,11 +223,14 @@ impl Entry {
         from_wide(&self.name).to_string_lossy().into()
     }
     pub fn display_name(&self, hide_extensions: bool) -> &[u16] {
+        let name = &self.name[..self.name.len().saturating_sub(1)];
         if hide_extensions && !self.directory && !self.extension.is_empty() {
-            &self.name[..self.name.len().saturating_sub(self.extension.len() + 1)]
-        } else {
-            &self.name[..self.name.len().saturating_sub(1)]
+            return name
+                .strip_suffix(&self.extension[..self.extension.len() - 1])
+                .and_then(|stem| stem.strip_suffix(&[u16::from(b'.')]))
+                .unwrap_or(name);
         }
+        name
     }
     pub fn kind(&self) -> String {
         if let Some(item) = &self.shell_item {
@@ -317,6 +320,7 @@ fn sort_entries_with_folders(entries: &mut [Arc<Entry>], sort: Sort, folders_fir
         let field = match sort.column {
             Column::Name => name_order(),
             Column::Modified => left.modified.cmp(&right.modified),
+            Column::Folder => left.path.parent().cmp(&right.path.parent()),
             Column::Kind => match (&left.shell_item, &right.shell_item) {
                 (Some(left), Some(right))
                     if left.original_location.is_some() || right.original_location.is_some() =>
@@ -435,7 +439,7 @@ pub fn scan(request: Request, latest: &AtomicU64, mut publish: impl FnMut(ScanEv
         id,
         location,
         hidden,
-        sort,
+        mut sort,
         pins,
     } = request;
     let stale = || latest.load(Ordering::Relaxed) != id;
@@ -444,7 +448,10 @@ pub fn scan(request: Request, latest: &AtomicU64, mut publish: impl FnMut(ScanEv
     }
     let mut entries = Vec::new();
     let mut error = None;
-    let file_system = matches!(location, Location::Folder(_) | Location::Search { .. });
+    let file_system = matches!(location, Location::Folder(_)) || location.is_search();
+    if matches!(location, Location::PcSearch { .. }) && sort.column == Column::Kind {
+        sort.column = Column::Folder;
+    }
     match location {
         Location::Settings => (),
         Location::Namespace { kind, child, .. } => {
@@ -455,10 +462,19 @@ pub fn scan(request: Request, latest: &AtomicU64, mut publish: impl FnMut(ScanEv
             };
             match result {
                 Ok(items) => entries.extend(items.into_iter().map(|item| {
+                    let extension = if kind == namespace::Namespace::RecycleBin && !item.directory {
+                        item.extension
+                            .as_deref()
+                            .or_else(|| Path::new(&item.name).extension())
+                            .map(wide)
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
                     Arc::new(Entry {
                         path: PathBuf::from(&item.key),
                         name: wide(&item.name),
-                        extension: Vec::new(),
+                        extension,
                         directory: item.directory,
                         size: item.size,
                         modified: if kind == namespace::Namespace::RecycleBin {
@@ -495,6 +511,63 @@ pub fn scan(request: Request, latest: &AtomicU64, mut publish: impl FnMut(ScanEv
                     return;
                 }
                 entries.push(Arc::new(drive_entry(path)));
+            }
+        }
+        Location::PcSearch {
+            query, all_drives, ..
+        } => {
+            if all_drives {
+                let query = query.to_lowercase();
+                for drive in drives() {
+                    if stale() {
+                        return;
+                    }
+                    // Include fixed and removable local volumes.
+                    if matches!(unsafe { GetDriveTypeW(wide(&drive).as_ptr()) }, 2 | 3) {
+                        enumerate(
+                            drive,
+                            Some(query.clone()),
+                            hidden,
+                            &stale,
+                            &mut entries,
+                            &mut error,
+                            |rows| publish(ScanEvent::Batch(id, rows)),
+                        );
+                    }
+                }
+            } else {
+                let result = crate::index_search::search(&query, stale, |batch| {
+                    let rows: Vec<_> = batch
+                        .into_iter()
+                        .filter(|file| {
+                            hidden
+                                || file.attributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)
+                                    == 0
+                        })
+                        .map(|file| {
+                            Arc::new(Entry {
+                                extension: if file.directory {
+                                    Vec::new()
+                                } else {
+                                    file.path.extension().map(wide).unwrap_or_default()
+                                },
+                                path: file.path,
+                                name: wide(file.name),
+                                directory: file.directory,
+                                size: file.size,
+                                modified: file.modified,
+                                location: false,
+                                capacity: None,
+                                shell_item: None,
+                            })
+                        })
+                        .collect();
+                    if !rows.is_empty() {
+                        entries.extend(rows.iter().cloned());
+                        publish(ScanEvent::Batch(id, rows));
+                    }
+                });
+                error = result.err();
             }
         }
         location => {
@@ -537,7 +610,7 @@ fn enumerate(
     mut batch: impl FnMut(Vec<Arc<Entry>>),
 ) {
     let mut pending = vec![root.clone()];
-    let mut delivered = 0;
+    let mut delivered = entries.len();
     let mut last_batch = Instant::now();
     let mut unreadable = 0usize;
     while let Some(folder) = pending.pop() {
@@ -663,7 +736,7 @@ impl Scanner {
             Location::Namespace {
                 kind: namespace::Namespace::Network,
                 ..
-            }
+            } | Location::PcSearch { .. }
         ) || request.location.directory().is_some_and(network_path)
         {
             &self.remote
@@ -830,6 +903,18 @@ fn watch_loop(signal: Arc<WatchSignal>, changed: impl Fn(u64)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shell_display_name_can_already_hide_the_file_extension() {
+        let mut entry = Entry::place(PathBuf::new(), "Report.pdf");
+        entry.directory = false;
+        entry.extension = wide("pdf");
+        assert_eq!(from_wide(entry.display_name(true)), "Report");
+        assert_eq!(from_wide(entry.display_name(false)), "Report.pdf");
+
+        entry.name = wide("Report");
+        assert_eq!(from_wide(entry.display_name(true)), "Report");
+    }
 
     #[test]
     fn modified_groups_follow_local_calendar_boundaries() {

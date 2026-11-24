@@ -7,6 +7,10 @@ mod breadcrumb;
 #[cfg(windows)]
 mod chrome;
 #[cfg(windows)]
+mod file_icon_cache;
+#[cfg(windows)]
+mod file_icons;
+#[cfg(windows)]
 mod home_page;
 #[cfg(windows)]
 mod hotkey;

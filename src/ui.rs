@@ -3,6 +3,8 @@ use crate::{
     benchmark::{self, Bench},
     breadcrumb,
     chrome::*,
+    file_icon_cache::{FileIconCache, GENERIC_FILE},
+    file_icons,
     home_page::{Activity, HomePage, Icon, Item},
     preview::{self, Content},
 };
@@ -47,6 +49,7 @@ const HOVER: u32 = WM_APP + 5;
 const BENCH_NAVIGATE: u32 = WM_APP + 6;
 const BENCH_PRESENT: u32 = WM_APP + 7;
 const BENCH_STARTED: u32 = WM_APP + 8;
+const START_FILE_DRAG: u32 = WM_APP + 9;
 const REFRESH_TIMER: usize = 1;
 const SETTINGS_TIMER: usize = 2;
 const GROUP_TIMER: usize = 3;
@@ -151,6 +154,7 @@ const DATE_FORMAT_MONTH_FIRST: u16 = 207;
 const RECYCLE_RESTORE: u16 = 208;
 const RECYCLE_EMPTY: u16 = 209;
 const GROUP_NONE: u16 = 214;
+const SEARCH_ALL_DRIVES: u16 = 216;
 const GROUP_MODIFIED: u16 = 215;
 const OPEN_TERMINAL: u16 = 210;
 const FOLDER_PROPERTIES: u16 = 211;
@@ -220,6 +224,7 @@ const MENU_IDS: [u16; 7] = [NEW, SORT, VIEW, FILTER, MORE, PATH, CONTEXT];
 
 enum Event {
     Scan(ScanEvent),
+    FileIcon(file_icons::Result),
     Preview(u64, Option<Content>),
     Boot(Settings, Vec<(PathBuf, &'static str)>),
     SettingsError(String),
@@ -245,6 +250,12 @@ fn publish(queue: &Events, window: usize, event: Event) {
             PostMessageW(window as HWND, WAKE, 0, 0);
         }
     }
+}
+
+fn start_file_icons(events: &Events, window: HWND) -> Option<file_icons::Worker> {
+    let events = Arc::clone(events);
+    let window = window as usize;
+    file_icons::Worker::start(move |icon| publish(&events, window, Event::FileIcon(icon)))
 }
 
 struct Tab {
@@ -375,6 +386,7 @@ struct App {
     edit_label: HWND,
     edit_name: HWND,
     images: [HIMAGELIST; 2],
+    file_icons: FileIconCache,
     icon_size: i32,
     fitted_columns: Option<[i32; 4]>,
     fonts: [HFONT; 2],
@@ -408,6 +420,8 @@ struct App {
     error: Option<String>,
     note: Option<String>,
     scanning: bool,
+    pending_drag: Option<Vec<PathBuf>>,
+    active_drag: bool,
     busy: usize,
     id: u64,
     events: Events,
@@ -438,6 +452,7 @@ impl App {
             (ACCEPT, "Apply"),
             (CANCEL, "Cancel"),
             (STOP_SEARCH, "Stop search"),
+            (SEARCH_ALL_DRIVES, "Search all drives"),
             (FRAME_MIN, "Minimize"),
             (FRAME_MAX, "Maximize or restore"),
             (FRAME_CLOSE, "Close window"),
@@ -503,6 +518,7 @@ impl App {
             edit_label: label(0),
             edit_name: input(NAME),
             images: [0; 2],
+            file_icons: FileIconCache::default(),
             icon_size: 52,
             fitted_columns: None,
             fonts: [null_mut(); 2],
@@ -541,6 +557,8 @@ impl App {
             note: None,
             error: None,
             scanning: true,
+            pending_drag: None,
+            active_drag: false,
             busy: 0,
             id: 0,
             events: Arc::new(Mutex::new(VecDeque::new())),
@@ -776,6 +794,7 @@ impl App {
         }
         self.measure_breadcrumbs();
         if let Some(home) = &self.home {
+            home.set_activity_images(0, Vec::new());
             home.set_style(&self.colors, self.dpi);
         }
         send(
@@ -790,6 +809,7 @@ impl App {
             .enumerate()
         {
             let images = list_images(dpi, side);
+            self.file_icons.reset(index);
             send(self.list, LVM_SETIMAGELIST, kind as usize, images as isize);
             let old = std::mem::replace(&mut self.images[index], images);
             if old != 0 {
@@ -798,6 +818,7 @@ impl App {
                 }
             }
         }
+        self.refresh_home_file_icons();
     }
 
     fn apply_theme(&mut self) {
@@ -1315,7 +1336,21 @@ impl App {
                 );
             }
         }
-        move_to(self.status, margin, status_y + d(5), w - d(198), d(20));
+        let offer_all_drives = !self.scanning
+            && matches!(
+                self.location(),
+                Location::PcSearch {
+                    all_drives: false,
+                    ..
+                }
+            );
+        move_to(
+            self.status,
+            margin,
+            status_y + d(5),
+            w - d(if offer_all_drives { 222 } else { 198 }),
+            d(20),
+        );
         pos(
             QUICK_DETAILS,
             w - frame_inset - d(61),
@@ -1333,8 +1368,16 @@ impl App {
         pos(STOP_SEARCH, w - d(192), status_y + d(1), d(115), d(24));
         set_visible(
             self.button(STOP_SEARCH),
-            self.scanning && matches!(self.location(), Location::Search { .. }),
+            self.scanning && self.location().is_search(),
         );
+        pos(
+            SEARCH_ALL_DRIVES,
+            w - d(219),
+            status_y + d(1),
+            d(142),
+            d(24),
+        );
+        set_visible(self.button(SEARCH_ALL_DRIVES), offer_all_drives);
         for control in [
             self.edit_label,
             self.edit_name,
@@ -1359,7 +1402,7 @@ impl App {
         if self.tab().view == LV_VIEW_DETAILS || self.tab().view == VIEW_CARDS {
             let available = (list_width - d(19)).max(d(342));
             let modified = d(143).min(available / 3);
-            let kind = if self.recycling() {
+            let kind = if self.recycling() || matches!(self.location(), Location::PcSearch { .. }) {
                 d(265).min(available / 3)
             } else {
                 d(104).min(available / 5)
@@ -1671,7 +1714,10 @@ impl App {
                 icon: Icon::File,
             })
             .collect();
-        self.home_activity_paths = paths;
+        if self.home_activity_paths != paths {
+            self.file_icons.viewport_changed(0);
+            self.home_activity_paths = paths;
+        }
         home.set_compact(self.settings.home_compact);
         home.set_content(
             quick,
@@ -1680,6 +1726,39 @@ impl App {
             HOME_FAVORITES,
             self.home_activity,
         );
+        self.refresh_home_file_icons();
+    }
+
+    fn refresh_home_file_icons(&mut self) {
+        let Some(home) = self
+            .home
+            .as_ref()
+            .filter(|_| *self.location() == Location::Home)
+        else {
+            return;
+        };
+        let list = self.images[0];
+        if list == 0 || self.home_activity_paths.is_empty() {
+            home.set_activity_images(0, Vec::new());
+            return;
+        }
+        let side = scale(22, self.dpi);
+        let icons = self
+            .home_activity_paths
+            .iter()
+            .map(|path| {
+                let key = path.extension().map(wide).unwrap_or_default();
+                let index = self.file_icons.image(0, side, &key, || {
+                    start_file_icons(&self.events, self.window)
+                });
+                if index == GENERIC_FILE {
+                    -1
+                } else {
+                    index
+                }
+            })
+            .collect();
+        home.set_activity_images(list, icons);
     }
 
     fn update_sidebar(&mut self) {
@@ -2035,7 +2114,7 @@ impl App {
         text(
             self.search,
             match self.location() {
-                Location::Search { query, .. } => query,
+                Location::Search { query, .. } | Location::PcSearch { query, .. } => query,
                 _ => "",
             },
         );
@@ -2056,10 +2135,14 @@ impl App {
             std::env::var("SystemDrive").ok().as_deref(),
         );
         self.measure_breadcrumbs();
-        let hint = wide(if self.location_dir().is_some() {
-            format!("Search {}", self.location().caption())
-        } else {
-            "Open a folder to search".into()
+        let hint = wide(match self.location() {
+            Location::Home | Location::Computer | Location::PcSearch { .. } => {
+                "Search this PC".into()
+            }
+            Location::Folder(_) | Location::Search { .. } => {
+                format!("Search {}", self.location().caption())
+            }
+            _ => "Open a folder to search".into(),
         });
         send(self.search, EM_SETCUEBANNER, 1, hint.as_ptr() as isize);
         set_enabled(self.button(BACK), self.tab().history.can_back());
@@ -2067,6 +2150,7 @@ impl App {
         set_enabled(
             self.button(UP),
             self.location_dir().is_some()
+                || matches!(self.location(), Location::PcSearch { .. })
                 || matches!(self.location(), Location::Namespace { child: Some(_), .. }),
         );
         set_enabled(self.button(NEW), self.dest().is_some());
@@ -2124,6 +2208,7 @@ impl App {
         if side != self.icon_size {
             self.icon_size = side;
             let images = list_images(self.dpi, side);
+            self.file_icons.reset(1);
             send(self.list, LVM_SETIMAGELIST, LVSIL_NORMAL as usize, images);
             let old = std::mem::replace(&mut self.images[1], images);
             if old != 0 {
@@ -2272,8 +2357,15 @@ impl App {
 
     fn events(&mut self) {
         let events = std::mem::take(&mut *self.events.lock().unwrap());
+        let mut redraw_icons = false;
         for event in events {
             match event {
+                Event::FileIcon(result) => {
+                    let slot = self.file_icon_slot();
+                    let active = result.request.slot == slot;
+                    redraw_icons |= self.file_icons.apply(result, &self.images) && active;
+                    redraw_icons |= self.file_icons.needs_retry(slot);
+                }
                 Event::Scan(ScanEvent::Batch(id, rows)) if id == self.id && !self.keep_rows => {
                     let filter = self.tab().filter;
                     for row in rows {
@@ -2313,7 +2405,9 @@ impl App {
                             self.settings.hidden != settings.hidden
                                 || self.settings.folder_order(path) != settings.folder_order(path)
                         }
-                        Location::Search { .. } => self.settings.hidden != settings.hidden,
+                        Location::Search { .. } | Location::PcSearch { .. } => {
+                            self.settings.hidden != settings.hidden
+                        }
                         Location::Computer | Location::Settings | Location::Namespace { .. } => {
                             false
                         }
@@ -2406,9 +2500,26 @@ impl App {
                 }
             }
         }
+        if redraw_icons {
+            if *self.location() == Location::Home {
+                self.refresh_home_file_icons();
+            } else {
+                unsafe {
+                    InvalidateRect(self.list, null(), 0);
+                }
+            }
+        }
+    }
+
+    fn file_icon_slot(&self) -> usize {
+        usize::from(matches!(
+            self.tab().view,
+            LV_VIEW_ICON | VIEW_SMALL | VIEW_LARGE | VIEW_XLARGE
+        ))
     }
 
     fn rebuild_visible(&mut self) {
+        self.file_icons.viewport_changed(self.file_icon_slot());
         let filter = self.tab().filter;
         self.visible.clear();
         self.group_headers.clear();
@@ -2659,6 +2770,18 @@ impl App {
         let count = if home { 0 } else { self.selection_count() };
         let summary = if self.scanning {
             "Loading…".into()
+        } else if matches!(
+            self.location(),
+            Location::PcSearch {
+                all_drives: false,
+                ..
+            }
+        ) {
+            if items == 1 {
+                "1 indexed match".into()
+            } else {
+                format!("{items} indexed matches")
+            }
         } else if items == 1 {
             "1 item".into()
         } else {
@@ -2670,7 +2793,17 @@ impl App {
         } else if self.busy != 0 {
             "Windows is processing the file operation…".into()
         } else if self.scanning {
-            format!("{items} found · Reading folder…")
+            let activity = match self.location() {
+                Location::PcSearch {
+                    all_drives: true, ..
+                } => "Searching local drives…",
+                Location::PcSearch {
+                    all_drives: false, ..
+                } => "Searching the Windows index…",
+                Location::Search { .. } => "Searching this folder…",
+                _ => "Reading folder…",
+            };
+            format!("{items} found · {activity}")
         } else if count != 0 {
             format!("{items} items  ·  {count} selected")
         } else if items == 0 {
@@ -2687,6 +2820,12 @@ impl App {
                     kind: Namespace::Libraries,
                     ..
                 } => "No libraries or library folders found.".into(),
+                Location::PcSearch {
+                    all_drives: false, ..
+                } => "No indexed matches.".into(),
+                Location::PcSearch {
+                    all_drives: true, ..
+                } => "No matching files or folders on local drives.".into(),
                 _ => "No items to show.".into(),
             }
         } else {
@@ -3042,16 +3181,53 @@ impl App {
     }
 
     fn search(&mut self) {
-        let Some(root) = self.location_dir() else {
-            self.note = Some("Open a folder before searching.".into());
-            self.status();
-            return;
-        };
         let query = read(self.search).to_string_lossy().trim().to_owned();
-        let location = if query.is_empty() {
-            Location::Folder(root)
-        } else {
-            Location::Search { root, query }
+        let location = match self.location() {
+            Location::Home | Location::Computer if query.is_empty() => return,
+            Location::Home | Location::Computer => {
+                let from_home = *self.location() == Location::Home;
+                self.tab_mut().sort = Sort::NEWEST_FIRST;
+                self.tab_mut().filter = Filter::All;
+                Location::PcSearch {
+                    query,
+                    all_drives: false,
+                    from_home,
+                }
+            }
+            Location::PcSearch {
+                all_drives,
+                from_home,
+                ..
+            } => {
+                if query.is_empty() {
+                    if *from_home {
+                        Location::Home
+                    } else {
+                        Location::Computer
+                    }
+                } else {
+                    Location::PcSearch {
+                        query,
+                        all_drives: *all_drives,
+                        from_home: *from_home,
+                    }
+                }
+            }
+            Location::Folder(root) | Location::Search { root, .. } => {
+                if query.is_empty() {
+                    Location::Folder(root.clone())
+                } else {
+                    Location::Search {
+                        root: root.clone(),
+                        query,
+                    }
+                }
+            }
+            _ => {
+                self.note = Some("Open a folder before searching.".into());
+                self.status();
+                return;
+            }
         };
         self.go(location);
         unsafe {
@@ -3082,6 +3258,13 @@ impl App {
             UP => {
                 let location = match self.location() {
                     Location::Search { root, .. } => Location::Folder(root.clone()),
+                    Location::PcSearch { from_home, .. } => {
+                        if *from_home {
+                            Location::Home
+                        } else {
+                            Location::Computer
+                        }
+                    }
                     Location::Namespace {
                         kind,
                         child: Some(_),
@@ -3326,6 +3509,30 @@ impl App {
             STOP_SEARCH => {
                 if let Location::Search { root, .. } = self.location() {
                     self.go(Location::Folder(root.clone()));
+                } else if self.scanning && matches!(self.location(), Location::PcSearch { .. }) {
+                    self.id = self.id.wrapping_add(1);
+                    if let Some(scanner) = &self.scanner {
+                        scanner.cancel(self.id);
+                    }
+                    self.scanning = false;
+                    self.keep_rows = false;
+                    self.note = Some("Search stopped.".into());
+                    self.status();
+                    self.layout();
+                }
+            }
+            SEARCH_ALL_DRIVES => {
+                if let Location::PcSearch {
+                    query,
+                    from_home,
+                    all_drives: false,
+                } = self.location()
+                {
+                    self.go(Location::PcSearch {
+                        query: query.clone(),
+                        all_drives: true,
+                        from_home: *from_home,
+                    });
                 }
             }
             SELECT_ALL => {
@@ -3536,10 +3743,10 @@ impl App {
                 if let Some(path) = path {
                     if let Some(index) = self.settings.pins.iter().position(|pin| *pin == path) {
                         self.settings.pins.remove(index);
-                        self.note = Some("Folder unpinned.".into());
+                        self.note = Some("Folder unpinned from Quick access.".into());
                     } else if self.settings.pins.len() < 75 {
                         self.settings.pins.push(path);
-                        self.note = Some("Folder pinned.".into());
+                        self.note = Some("Folder pinned to Quick access.".into());
                     } else {
                         self.note = Some("75 folders are already pinned.".into());
                     }
@@ -3800,7 +4007,7 @@ impl App {
                     item(MOVE_TAB_RIGHT, "Move tab right")
                         .enabled(self.active + 1 < self.tabs.len()),
                     line(),
-                    item(PIN, "Pin or unpin folder").enabled(
+                    item(PIN, "Pin or unpin in Quick access").enabled(
                         self.location_dir().is_some()
                             || self
                                 .first_selected()
@@ -3892,9 +4099,9 @@ impl App {
                             item(
                                 PIN,
                                 if self.settings.pins.contains(&entry.path) {
-                                    "Unpin folder"
+                                    "Unpin from Quick access"
                                 } else {
-                                    "Pin folder"
+                                    "Pin to Quick access"
                                 },
                             )
                             .enabled(count == 1),
@@ -3903,9 +4110,9 @@ impl App {
                         items.push(item(
                             FAVORITE,
                             if self.settings.favorites.contains(&entry.path) {
-                                "Remove from Favorites"
+                                "Remove from Home Favorites"
                             } else {
-                                "Add to Favorites"
+                                "Add to Home Favorites"
                             },
                         ));
                     }
@@ -3945,7 +4152,7 @@ impl App {
                             line(),
                             item(OPEN_TERMINAL, "Open in Terminal"),
                             item(FOLDER_COPY_PATH, "Copy folder path"),
-                            item(PIN, "Pin or unpin current folder"),
+                            item(PIN, "Pin or unpin current folder in Quick access"),
                             line(),
                             item(FOLDER_PROPERTIES, "Properties"),
                         ]);
@@ -4026,7 +4233,7 @@ impl App {
                     Some(Location::Home) => Glyph::Home,
                     Some(Location::Computer) => Glyph::Drive,
                     Some(Location::Settings) => Glyph::Settings,
-                    Some(Location::Search { .. }) => Glyph::Search,
+                    Some(Location::Search { .. } | Location::PcSearch { .. }) => Glyph::Search,
                     Some(Location::Namespace {
                         kind: Namespace::Network,
                         ..
@@ -4214,6 +4421,9 @@ impl App {
     }
 
     fn column_label(&self, index: usize) -> &'static str {
+        if index == 2 && matches!(self.location(), Location::PcSearch { .. }) {
+            return "Folder";
+        }
         if self.recycling() {
             match index {
                 1 => return "Date deleted",
@@ -4392,14 +4602,26 @@ impl App {
             LVN_GETDISPINFOW => {
                 let display = unsafe { &mut *(notification as *mut NMLVDISPINFOW) };
                 let item = &mut display.item;
-                if let Some(entry) = self.entry(item.iItem as usize) {
+                if let Some(entry) = self
+                    .visible
+                    .get(item.iItem as usize)
+                    .and_then(|&row| self.rows.get(row))
+                {
                     if item.mask & LVIF_IMAGE != 0 {
                         item.iImage = if matches!(self.location(), Location::Computer) {
                             2
                         } else if entry.directory {
                             0
                         } else {
-                            1
+                            let slot = self.file_icon_slot();
+                            let side = scale(if slot == 0 { 22 } else { self.icon_size }, self.dpi);
+                            if self.images[slot] == 0 {
+                                GENERIC_FILE
+                            } else {
+                                self.file_icons.image(slot, side, &entry.extension, || {
+                                    start_file_icons(&self.events, self.window)
+                                })
+                            }
                         };
                     }
                     if item.mask & LVIF_TEXT != 0 && !item.pszText.is_null() && item.cchTextMax > 0
@@ -4417,6 +4639,11 @@ impl App {
                                         .map_or_else(String::new, |path| {
                                             path.display().to_string()
                                         }),
+                                    2 if matches!(self.location(), Location::PcSearch { .. }) => {
+                                        entry.path.parent().map_or_else(String::new, |path| {
+                                            path.display().to_string()
+                                        })
+                                    }
                                     2 => entry.kind(),
                                     3 => entry.display_size(),
                                     _ => String::new(),
@@ -4450,11 +4677,44 @@ impl App {
                     }
                 }
             }
+            LVN_ENDSCROLL => {
+                if self.file_icons.viewport_changed(self.file_icon_slot()) {
+                    unsafe {
+                        InvalidateRect(self.list, null(), 0);
+                    }
+                }
+            }
             LVN_ITEMCHANGED | LVN_ODSTATECHANGED => {
                 if !self.selection_event {
                     self.selection_event = true;
                     unsafe {
                         PostMessageW(self.window, SELECTION_CHANGED, 0, 0);
+                    }
+                }
+            }
+            LVN_BEGINDRAG if !self.active_drag => {
+                let event = unsafe { &*(notification as *const NMLISTVIEW) };
+                if let Some(entry) = usize::try_from(event.iItem)
+                    .ok()
+                    .and_then(|index| self.entry(index))
+                    .filter(|row| !row.location)
+                {
+                    let paths = if send(
+                        self.list,
+                        LVM_GETITEMSTATE,
+                        event.iItem as usize,
+                        LVIS_SELECTED as isize,
+                    ) != 0
+                    {
+                        self.selected_paths()
+                    } else {
+                        vec![entry.path.clone()]
+                    };
+                    if !paths.is_empty() {
+                        self.pending_drag = Some(paths);
+                        if unsafe { PostMessageW(self.window, START_FILE_DRAG, 0, 0) } == 0 {
+                            self.pending_drag = None;
+                        }
                     }
                 }
             }
@@ -4624,7 +4884,6 @@ fn show_menu(app: &RefCell<App>, id: u16, coordinates: LPARAM) {
     let items = state.menu(id);
     let painted = !state.colors.contrast;
     let menu_color = state.colors.chrome;
-    let dark_border = (state.colors.dark && painted).then_some(state.colors.edge);
     let window = state.window;
     let selected_targets = |state: &App| {
         state
@@ -4700,7 +4959,7 @@ fn show_menu(app: &RefCell<App>, id: u16, coordinates: LPARAM) {
             let mut rows = Vec::new();
             menu.append(items, false, &mut rows);
         }
-        let border = dark_border.map(PopupBorder::apply);
+        let border = (!brush.is_null()).then(PopupBorder::apply);
         let selected = TrackPopupMenu(
             menu.0,
             TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
@@ -4815,11 +5074,7 @@ fn key(app: &RefCell<App>, message: &MSG) -> bool {
         (VK_RETURN, false, false, _) if focus == app.list => OPEN,
         (VK_RETURN, false, true, _) if focus == app.list => PROPERTIES,
         (VK_ESCAPE, false, false, _) if app.edit.is_some() => CANCEL,
-        (VK_ESCAPE, false, false, _)
-            if app.scanning && matches!(app.location(), Location::Search { .. }) =>
-        {
-            STOP_SEARCH
-        }
+        (VK_ESCAPE, false, false, _) if app.scanning && app.location().is_search() => STOP_SEARCH,
         (0x41, true, false, false) if !typing && *app.location() != Location::Home => SELECT_ALL,
         (0x58, true, false, false) if !typing => CUT,
         (0x43, true, false, false) if !typing => COPY,
@@ -4923,6 +5178,30 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
     }
     if message == SHOW_MENU {
         show_menu(cell, wp as u16, lp);
+        return 0;
+    }
+    if message == START_FILE_DRAG {
+        let paths = {
+            let Ok(mut app) = cell.try_borrow_mut() else {
+                return 0;
+            };
+            if app.active_drag {
+                return 0;
+            }
+            let Some(paths) = app.pending_drag.take() else {
+                return 0;
+            };
+            app.active_drag = true;
+            paths
+        };
+        // DoDragDrop runs a modal Windows message loop, so the app cannot be borrowed here.
+        let result = better_explorer::drag_drop::copy_paths(&paths);
+        let mut app = cell.borrow_mut();
+        app.active_drag = false;
+        if let Err(error) = result {
+            app.note = Some(error);
+            app.status();
+        }
         return 0;
     }
     if message == WM_DESTROY {
@@ -5069,6 +5348,8 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
             0
         }
         WM_SIZE | WM_EXITSIZEMOVE => {
+            let slot = app.file_icon_slot();
+            app.file_icons.viewport_changed(slot);
             app.layout();
             0
         }
@@ -5162,6 +5443,9 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
             0
         }
         WM_CLOSE => {
+            if app.active_drag {
+                return 0;
+            }
             if matches!(app.hotkey_request, Some(HotkeyRequest::Change(_))) {
                 return 0;
             }

@@ -15,7 +15,8 @@ use windows_sys::Win32::{
     System::LibraryLoader::GetModuleHandleW,
     UI::{
         Controls::{
-            SetScrollInfo, SetWindowTheme, DRAWITEMSTRUCT, ODS_FOCUS, ODS_SELECTED, WM_MOUSELEAVE,
+            ImageList_Draw, SetScrollInfo, SetWindowTheme, DRAWITEMSTRUCT, HIMAGELIST,
+            ILD_TRANSPARENT, ODS_FOCUS, ODS_SELECTED, WM_MOUSELEAVE,
         },
         HiDpi::GetSystemMetricsForDpi,
         Input::KeyboardAndMouse::{
@@ -129,6 +130,7 @@ impl HomePage {
             selected: Cell::new(Activity::Recent),
             quick: RefCell::new(Vec::new()),
             activity: RefCell::new(Vec::new()),
+            activity_images: RefCell::new((0, Vec::new())),
             scrollbar,
             scroll: Cell::new(0),
             wheel_fraction: Cell::new(0),
@@ -198,6 +200,9 @@ impl HomePage {
         let window = state.window.get();
         let quick_changed = update_entries(window, &state.quick, quick);
         let activity_changed = update_entries(window, &state.activity, activity);
+        if activity_changed {
+            state.activity_images.replace((0, Vec::new()));
+        }
         let changed_tab = state.selected.replace(selected) != selected;
         for (control, id) in state.tabs.into_iter().zip([recent_id, favorites_id]) {
             unsafe { SetWindowLongPtrW(control, GWLP_ID, id as isize) };
@@ -231,6 +236,20 @@ impl HomePage {
         }
         if quick_changed || activity_changed || changed_tab {
             state.arrange();
+        }
+    }
+
+    pub fn set_activity_images(&self, list: HIMAGELIST, icons: Vec<i32>) {
+        let old = self.0.activity_images.replace((list, icons));
+        let current = self.0.activity_images.borrow();
+        if old != *current {
+            for (index, entry) in self.0.activity.borrow().iter().enumerate() {
+                if old.0 != list || old.1.get(index) != current.1.get(index) {
+                    unsafe {
+                        InvalidateRect(entry.window, null(), 0);
+                    }
+                }
+            }
         }
     }
 }
@@ -454,6 +473,7 @@ struct State {
     selected: Cell<Activity>,
     quick: RefCell<Vec<Control>>,
     activity: RefCell<Vec<Control>>,
+    activity_images: RefCell<(HIMAGELIST, Vec<i32>)>,
     scrollbar: HWND,
     scroll: Cell<i32>,
     wheel_fraction: Cell<i32>,
@@ -706,12 +726,13 @@ impl State {
             }
         }
         for (section, tile) in [(&self.quick, true), (&self.activity, false)] {
-            if let Some(entry) = section
+            if let Some((index, entry)) = section
                 .borrow()
                 .iter()
-                .find(|entry| entry.window == draw.hwndItem)
+                .enumerate()
+                .find(|(_, entry)| entry.window == draw.hwndItem)
             {
-                self.draw_entry(draw, &entry.item, tile, hot, focused);
+                self.draw_entry(draw, &entry.item, tile, hot, focused, index);
                 return;
             }
         }
@@ -786,7 +807,15 @@ impl State {
         }
     }
 
-    fn draw_entry(&self, draw: &DRAWITEMSTRUCT, item: &Item, tile: bool, hot: bool, focused: bool) {
+    fn draw_entry(
+        &self,
+        draw: &DRAWITEMSTRUCT,
+        item: &Item,
+        tile: bool,
+        hot: bool,
+        focused: bool,
+        index: usize,
+    ) {
         let colors = self.colors.get();
         let fonts = self.fonts.get();
         let dc = draw.hDC;
@@ -834,15 +863,34 @@ impl State {
         let center = (bounds.top + bounds.bottom) / 2;
         let label_x = icon_x + size + d(10);
         let width = bounds.right - label_x - d(10);
-        draw_icon(
-            dc,
-            item.icon,
-            icon_x,
-            center - size / 2,
-            size,
-            colors,
-            foreground,
-        );
+        let icons = self.activity_images.borrow();
+        let painted = !tile
+            && !colors.contrast
+            && icons.0 != 0
+            && icons.1.get(index).is_some_and(|&icon| {
+                icon >= 0
+                    && unsafe {
+                        ImageList_Draw(
+                            icons.0,
+                            icon,
+                            dc,
+                            icon_x + (size - d(22)) / 2,
+                            center - d(22) / 2,
+                            ILD_TRANSPARENT,
+                        )
+                    } != 0
+            });
+        if !painted {
+            draw_icon(
+                dc,
+                item.icon,
+                icon_x,
+                center - size / 2,
+                size,
+                colors,
+                foreground,
+            );
+        }
         let line = d(18);
         let has_subtitle = !item.subtitle.is_empty();
         text_at(

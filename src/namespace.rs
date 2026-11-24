@@ -41,6 +41,7 @@ pub enum Namespace {
 #[derive(Debug)]
 pub struct Item {
     pub name: String,
+    pub extension: Option<OsString>,
     pub target: Option<PathBuf>,
     pub directory: bool,
     pub key: String,
@@ -179,6 +180,7 @@ fn shell_entry(item: &IShellItem, namespace: Namespace) -> Option<Item> {
     };
     let mut entry = Item {
         name: display_name,
+        extension: None,
         target,
         directory,
         key,
@@ -364,6 +366,7 @@ fn library_folders(
                 .unwrap_or_else(|| path.as_os_str().to_owned());
             entries.push(Item {
                 name: display.to_string_lossy().into_owned(),
+                extension: None,
                 key: path.to_string_lossy().into_owned(),
                 target: Some(path),
                 directory: true,
@@ -399,6 +402,10 @@ const ITEM_TYPE_TEXT: PROPERTYKEY = PROPERTYKEY {
     fmtid: DOCUMENT,
     pid: 4,
 };
+const FILE_EXTENSION: PROPERTYKEY = PROPERTYKEY {
+    fmtid: GUID::from_u128(0xe4f10a3c_49e6_405d_8288_a23bd4eeaa6c),
+    pid: 100,
+};
 const SIZE: PROPERTYKEY = PROPERTYKEY {
     fmtid: DOCUMENT,
     pid: 12,
@@ -422,6 +429,19 @@ fn filetime(value: FILETIME) -> u64 {
 
 fn recycle_metadata(entry: &mut Item, item: &IShellItem2) {
     unsafe {
+        if !entry.directory {
+            entry.extension = item
+                .GetString(&FILE_EXTENSION)
+                .ok()
+                .and_then(read_shell_string)
+                .and_then(|extension| {
+                    extension
+                        .to_str()?
+                        .strip_prefix('.')
+                        .filter(|extension| !extension.is_empty())
+                        .map(OsString::from)
+                });
+        }
         entry.modified = item.GetFileTime(&DATE_MODIFIED).map_or(0, filetime);
         entry.deleted = item.GetFileTime(&DATE_DELETED).map_or(0, filetime);
         entry.size = item.GetUInt64(&SIZE).unwrap_or(0);

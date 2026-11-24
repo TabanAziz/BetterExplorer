@@ -23,6 +23,11 @@ pub enum Location {
         root: PathBuf,
         query: String,
     },
+    PcSearch {
+        query: String,
+        all_drives: bool,
+        from_home: bool,
+    },
 }
 
 impl Location {
@@ -45,6 +50,10 @@ impl Location {
         }
     }
 
+    pub fn is_search(&self) -> bool {
+        matches!(self, Self::Search { .. } | Self::PcSearch { .. })
+    }
+
     pub fn caption(&self) -> String {
         match self {
             Self::Home => "Home".into(),
@@ -55,7 +64,7 @@ impl Location {
                 Namespace::RecycleBin => "Recycle Bin".into(),
                 Namespace::Libraries => "Libraries".into(),
             }),
-            Self::Search { query, .. } => format!("Search: {query}"),
+            Self::Search { query, .. } | Self::PcSearch { query, .. } => format!("Search: {query}"),
             Self::Folder(path) => path
                 .file_name()
                 .unwrap_or(path.as_os_str())
@@ -208,6 +217,7 @@ pub enum Column {
     Name,
     Modified,
     Kind,
+    Folder,
     Size,
 }
 

@@ -8,6 +8,17 @@ pub struct Placement {
 }
 
 pub fn segments(location: &Location, system_drive: Option<&str>) -> Vec<(String, Location)> {
+    if let Location::PcSearch { from_home, .. } = location {
+        let start = if *from_home {
+            Location::Home
+        } else {
+            Location::Computer
+        };
+        return vec![
+            (start.caption(), start),
+            (location.caption(), location.clone()),
+        ];
+    }
     let Some(path) = location
         .directory()
         .filter(|path| !path.as_os_str().is_empty())
