@@ -121,11 +121,12 @@ function Show-SetupDialog {
         $form.AcceptButton = $installButton
         $form.CancelButton = $cancelButton
         if ($form.ShowDialog() -ne [Windows.Forms.DialogResult]::OK) { return }
+        $folderManagerChoice = if ($folderOption.Enabled -and $folderOption.CheckState -ne $initialFolderChoice) {
+            if ($folderOption.Checked) { 'BetterExplorer' } else { 'WindowsExplorer' }
+        }
         [pscustomobject] @{
             WinE = if ($betterOption.Checked) { 'BetterExplorer' } else { 'WindowsExplorer' }
-            FolderManager = if ($folderOption.Enabled -and $folderOption.CheckState -ne $initialFolderChoice) {
-                if ($folderOption.Checked) { 'BetterExplorer' } else { 'WindowsExplorer' }
-            }
+            FolderManager = $folderManagerChoice
             StartMenuShortcut = $shortcutOption.Checked
         }
     } finally {
@@ -296,7 +297,7 @@ try {
         $options = Show-SetupDialog $currentWinE $currentFolderManager $bundle.version $bundleExecutable
         if (-not $options) { return }
         $WinE = $options.WinE
-        $FolderManager = $options.FolderManager
+        if ($options.FolderManager) { $FolderManager = $options.FolderManager }
         $addShortcut = $options.StartMenuShortcut
     }
     $lockRoot = if ($TestRoot) { $paths.Programs }

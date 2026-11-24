@@ -12,6 +12,15 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Check setup scripts in Windows PowerShell
+        shell: powershell
+        run: |
+          foreach ($script in Get-ChildItem -LiteralPath tools -Filter *.ps1 -File) {
+            $tokens = $null
+            $parseErrors = $null
+            $null = [System.Management.Automation.Language.Parser]::ParseFile($script.FullName, [ref] $tokens, [ref] $parseErrors)
+            if ($parseErrors.Count) { throw "$($script.Name): $($parseErrors.Message -join ' ')" }
+          }
       - name: Select Rust stable
         run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
       - name: Check formatting

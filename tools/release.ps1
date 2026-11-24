@@ -40,6 +40,12 @@ function Build-SetupLauncher {
             throw "Expected one common-script import in $scriptName.ps1."
         }
         $embedded = $source.Replace($import, $common).Replace('$PSScriptRoot', '$BetterExplorerBundleRoot')
+        $tokens = $null
+        $parseErrors = $null
+        $null = [System.Management.Automation.Language.Parser]::ParseInput($embedded, [ref] $tokens, [ref] $parseErrors)
+        if ($parseErrors.Count) {
+            throw "The embedded $scriptName script has syntax errors: $($parseErrors.Message -join ' ')"
+        }
         $resourcePath = Join-Path $Work "$scriptName.embedded.ps1"
         [IO.File]::WriteAllText($resourcePath, $embedded)
         "/resource:$resourcePath,BetterExplorer.$scriptName.ps1"
