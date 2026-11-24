@@ -23,7 +23,7 @@ To remove the installed program, run Setup.exe from the extracted bundle with th
 - Open folders from Home or This PC, use the breadcrumb bar, or press Ctrl+L to enter a path. Home shows Quick access, Recent and Favorites.
 - Network, Recycle Bin and Libraries open inside BetterExplorer. Use the Recycle Bin context menu to restore or permanently delete items.
 - In Settings under **Date modified format**, choose DD.MM.YYYY or MM/DD/YYYY. Both include the local time.
-- In **Settings → Appearance**, preview and select System, Light, Dark or one of six original themes.
+- In **Settings**, select System, Light, Dark or one of six original themes from the previews below the date format.
 - Ctrl+T and Ctrl+W manage tabs. Use More to reorder tabs and enable tab restoration.
 - BetterExplorer reopens at the last window position and remembers the size you set by dragging the window edge.
 - Wheel scrolling eases toward the new position, including the first row at the upper edge.

@@ -1,16 +1,25 @@
 use crate::chrome::{
-    blend_color, draw_glyph, fill, font_sized, move_to, new_control, rounded_fill, scale, send,
-    set_visible, text, text_at, Glyph, Palette,
+    blend_color, button, draw_glyph, fill, font_sized, move_to, new_control, rounded_fill, scale,
+    send, set_visible, text, text_at, Glyph, Palette,
 };
 use crate::theme_visuals;
-use better_explorer::model::ThemePreference;
-use std::ffi::OsStr;
+use better_explorer::model::{wide, ThemePreference};
+use std::{
+    cell::Cell,
+    ffi::OsStr,
+    mem::{size_of, zeroed},
+    ptr::{null, null_mut},
+};
 use windows_sys::Win32::{
-    Foundation::{HWND, RECT},
+    Foundation::{HWND, LPARAM, POINT, RECT, WPARAM},
     Graphics::Gdi::*,
-    System::SystemServices::SS_NOPREFIX,
+    System::{LibraryLoader::GetModuleHandleW, SystemServices::SS_NOPREFIX},
     UI::{
-        Controls::{DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED},
+        Controls::{
+            SetScrollInfo, SetWindowTheme, DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED,
+        },
+        HiDpi::GetSystemMetricsForDpi,
+        Input::KeyboardAndMouse::SetFocus,
         WindowsAndMessaging::*,
     },
 };
@@ -25,36 +34,14 @@ const SHORTCUT_HEADING: u16 = 222;
 const SHORTCUT_STATUS: u16 = 224;
 const DATE_HEADING: u16 = 225;
 const DATE_HINT: u16 = 226;
-pub const SECTIONS: [(u16, Section); 2] = [(227, Section::General), (228, Section::Appearance)];
+const THEME_HEADING: u16 = 229;
 pub const THEME_START: u16 = 230;
-const SECTION_TOP: i32 = 150;
-const SECTION_BOTTOM: i32 = 184;
-const GALLERY_TOP: i32 = 197;
-const GALLERY_COLUMNS: usize = 3;
+const GALLERY_COLUMNS: i32 = 3;
+const GALLERY_GAP: i32 = 8;
+const MIN_THEME_WIDTH: i32 = 111;
+const THEME_HEIGHT: i32 = 82;
 const THEME_CHECK_SIZE: i32 = 12;
 const THEME_CHECK_GAP: i32 = 3;
-
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub enum Section {
-    #[default]
-    General,
-    Appearance,
-}
-
-impl Section {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::General => "General",
-            Self::Appearance => "Appearance",
-        }
-    }
-}
-
-pub fn section(id: u16) -> Option<Section> {
-    SECTIONS
-        .iter()
-        .find_map(|&(key, page)| (id == key).then_some(page))
-}
 
 pub fn theme(id: u16) -> Option<ThemePreference> {
     ThemePreference::ALL
@@ -63,7 +50,7 @@ pub fn theme(id: u16) -> Option<ThemePreference> {
 }
 
 pub fn is_button(id: u16) -> bool {
-    section(id).is_some() || theme(id).is_some() || choice(id).is_some()
+    theme(id).is_some() || choice(id).is_some()
 }
 
 pub fn accessible_name(label: &str, selected: bool) -> String {
@@ -133,27 +120,107 @@ pub fn choice(id: u16) -> Option<Choice> {
 }
 
 pub struct Page {
+    window: HWND,
+    scrollbar: HWND,
     fonts: [HFONT; 2],
     title: HWND,
     shortcut_heading: HWND,
     shortcut_status: HWND,
     date_heading: HWND,
     date_hint: HWND,
+    theme_heading: HWND,
+    layout: Cell<Option<Layout>>,
+    scroll: Cell<i32>,
+    wheel_fraction: Cell<i32>,
 }
 
 impl Page {
-    pub fn create(window: HWND, dpi: u32, fonts: [HFONT; 2]) -> Self {
+    pub fn create(parent: HWND, dpi: u32, fonts: [HFONT; 2], procedure: WNDPROC) -> Option<Self> {
+        let window = unsafe {
+            let module = GetModuleHandleW(null());
+            let class = wide("BetterExplorerSettings");
+            RegisterClassW(&WNDCLASSW {
+                lpfnWndProc: procedure,
+                hInstance: module,
+                hCursor: LoadCursorW(null_mut(), IDC_ARROW),
+                lpszClassName: class.as_ptr(),
+                ..zeroed()
+            });
+            CreateWindowExW(
+                WS_EX_CONTROLPARENT,
+                class.as_ptr(),
+                null(),
+                WS_CHILD | WS_CLIPCHILDREN,
+                0,
+                0,
+                0,
+                0,
+                parent,
+                null_mut(),
+                module,
+                null(),
+            )
+        };
+        if window.is_null() {
+            return None;
+        }
         let label = |id, caption| new_control(window, "Static", caption, id, SS_NOPREFIX, 0);
         let mut page = Self {
-            fonts: [std::ptr::null_mut(); 2],
+            window,
+            scrollbar: new_control(window, "ScrollBar", "", 0, SBS_VERT as u32, 0),
+            fonts: [null_mut(); 2],
             title: label(PAGE_TITLE, "Settings"),
             shortcut_heading: label(SHORTCUT_HEADING, "Win+E shortcut"),
             shortcut_status: label(SHORTCUT_STATUS, ""),
             date_heading: label(DATE_HEADING, "Date modified format"),
             date_hint: label(DATE_HINT, "Used in file lists and item details."),
+            theme_heading: label(THEME_HEADING, "Themes"),
+            layout: Cell::new(None),
+            scroll: Cell::new(0),
+            wheel_fraction: Cell::new(0),
         };
+        let failed = SHORTCUT_CHOICES
+            .into_iter()
+            .chain(DATE_CHOICES)
+            .map(|choice| (choice.id, choice.caption))
+            .chain(
+                ThemePreference::ALL
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, theme)| (THEME_START + index as u16, theme.label())),
+            )
+            .any(|(id, label)| button(window, label, id).is_null());
+        if failed
+            || [
+                page.scrollbar,
+                page.title,
+                page.shortcut_heading,
+                page.shortcut_status,
+                page.date_heading,
+                page.date_hint,
+                page.theme_heading,
+            ]
+            .into_iter()
+            .any(|control| control.is_null())
+        {
+            unsafe { DestroyWindow(window) };
+            return None;
+        }
         page.set_fonts(dpi, fonts);
-        page
+        Some(page)
+    }
+
+    pub fn button(&self, id: u16) -> HWND {
+        unsafe { GetDlgItem(self.window, id.into()) }
+    }
+
+    pub fn buttons(&self) -> impl Iterator<Item = HWND> + '_ {
+        SHORTCUT_CHOICES
+            .into_iter()
+            .chain(DATE_CHOICES)
+            .map(|choice| choice.id)
+            .chain(THEME_START..THEME_START + ThemePreference::ALL.len() as u16)
+            .map(|id| self.button(id))
     }
 
     pub fn set_fonts(&mut self, dpi: u32, fonts: [HFONT; 2]) {
@@ -167,8 +234,12 @@ impl Page {
             (self.shortcut_status, fonts[0]),
             (self.date_heading, self.fonts[1]),
             (self.date_hint, fonts[0]),
+            (self.theme_heading, self.fonts[1]),
         ] {
             send(window, WM_SETFONT, font as usize, 0);
+        }
+        for button in self.buttons() {
+            send(button, WM_SETFONT, fonts[0] as usize, 0);
         }
         for font in old {
             if !font.is_null() {
@@ -177,65 +248,233 @@ impl Page {
         }
     }
 
+    pub fn set_style(&self, palette: &Palette) {
+        let theme = wide(if palette.dark {
+            "DarkMode_Explorer"
+        } else {
+            "Explorer"
+        });
+        unsafe {
+            SetWindowTheme(
+                self.scrollbar,
+                if palette.contrast {
+                    null()
+                } else {
+                    theme.as_ptr()
+                },
+                null(),
+            );
+        }
+    }
+
     pub fn set_status(&self, value: impl AsRef<OsStr>) {
         text(self.shortcut_status, value);
     }
 
-    pub fn layout(&self, layout: Option<Layout>, button: impl Fn(u16) -> HWND) {
-        let general = layout.is_some_and(|layout| layout.section == Section::General);
-        let appearance = layout.is_some_and(|layout| layout.section == Section::Appearance);
-        let general_controls = [
-            self.shortcut_heading,
-            self.shortcut_status,
-            self.date_heading,
-            self.date_hint,
-        ]
-        .into_iter()
-        .chain(
-            SHORTCUT_CHOICES
-                .into_iter()
-                .chain(DATE_CHOICES)
-                .map(|choice| button(choice.id)),
-        );
-        for window in general_controls {
-            set_visible(window, general);
+    pub fn layout(&self, sidebar: i32, width: i32, height: i32, dpi: u32) {
+        let top = scale(CONTENT_TOP, dpi);
+        let width = (width - sidebar).max(0);
+        let height = (height - top).max(0);
+        let full = Layout::new(width, height, dpi);
+        let scroll_width = if full.max_scroll() > 0 {
+            scrollbar_width(dpi).min(width)
+        } else {
+            0
+        };
+        let layout = Layout::new(width - scroll_width, height, dpi);
+        if let Some(previous) = self.layout.replace(Some(layout)) {
+            if previous.dpi != dpi {
+                let old_dpi = previous.dpi as i32;
+                self.scroll
+                    .set((self.scroll.get() * dpi as i32 + old_dpi / 2) / old_dpi);
+            }
         }
-        for index in 0..ThemePreference::ALL.len() {
-            set_visible(button(THEME_START + index as u16), appearance);
+        let offset = self.scroll.get().clamp(0, layout.max_scroll());
+        self.scroll.set(offset);
+        move_to(self.window, sidebar, top, width, height);
+        self.place_controls(layout, offset);
+        if scroll_width > 0 {
+            move_to(
+                self.scrollbar,
+                width - scroll_width,
+                0,
+                scroll_width,
+                height,
+            );
+            unsafe {
+                SetScrollInfo(
+                    self.scrollbar,
+                    SB_CTL,
+                    &SCROLLINFO {
+                        cbSize: size_of::<SCROLLINFO>() as u32,
+                        fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+                        nMin: 0,
+                        nMax: layout.content_height() - 1,
+                        nPage: height as u32,
+                        nPos: offset,
+                        nTrackPos: 0,
+                    },
+                    1,
+                );
+            }
         }
-        for (id, _) in SECTIONS {
-            set_visible(button(id), layout.is_some());
+        set_visible(self.scrollbar, scroll_width > 0);
+        set_visible(self.window, true);
+    }
+
+    pub fn hide(&self) {
+        set_visible(self.window, false);
+    }
+
+    pub fn focus_first(&self) {
+        self.scroll_to(0);
+        unsafe {
+            let first = GetNextDlgTabItem(self.window, null_mut(), 0);
+            if !first.is_null() {
+                SetFocus(first);
+            }
         }
-        set_visible(self.title, layout.is_some());
-        let Some(layout) = layout else {
+    }
+
+    pub fn is_under_pointer(&self, lp: LPARAM) -> bool {
+        let point = POINT {
+            x: lp as i16 as i32,
+            y: (lp >> 16) as i16 as i32,
+        };
+        let mut bounds = unsafe { zeroed() };
+        unsafe { GetWindowRect(self.window, &mut bounds) != 0 && PtInRect(&bounds, point) != 0 }
+    }
+
+    pub fn reveal(&self, target: HWND) {
+        let Some(layout) = self.layout.get() else {
             return;
         };
-        let d = |value| scale(value, layout.dpi);
-        move_to(
-            self.title,
-            layout.left,
-            d(104),
-            layout.right - layout.left,
-            d(44),
+        if unsafe { GetParent(target) } != self.window {
+            return;
+        }
+        let mut bounds = crate::chrome::rect(target);
+        unsafe { MapWindowPoints(target, self.window, (&mut bounds as *mut RECT).cast(), 2) };
+        let inset = scale(4, layout.dpi);
+        let position = self.scroll.get();
+        if bounds.top < inset {
+            self.scroll_to(position + bounds.top - inset);
+        } else if bounds.bottom + inset > layout.height {
+            self.scroll_to(position + bounds.bottom + inset - layout.height);
+        }
+    }
+
+    pub fn scroll_bar(&self, wp: WPARAM) {
+        let Some(layout) = self.layout.get() else {
+            return;
+        };
+        let offset = self.scroll.get();
+        let line = scale(26, layout.dpi);
+        let next = match wp as u16 as i32 {
+            SB_TOP => 0,
+            SB_BOTTOM => layout.max_scroll(),
+            SB_LINEUP => offset - line,
+            SB_LINEDOWN => offset + line,
+            SB_PAGEUP => offset - layout.height,
+            SB_PAGEDOWN => offset + layout.height,
+            SB_THUMBTRACK => {
+                let mut info = SCROLLINFO {
+                    cbSize: size_of::<SCROLLINFO>() as u32,
+                    fMask: SIF_TRACKPOS,
+                    ..unsafe { zeroed() }
+                };
+                if unsafe { GetScrollInfo(self.scrollbar, SB_CTL, &mut info) } == 0 {
+                    return;
+                }
+                info.nTrackPos
+            }
+            SB_THUMBPOSITION => (wp >> 16) as u16 as i32,
+            _ => return,
+        };
+        self.scroll_to(next);
+    }
+
+    pub fn wheel(&self, delta: i16) {
+        let Some(layout) = self.layout.get() else {
+            return;
+        };
+        let mut lines = 3u32;
+        unsafe {
+            SystemParametersInfoW(
+                SPI_GETWHEELSCROLLLINES,
+                0,
+                (&mut lines as *mut u32).cast(),
+                0,
+            );
+        }
+        let distance = if lines == u32::MAX {
+            layout.height
+        } else {
+            (lines as i32).saturating_mul(scale(26, layout.dpi))
+        };
+        let movement = self
+            .wheel_fraction
+            .get()
+            .saturating_sub(i32::from(delta).saturating_mul(distance));
+        self.wheel_fraction.set(movement % WHEEL_DELTA as i32);
+        self.scroll_to(
+            self.scroll
+                .get()
+                .saturating_add(movement / WHEEL_DELTA as i32),
         );
-        let position = |id, bounds: RECT| {
+    }
+
+    fn scroll_to(&self, position: i32) {
+        let Some(layout) = self.layout.get() else {
+            return;
+        };
+        let offset = position.clamp(0, layout.max_scroll());
+        if self.scroll.replace(offset) == offset {
+            return;
+        }
+        self.place_controls(layout, offset);
+        unsafe {
+            SetScrollInfo(
+                self.scrollbar,
+                SB_CTL,
+                &SCROLLINFO {
+                    cbSize: size_of::<SCROLLINFO>() as u32,
+                    fMask: SIF_POS,
+                    nPos: offset,
+                    ..zeroed()
+                },
+                1,
+            );
+            RedrawWindow(
+                self.window,
+                null(),
+                null_mut(),
+                RDW_INVALIDATE | RDW_ALLCHILDREN,
+            );
+        }
+    }
+
+    fn place_controls(&self, layout: Layout, offset: i32) {
+        let d = |value| scale(value, layout.dpi);
+        let position = |control, bounds: RECT| {
             move_to(
-                button(id),
+                control,
                 bounds.left,
-                bounds.top,
+                bounds.top - offset,
                 bounds.right - bounds.left,
                 bounds.bottom - bounds.top,
             );
         };
-        for (index, (id, _)) in SECTIONS.into_iter().enumerate() {
-            position(id, layout.section_bounds(index));
-        }
-        if appearance {
-            for index in 0..ThemePreference::ALL.len() {
-                position(THEME_START + index as u16, layout.theme_bounds(index));
-            }
-            return;
-        }
+        let label = |top, height: i32, right| RECT {
+            left: layout.left,
+            right,
+            top,
+            bottom: top + d(height),
+        };
+        position(self.title, label(d(20), 44, layout.right));
+        position(
+            self.theme_heading,
+            label(layout.theme_heading, 24, layout.right),
+        );
         for (row, heading, hint, hint_height, choices) in [
             (
                 layout.shortcut,
@@ -252,23 +491,41 @@ impl Page {
                 DATE_CHOICES,
             ),
         ] {
-            let width = layout.label_right - layout.left;
-            move_to(heading, layout.left, row.top, width, d(24));
-            move_to(hint, layout.left, row.top + d(26), width, d(hint_height));
+            position(heading, label(row.top, 24, layout.label_right));
+            position(
+                hint,
+                label(row.top + d(25), hint_height, layout.label_right),
+            );
             let inner = inset(row.track, d(4));
             let gap = d(3);
             let first = (inner.right - inner.left - gap) / 2;
-            let y = inner.top;
-            let height = inner.bottom - y;
-            move_to(button(choices[0].id), inner.left, y, first, height);
-            let second_x = inner.left + first + gap;
-            move_to(
-                button(choices[1].id),
-                second_x,
-                y,
-                inner.right - second_x,
-                height,
+            position(
+                self.button(choices[0].id),
+                RECT {
+                    right: inner.left + first,
+                    ..inner
+                },
             );
+            position(
+                self.button(choices[1].id),
+                RECT {
+                    left: inner.left + first + gap,
+                    ..inner
+                },
+            );
+        }
+        for index in 0..ThemePreference::ALL.len() {
+            position(
+                self.button(THEME_START + index as u16),
+                layout.theme_bounds(index),
+            );
+        }
+    }
+
+    pub fn paint(&self, dc: HDC, update: &RECT, colors: &Palette) {
+        fill(dc, update, colors.content);
+        if let Some(layout) = self.layout.get() {
+            layout.paint(dc, self.scroll.get(), colors);
         }
     }
 }
@@ -283,16 +540,22 @@ impl Drop for Page {
     }
 }
 
+fn scrollbar_width(dpi: u32) -> i32 {
+    unsafe { GetSystemMetricsForDpi(SM_CXVSCROLL, dpi) }.max(scale(12, dpi))
+}
+
 #[derive(Clone, Copy)]
-pub struct Layout {
-    section: Section,
+struct Layout {
     left: i32,
     right: i32,
     height: i32,
     label_right: i32,
-    divider: i32,
+    dividers: [i32; 2],
     shortcut: Row,
     dates: Row,
+    theme_heading: i32,
+    gallery: i32,
+    columns: usize,
     dpi: u32,
 }
 
@@ -303,13 +566,14 @@ struct Row {
 }
 
 impl Layout {
-    pub fn new(sidebar: i32, width: i32, height: i32, dpi: u32, section: Section) -> Self {
+    fn new(width: i32, height: i32, dpi: u32) -> Self {
         let d = |value| scale(value, dpi);
-        let available = width - sidebar;
-        let gutter = d(if available >= d(680) { 40 } else { 24 });
-        let span = (available - 2 * gutter).clamp(0, d(720));
-        let left = sidebar + (available - span) / 2;
+        let gutter = d(if width >= d(680) { 40 } else { 12 });
+        let span = (width - 2 * gutter).clamp(0, d(720));
+        let left = (width - span) / 2;
         let right = left + span;
+        let gap = d(GALLERY_GAP);
+        let columns = ((span + gap) / (d(MIN_THEME_WIDTH) + gap)).clamp(1, GALLERY_COLUMNS);
         let side_by_side = span >= d(590);
         let track_width = if side_by_side { d(304) } else { span };
         let track_left = right - track_width;
@@ -327,69 +591,71 @@ impl Layout {
                 bottom: d(top + offset + height),
             },
         };
-        let (shortcut, dates, divider) = if side_by_side {
-            (row(210, 4, 42), row(305, 0, 54), 281)
+        let (shortcut, dates, dividers, theme_heading) = if side_by_side {
+            (row(72, 2, 42), row(148, 0, 54), [137, 215], 228)
         } else {
-            (row(194, 62, 42), row(318, 48, 54), 308)
+            (row(72, 63, 42), row(199, 46, 54), [188, 310], 322)
         };
         Self {
-            section,
             left,
             right,
             height,
             label_right,
-            divider: d(divider),
+            dividers: dividers.map(d),
             shortcut,
             dates,
+            theme_heading: d(theme_heading),
+            gallery: d(theme_heading + 24),
+            columns: columns as usize,
             dpi,
-        }
-    }
-
-    fn section_bounds(self, index: usize) -> RECT {
-        let d = |value| scale(value, self.dpi);
-        let (left, right) = [(0, 77), (85, 191)][index];
-        RECT {
-            left: self.left + d(left),
-            right: self.left + d(right),
-            top: d(SECTION_TOP),
-            bottom: d(SECTION_BOTTOM) + 1,
         }
     }
 
     fn theme_bounds(self, index: usize) -> RECT {
         let d = |value| scale(value, self.dpi);
-        let gap = d(9);
-        let columns = GALLERY_COLUMNS as i32;
-        let rows = ThemePreference::ALL.len().div_ceil(GALLERY_COLUMNS) as i32;
-        let column = (index % GALLERY_COLUMNS) as i32;
-        let row = (index / GALLERY_COLUMNS) as i32;
+        let gap = d(GALLERY_GAP);
+        let columns = self.columns as i32;
+        let column = (index % self.columns) as i32;
+        let row = (index / self.columns) as i32;
         let width = (self.right - self.left - (columns - 1) * gap).max(0);
-        let height =
-            ((self.height - d(GALLERY_TOP + 12) - (rows - 1) * gap) / rows).clamp(0, d(110));
         let left = self.left + column * gap;
-        let top = d(GALLERY_TOP) + row * (height + gap);
+        let row_top = row * (THEME_HEIGHT + GALLERY_GAP);
         RECT {
             left: left + width * column / columns,
             right: left + width * (column + 1) / columns,
-            top,
-            bottom: top + height,
+            top: self.gallery + d(row_top),
+            bottom: self.gallery + d(row_top + THEME_HEIGHT),
         }
     }
 
-    pub fn paint(self, dc: HDC, colors: &Palette) {
+    fn content_height(self) -> i32 {
+        self.theme_bounds(ThemePreference::ALL.len() - 1).bottom + scale(7, self.dpi)
+    }
+
+    fn max_scroll(self) -> i32 {
+        (self.content_height() - self.height).max(0)
+    }
+
+    fn paint(self, dc: HDC, offset: i32, colors: &Palette) {
         let d = |value| scale(value, self.dpi);
-        let line = |y| RECT {
-            left: self.left,
-            right: self.right,
-            top: y,
-            bottom: y + 1,
-        };
-        fill(dc, &line(d(SECTION_BOTTOM)), colors.edge);
-        if self.section == Section::Appearance {
-            return;
+        for y in self.dividers {
+            fill(
+                dc,
+                &RECT {
+                    left: self.left,
+                    right: self.right,
+                    top: y - offset,
+                    bottom: y - offset + 1,
+                },
+                colors.edge,
+            );
         }
-        fill(dc, &line(self.divider), colors.edge);
         for track in [self.shortcut.track, self.dates.track] {
+            let track = RECT {
+                top: track.top - offset,
+                bottom: track.bottom - offset,
+                ..track
+            };
             rounded_fill(dc, &track, d(10), track_color(colors));
         }
     }
@@ -406,64 +672,6 @@ fn track_color(colors: &Palette) -> u32 {
 fn inset(mut bounds: RECT, gap: i32) -> RECT {
     unsafe { InflateRect(&mut bounds, -gap, -gap) };
     bounds
-}
-
-pub fn draw_section(
-    draw: &DRAWITEMSTRUCT,
-    section: Section,
-    colors: &Palette,
-    dpi: u32,
-    fonts: [HFONT; 2],
-    selected: bool,
-    hovered: bool,
-) {
-    let dc = draw.hDC;
-    let bounds = draw.rcItem;
-    let d = |value| scale(value, dpi);
-    let focus = draw.itemState & ODS_FOCUS != 0;
-    let pressed = draw.itemState & ODS_SELECTED != 0;
-    fill(dc, &bounds, colors.content);
-    fill(
-        dc,
-        &RECT {
-            top: bounds.bottom - 1,
-            ..bounds
-        },
-        colors.edge,
-    );
-    let face = RECT {
-        bottom: bounds.bottom - d(4),
-        ..bounds
-    };
-    let surface = if selected && colors.contrast {
-        colors.accent
-    } else if selected {
-        track_color(colors)
-    } else if hovered || pressed {
-        colors.field
-    } else {
-        colors.content
-    };
-    if focus {
-        rounded_fill(dc, &face, d(6), colors.text);
-        rounded_fill(dc, &inset(face, d(1)), d(5), surface);
-    } else if surface != colors.content {
-        rounded_fill(dc, &face, d(6), surface);
-    }
-    text_at(
-        dc,
-        section.label(),
-        face,
-        fonts[usize::from(selected)],
-        if selected && colors.contrast {
-            unsafe { GetSysColor(COLOR_HIGHLIGHTTEXT) }
-        } else if selected || focus || hovered {
-            colors.text
-        } else {
-            colors.muted
-        },
-        DT_SINGLELINE | DT_VCENTER | DT_CENTER,
-    );
 }
 
 pub fn draw_theme(
@@ -553,8 +761,8 @@ fn theme_content(bounds: RECT, dpi: u32) -> (RECT, RECT) {
         bottom: bounds.bottom - d(25),
     };
     let caption = RECT {
-        left: preview.left + d(1),
-        right: preview.right - d(1),
+        left: preview.left,
+        right: preview.right,
         top: preview.bottom + d(1),
         bottom: bounds.bottom - d(3),
     };
@@ -656,14 +864,35 @@ pub fn draw_choice(
 mod tests {
     use super::*;
     use crate::chrome::font;
-    use better_explorer::model::wide;
     use windows_sys::Win32::Foundation::SIZE;
 
     #[test]
-    fn theme_previews_and_selected_labels_fit_at_minimum_window_size() {
-        for dpi in [96, 144] {
+    fn full_size_settings_place_all_themes_below_the_date_choices() {
+        for dpi in [96, 120, 144, 168, 192] {
             let d = |value| scale(value, dpi);
-            let layout = Layout::new(d(151), d(552), d(450), dpi, Section::Appearance);
+            let layout = Layout::new(
+                d(968) - d(161) - 1 - d(7),
+                d(608) - d(CONTENT_TOP) - d(7),
+                dpi,
+            );
+            assert!(layout.shortcut.track.bottom < layout.dates.top);
+            assert!(layout.dates.track.bottom < layout.theme_heading);
+            assert!(layout.theme_heading < layout.theme_bounds(0).top);
+            assert_eq!(layout.max_scroll(), 0, "at {dpi} DPI");
+        }
+    }
+
+    #[test]
+    fn theme_previews_and_selected_labels_fit_at_minimum_window_size() {
+        for (window_width, dpi) in [552, 512]
+            .into_iter()
+            .flat_map(|width| [96, 120, 144, 192].into_iter().map(move |dpi| (width, dpi)))
+        {
+            let d = |value| scale(value, dpi);
+            let width = d(window_width) - d(151) - 1 - d(7) - scrollbar_width(dpi);
+            let height = d(450) - d(CONTENT_TOP) - d(7);
+            let layout = Layout::new(width, height, dpi);
+            assert!(layout.max_scroll() > 0);
             let labels = unsafe {
                 let dc = CreateCompatibleDC(std::ptr::null_mut());
                 assert!(!dc.is_null());
@@ -690,13 +919,18 @@ mod tests {
             };
             for (index, size) in labels.into_iter().enumerate() {
                 let tile = layout.theme_bounds(index);
-                assert!(tile.right <= d(552) && tile.bottom <= d(450));
+                assert!(tile.right <= width && tile.bottom - layout.max_scroll() <= height);
                 let (preview, caption) = theme_content(tile, dpi);
                 assert!(preview.right - preview.left >= d(65));
                 assert!(preview.bottom - preview.top >= d(29));
                 let label_width =
                     caption.right - caption.left - d(THEME_CHECK_SIZE) - d(THEME_CHECK_GAP);
-                assert!(size.cx <= label_width && size.cy <= caption.bottom - caption.top);
+                assert!(
+                    size.cx <= label_width && size.cy <= caption.bottom - caption.top,
+                    "{} at {window_width}px and {dpi} DPI, label width {}, available {label_width}",
+                    ThemePreference::ALL[index].label(),
+                    size.cx,
+                );
             }
         }
     }

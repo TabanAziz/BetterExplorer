@@ -8,8 +8,8 @@ use crate::{
     home_page::{Activity, HomePage, Icon, Item},
     preview::{self, Content},
     settings_page::{
-        self, Choice, Section, DATE_CHOICES, DATE_FORMAT_DAY_FIRST, DATE_FORMAT_MONTH_FIRST,
-        SECTIONS, SHORTCUT_CHOICES, THEME_START, WIN_E_BETTER, WIN_E_WINDOWS,
+        self, Choice, DATE_CHOICES, DATE_FORMAT_DAY_FIRST, DATE_FORMAT_MONTH_FIRST,
+        SHORTCUT_CHOICES, THEME_START, WIN_E_BETTER, WIN_E_WINDOWS,
     },
     theme_visuals,
     window_geometry::{self, WindowPosition, WindowSize},
@@ -56,6 +56,7 @@ const BENCH_NAVIGATE: u32 = WM_APP + 6;
 const BENCH_PRESENT: u32 = WM_APP + 7;
 const BENCH_STARTED: u32 = WM_APP + 8;
 const START_FILE_DRAG: u32 = WM_APP + 9;
+const REVEAL_SETTING: u32 = WM_APP + 10;
 const REFRESH_TIMER: usize = 1;
 const SETTINGS_TIMER: usize = 2;
 const GROUP_TIMER: usize = 3;
@@ -159,7 +160,6 @@ const GROUP_NONE: u16 = 214;
 const SEARCH_ALL_DRIVES: u16 = 216;
 const UNDO: u16 = 217;
 const REDO: u16 = 218;
-const OPEN_APPEARANCE: u16 = 219;
 const GROUP_MODIFIED: u16 = 215;
 const OPEN_TERMINAL: u16 = 210;
 const FOLDER_PROPERTIES: u16 = 211;
@@ -395,7 +395,6 @@ struct App {
     active: usize,
     settings: Settings,
     settings_controls: Option<settings_page::Page>,
-    settings_section: Section,
     hotkey_status: Option<hotkey::Status>,
     hotkey_request: Option<HotkeyRequest>,
     hotkey_error: Option<String>,
@@ -559,7 +558,6 @@ impl App {
             active,
             settings,
             settings_controls: None,
-            settings_section: Section::default(),
             hotkey_status: None,
             hotkey_request: None,
             hotkey_error: None,
@@ -733,6 +731,12 @@ impl App {
     }
 
     fn button(&self, id: u16) -> HWND {
+        if settings_page::is_button(id) {
+            return self
+                .settings_controls
+                .as_ref()
+                .map_or(null_mut(), |page| page.button(id));
+        }
         self.buttons
             .iter()
             .find(|(key, _)| *key == id)
@@ -884,6 +888,7 @@ impl App {
             self.settings.theme = theme;
             self.apply_theme();
             self.update_appearance_choices();
+            self.layout();
             self.schedule_save();
         }
     }
@@ -911,6 +916,9 @@ impl App {
         set_theme(self.window, self.list, &self.colors);
         if let Some(home) = &self.home {
             home.set_style(&self.colors, self.dpi);
+        }
+        if let Some(page) = &self.settings_controls {
+            page.set_style(&self.colors);
         }
         let theme = wide(if self.colors.dark {
             "DarkMode_Explorer"
@@ -971,10 +979,7 @@ impl App {
         }
     }
 
-    fn open_settings(&mut self, section: Option<Section>) {
-        if let Some(section) = section {
-            self.settings_section = section;
-        }
+    fn open_settings(&mut self) {
         if let Some(index) = self
             .tabs
             .iter()
@@ -988,11 +993,8 @@ impl App {
         }
         self.update_appearance_choices();
         self.layout();
-        if let Some((id, _)) = SECTIONS
-            .iter()
-            .find(|(_, section)| *section == self.settings_section)
-        {
-            unsafe { SetFocus(self.button(*id)) };
+        if let Some(page) = &self.settings_controls {
+            page.focus_first();
         }
     }
 
@@ -1000,20 +1002,19 @@ impl App {
         if self.settings_controls.is_some() {
             return;
         }
-        self.settings_controls = Some(settings_page::Page::create(
+        let Some(page) = settings_page::Page::create(
             self.window,
             self.dpi,
             self.fonts,
-        ));
-        for (id, section) in SECTIONS {
-            self.set_dynamic_button(id, section.label());
+            Some(settings_viewport_proc),
+        ) else {
+            return;
+        };
+        for control in page.buttons() {
+            unsafe { SetWindowSubclass(control, Some(button_proc), 1, 0) };
         }
-        for choice in SHORTCUT_CHOICES.into_iter().chain(DATE_CHOICES) {
-            self.set_dynamic_button(choice.id, choice.caption);
-        }
-        for (index, theme) in ThemePreference::ALL.into_iter().enumerate() {
-            self.set_dynamic_button(THEME_START + index as u16, theme.label());
-        }
+        page.set_style(&self.colors);
+        self.settings_controls = Some(page);
         self.update_modified_date_controls();
         self.update_appearance_choices();
     }
@@ -1032,9 +1033,6 @@ impl App {
                 unsafe { InvalidateRect(control, null(), 0) };
             }
         };
-        for (id, section) in SECTIONS {
-            update(id, section.label(), self.settings_section == section);
-        }
         for (index, theme) in ThemePreference::ALL.into_iter().enumerate() {
             update(
                 THEME_START + index as u16,
@@ -1181,9 +1179,27 @@ impl App {
         width < scale(866, self.dpi)
     }
 
-    fn tab_width(&self, width: i32) -> i32 {
-        let d = |value| scale(value, self.dpi);
-        ((width - d(193)) / self.tabs.len() as i32 - d(2)).clamp(d(32), d(221))
+    fn tab_layout(&self, width: i32) -> (i32, i32) {
+        title_tab_widths(
+            width,
+            self.tabs.len() as i32,
+            self.title_motif_width(width),
+            self.dpi,
+        )
+    }
+
+    fn title_motif_width(&self, width: i32) -> i32 {
+        if self.colors.contrast || !theme_visuals::has_motif(self.settings.theme) {
+            return 0;
+        }
+        scale(
+            if width >= scale(760, self.dpi) {
+                144
+            } else {
+                76
+            },
+            self.dpi,
+        )
     }
 
     fn layout(&mut self) {
@@ -1199,7 +1215,7 @@ impl App {
         let margin = d(10);
         let settings_tab = *self.location() == Location::Settings;
         let home_tab = self.home.is_some() && *self.location() == Location::Home;
-        let tab_width = self.tab_width(w);
+        let (tab_width, extra_close) = self.tab_layout(w);
         let mut x = margin;
         for offset in 0..TAB_LIMIT {
             let id = TAB_START + offset as u16;
@@ -1210,18 +1226,28 @@ impl App {
             let shown = offset < self.tabs.len();
             set_visible(control, shown);
             if shown {
-                let close = if offset == self.active { d(25) } else { 0 };
-                pos(id, x, d(RESIZE_EDGE), tab_width - close, d(27));
+                let active = offset == self.active;
+                let slot_width = tab_width + if active { extra_close } else { 0 };
+                let close = if active {
+                    if extra_close > 0 {
+                        extra_close
+                    } else {
+                        d(25)
+                    }
+                } else {
+                    0
+                };
+                pos(id, x, d(RESIZE_EDGE), slot_width - close, d(27));
                 if close != 0 {
                     pos(
                         CLOSE_TAB,
-                        x + tab_width - close,
+                        x + slot_width - close,
                         d(RESIZE_EDGE),
                         close,
                         d(27),
                     );
                 }
-                x += tab_width + d(2);
+                x += slot_width + d(2);
             }
         }
         pos(NEW_TAB, x + d(4), d(RESIZE_EDGE), d(32), d(27));
@@ -1403,12 +1429,16 @@ impl App {
         set_visible(self.button(QUICK_DETAILS), !settings_tab && !home_tab);
         set_visible(self.button(QUICK_ICONS), !settings_tab && !home_tab);
         if let Some(controls) = &self.settings_controls {
-            controls.layout(
-                settings_tab.then(|| {
-                    settings_page::Layout::new(sidebar_width, w, h, dpi, self.settings_section)
-                }),
-                |id| self.button(id),
-            );
+            if settings_tab {
+                let edge = if unsafe { IsZoomed(self.window) } == 0 {
+                    d(RESIZE_EDGE)
+                } else {
+                    0
+                };
+                controls.layout(sidebar_width + 1, w - edge, h - edge, dpi);
+            } else {
+                controls.hide();
+            }
         }
         let offer_all_drives = !self.scanning
             && matches!(
@@ -1629,19 +1659,24 @@ impl App {
             },
             self.colors.title,
         );
-        let next_tab_right = d(46) + self.tabs.len() as i32 * (self.tab_width(bounds.right) + d(2));
-        theme_visuals::paint_motif(
-            dc,
-            RECT {
-                left: next_tab_right + d(8),
-                top: d(3),
-                right: bounds.right - d(148),
-                bottom: d(36),
-            },
-            self.settings.theme,
-            &self.colors,
-            self.dpi,
-        );
+        let motif_width = self.title_motif_width(bounds.right);
+        if motif_width != 0 {
+            let (tab_width, extra_close) = self.tab_layout(bounds.right);
+            let next_tab_right = d(46) + extra_close + self.tabs.len() as i32 * (tab_width + d(2));
+            let title_right = bounds.right - d(148);
+            theme_visuals::paint_motif(
+                dc,
+                RECT {
+                    left: (next_tab_right + d(8)).max(title_right - motif_width),
+                    top: d(3),
+                    right: title_right,
+                    bottom: d(36),
+                },
+                self.settings.theme,
+                &self.colors,
+                self.dpi,
+            );
+        }
         let (left, right, search_width) = self.address_bounds(bounds.right);
         rounded_fill(
             dc,
@@ -1708,16 +1743,6 @@ impl App {
                     self.colors.edge,
                 );
             }
-        }
-        if settings_tab {
-            settings_page::Layout::new(
-                self.sidebar_width(bounds.right),
-                bounds.right,
-                bounds.bottom,
-                self.dpi,
-                self.settings_section,
-            )
-            .paint(dc, &self.colors);
         }
         if right > 0 {
             if let Some(Content::Bitmap(image)) = &self.preview {
@@ -3270,12 +3295,6 @@ impl App {
             self.layout();
         }
         if *self.location() == Location::Settings {
-            if let Some(section) = settings_page::section(id) {
-                self.settings_section = section;
-                self.update_appearance_choices();
-                self.layout();
-                return;
-            }
             if let Some(theme) = settings_page::theme(id) {
                 self.select_theme(theme);
                 return;
@@ -3337,8 +3356,7 @@ impl App {
                 PostMessageW(self.window, WM_CLOSE, 0, 0);
             },
             ENTER_SEARCH => self.search(),
-            OPEN_SETTINGS => self.open_settings(None),
-            OPEN_APPEARANCE => self.open_settings(Some(Section::Appearance)),
+            OPEN_SETTINGS => self.open_settings(),
             WIN_E_WINDOWS | WIN_E_BETTER if *self.location() == Location::Settings => {
                 self.request_hotkey(HotkeyRequest::Change(id == WIN_E_BETTER));
             }
@@ -4085,7 +4103,6 @@ impl App {
                     item(RESTORE_TABS, "Restore tabs on startup")
                         .checked(self.settings.restore_tabs),
                     line(),
-                    item(OPEN_APPEARANCE, "Appearance…"),
                     item(THEME_SYSTEM, "Use system theme")
                         .checked(matches!(self.settings.theme, ThemePreference::System)),
                     item(THEME_DARK, "Dark theme")
@@ -4360,7 +4377,7 @@ impl App {
             surface,
             label: (id != DETAILS || !self.compact_toolbar(rect(self.window).right))
                 && (crumb
-                    || tab
+                    || (tab && rect(control).right >= scale(48, self.dpi))
                     || matches!(id, NEW | SORT | VIEW | FILTER | DETAILS | OPEN_SETTINGS)
                     || glyph.is_none()),
             left: crumb || tab,
@@ -5123,6 +5140,39 @@ fn is_zip(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
 }
 
+fn title_tab_widths(width: i32, count: i32, motif_width: i32, dpi: u32) -> (i32, i32) {
+    let d = |value| scale(value, dpi);
+    let tab_space = width - d(193) - motif_width;
+    let extra_close = if motif_width != 0 && tab_space / count - d(2) < d(51) {
+        d(22)
+    } else {
+        0
+    };
+    let minimum = if motif_width > 0 {
+        // Preserve a compact artwork slot on work areas narrower than the normal minimum.
+        let fitting = (width - d(148) - d(54) - d(40) - extra_close) / count - d(2);
+        fitting.clamp(d(12), d(28))
+    } else {
+        d(32)
+    };
+    let tab = ((tab_space - extra_close) / count - d(2)).clamp(minimum, d(221));
+    (tab, extra_close)
+}
+
+#[cfg(test)]
+#[test]
+fn compact_title_leaves_space_for_the_motif_and_the_active_tab_close() {
+    for dpi in [96, 120, 144, 192] {
+        let d = |value| scale(value, dpi);
+        for dips in [512, 552, 680, 760] {
+            let motif_width = d(if dips >= 760 { 144 } else { 76 });
+            let (tab, close) = title_tab_widths(d(dips), TAB_LIMIT as i32, motif_width, dpi);
+            let artwork = d(dips) - d(148) - d(54) - close - TAB_LIMIT as i32 * (tab + d(2));
+            assert!(tab >= d(21) && close == d(22) && artwork >= d(40));
+        }
+    }
+}
+
 fn key(app: &RefCell<App>, message: &MSG) -> bool {
     if !matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
         return false;
@@ -5150,6 +5200,13 @@ fn key(app: &RefCell<App>, message: &MSG) -> bool {
     if vk == VK_TAB && !ctrl && !alt {
         let next = unsafe { GetNextDlgTabItem(app.window, focus, i32::from(shift)) };
         if !next.is_null() {
+            if let Some(page) = app
+                .settings_controls
+                .as_ref()
+                .filter(|_| *app.location() == Location::Settings)
+            {
+                page.reveal(next);
+            }
             unsafe {
                 SetFocus(next);
             }
@@ -5224,6 +5281,80 @@ fn key(app: &RefCell<App>, message: &MSG) -> bool {
     };
     app.command(shortcut);
     true
+}
+
+fn settings_wheel(app: &RefCell<App>, message: &MSG) -> bool {
+    if message.message != WM_MOUSEWHEEL || message.wParam & 0x000c != 0 {
+        return false;
+    }
+    let Ok(app) = app.try_borrow() else {
+        return false;
+    };
+    let Some(page) = app.settings_controls.as_ref().filter(|page| {
+        *app.location() == Location::Settings && page.is_under_pointer(message.lParam)
+    }) else {
+        return false;
+    };
+    page.wheel((message.wParam >> 16) as i16);
+    true
+}
+
+unsafe extern "system" fn settings_viewport_proc(
+    window: HWND,
+    message: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+) -> LRESULT {
+    unsafe {
+        let parent = GetParent(window);
+        match message {
+            WM_COMMAND | WM_DRAWITEM | WM_CTLCOLORSTATIC => SendMessageW(parent, message, wp, lp),
+            WM_ERASEBKGND => 1,
+            WM_PAINT | WM_PRINTCLIENT | WM_VSCROLL | WM_MOUSEWHEEL => {
+                let pointer = GetWindowLongPtrW(parent, GWLP_USERDATA) as *const RefCell<App>;
+                let app = pointer.as_ref().and_then(|app| app.try_borrow().ok());
+                let page = app.as_ref().and_then(|app| app.settings_controls.as_ref());
+                match message {
+                    WM_PAINT | WM_PRINTCLIENT => {
+                        let mut paint = zeroed();
+                        let dc = if message == WM_PAINT {
+                            BeginPaint(window, &mut paint)
+                        } else {
+                            wp as HDC
+                        };
+                        let update = if message == WM_PAINT {
+                            paint.rcPaint
+                        } else {
+                            rect(window)
+                        };
+                        if !dc.is_null() {
+                            if let Some((app, page)) = app.as_ref().zip(page) {
+                                page.paint(dc, &update, &app.colors);
+                            } else if let Some(colors) = CONTROL_COLORS.get() {
+                                FillRect(dc, &update, colors.brushes[1]);
+                            }
+                        }
+                        if message == WM_PAINT {
+                            EndPaint(window, &paint);
+                        }
+                    }
+                    WM_VSCROLL => {
+                        if let Some(page) = page {
+                            page.scroll_bar(wp);
+                        }
+                    }
+                    WM_MOUSEWHEEL if wp & 0x000c == 0 => {
+                        if let Some(page) = page.filter(|page| page.is_under_pointer(lp)) {
+                            page.wheel((wp >> 16) as i16);
+                        }
+                    }
+                    _ => return DefWindowProcW(window, message, wp, lp),
+                }
+                0
+            }
+            _ => DefWindowProcW(window, message, wp, lp),
+        }
+    }
 }
 
 // GWLP_USERDATA borrows the RefCell owned by run(). It outlives the message pump.
@@ -5354,6 +5485,19 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
         return unsafe { DefWindowProcW(window, message, wp, lp) };
     };
     match message {
+        REVEAL_SETTING => {
+            let control = wp as HWND;
+            if let Some(page) = app
+                .settings_controls
+                .as_ref()
+                .filter(|_| *app.location() == Location::Settings)
+            {
+                if unsafe { GetFocus() } == control {
+                    page.reveal(control);
+                }
+            }
+            0
+        }
         WM_COMMAND => {
             if wp as u16 == NAVIGATION && wp >> 16 == LBN_SELCHANGE as usize {
                 app.select_sidebar();
@@ -5517,7 +5661,12 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
             0
         }
         WM_THEMECHANGED | WM_SETTINGCHANGE | WM_SYSCOLORCHANGE => {
+            let width = rect(window).right;
+            let motif_width = app.title_motif_width(width);
             app.apply_theme();
+            if app.title_motif_width(width) != motif_width {
+                app.layout();
+            }
             0
         }
         WM_DPICHANGED => {
@@ -5568,16 +5717,6 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
                 app.draw_sidebar(draw);
             } else if (DRIVE_START..DRIVE_START + DRIVE_LIMIT as u16).contains(&id) {
                 app.draw_drive(draw, (id - DRIVE_START) as usize);
-            } else if let Some(section) = settings_page::section(id) {
-                settings_page::draw_section(
-                    draw,
-                    section,
-                    &app.colors,
-                    app.dpi,
-                    app.fonts,
-                    app.settings_section == section,
-                    app.hover == draw.hwndItem,
-                );
             } else if let Some(theme) = settings_page::theme(id) {
                 settings_page::draw_theme(
                     draw,
@@ -5716,7 +5855,7 @@ unsafe extern "system" fn button_proc(
 ) -> LRESULT {
     unsafe {
         if msg == WM_MOUSEMOVE {
-            let parent = GetParent(window);
+            let parent = GetAncestor(window, GA_ROOT);
             let pointer = GetWindowLongPtrW(parent, GWLP_USERDATA) as *const RefCell<App>;
             if !pointer.is_null()
                 && (&*pointer)
@@ -5731,11 +5870,19 @@ unsafe extern "system" fn button_proc(
                 PostMessageW(parent, HOVER, window as usize, 0);
             }
         } else if msg == WM_MOUSELEAVE {
-            PostMessageW(GetParent(window), HOVER, window as usize, 1);
+            PostMessageW(GetAncestor(window, GA_ROOT), HOVER, window as usize, 1);
         } else if matches!(msg, WM_SETFOCUS | WM_KILLFOCUS)
             && settings_page::is_button(GetDlgCtrlID(window) as u16)
         {
             InvalidateRect(window, null(), 0);
+            if msg == WM_SETFOCUS {
+                PostMessageW(
+                    GetAncestor(window, GA_ROOT),
+                    REVEAL_SETTING,
+                    window as usize,
+                    0,
+                );
+            }
         }
         DefSubclassProc(window, msg, wp, lp)
     }
@@ -6026,7 +6173,7 @@ pub fn run(path: Option<PathBuf>) -> Result<(), std::io::Error> {
             if code == 0 {
                 break;
             }
-            if !key(&app, &message) {
+            if !settings_wheel(&app, &message) && !key(&app, &message) {
                 TranslateMessage(&message);
                 DispatchMessageW(&message);
             }

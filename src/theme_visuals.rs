@@ -8,11 +8,25 @@ use windows_sys::Win32::{
     },
 };
 
+pub fn has_motif(theme: ThemePreference) -> bool {
+    !matches!(
+        theme,
+        ThemePreference::System | ThemePreference::Light | ThemePreference::Dark
+    )
+}
+
 pub fn paint_motif(dc: HDC, bounds: RECT, theme: ThemePreference, colors: &Palette, dpi: u32) {
-    if bounds.right - bounds.left < scale(32, dpi) || bounds.bottom - bounds.top < scale(16, dpi) {
+    let width = bounds.right - bounds.left;
+    if width < scale(32, dpi) || bounds.bottom - bounds.top < scale(16, dpi) {
         return;
     }
-    paint_art(dc, bounds, theme, colors, scale(32, dpi));
+    paint_art(
+        dc,
+        bounds,
+        theme,
+        colors,
+        scale(32, dpi).min(width * 32 / 64),
+    );
 }
 
 pub fn paint_preview(dc: HDC, bounds: RECT, theme: ThemePreference, dpi: u32) {
@@ -64,11 +78,7 @@ fn paint_art(dc: HDC, bounds: RECT, theme: ThemePreference, colors: &Palette, li
     use ThemePreference::*;
 
     let height = (bounds.bottom - bounds.top).min(limit);
-    if colors.contrast
-        || matches!(theme, System | Light | Dark)
-        || height < 3
-        || bounds.left >= bounds.right
-    {
+    if colors.contrast || !has_motif(theme) || height < 3 || bounds.left >= bounds.right {
         return;
     }
     let saved = unsafe { SaveDC(dc) };
