@@ -1,0 +1,185 @@
+{
+  "startup_ms": 87.4248,
+  "navigation": [
+    {
+      "first_ms": 49.1273,
+      "complete_ms": 173.3238,
+      "rows": 100000,
+      "max_dispatch_ms": 3.1544
+    },
+    {
+      "first_ms": 48.5671,
+      "complete_ms": 166.4579,
+      "rows": 100000,
+      "max_dispatch_ms": 2.0825
+    },
+    {
+      "first_ms": 48.80459999999999,
+      "complete_ms": 173.3239,
+      "rows": 100000,
+      "max_dispatch_ms": 3.1243999999999996
+    },
+    {
+      "first_ms": 48.618500000000004,
+      "complete_ms": 166.45399999999998,
+      "rows": 100000,
+      "max_dispatch_ms": 2.6629
+    },
+    {
+      "first_ms": 48.4842,
+      "complete_ms": 173.5122,
+      "rows": 100000,
+      "max_dispatch_ms": 3.521
+    },
+    {
+      "first_ms": 41.4816,
+      "complete_ms": 159.6131,
+      "rows": 100000,
+      "max_dispatch_ms": 2.5373
+    },
+    {
+      "first_ms": 48.4355,
+      "complete_ms": 166.41410000000002,
+      "rows": 100000,
+      "max_dispatch_ms": 2.8699
+    },
+    {
+      "first_ms": 48.5688,
+      "complete_ms": 166.3526,
+      "rows": 100000,
+      "max_dispatch_ms": 2.3341
+    },
+    {
+      "first_ms": 48.601400000000005,
+      "complete_ms": 159.6464,
+      "rows": 100000,
+      "max_dispatch_ms": 2.4894000000000003
+    },
+    {
+      "first_ms": 41.6009,
+      "complete_ms": 166.492,
+      "rows": 100000,
+      "max_dispatch_ms": 3.2932
+    },
+    {
+      "first_ms": 48.4076,
+      "complete_ms": 166.565,
+      "rows": 100000,
+      "max_dispatch_ms": 2.0143999999999997
+    },
+    {
+      "first_ms": 48.455400000000004,
+      "complete_ms": 180.27609999999999,
+      "rows": 100000,
+      "max_dispatch_ms": 3.2799
+    },
+    {
+      "first_ms": 48.4343,
+      "complete_ms": 166.3848,
+      "rows": 100000,
+      "max_dispatch_ms": 2.6818
+    },
+    {
+      "first_ms": 48.502900000000004,
+      "complete_ms": 166.57150000000001,
+      "rows": 100000,
+      "max_dispatch_ms": 2.8989
+    },
+    {
+      "first_ms": 48.6909,
+      "complete_ms": 173.3699,
+      "rows": 100000,
+      "max_dispatch_ms": 2.6334
+    },
+    {
+      "first_ms": 48.397000000000006,
+      "complete_ms": 166.6557,
+      "rows": 100000,
+      "max_dispatch_ms": 2.585
+    },
+    {
+      "first_ms": 48.471599999999995,
+      "complete_ms": 193.98489999999998,
+      "rows": 100000,
+      "max_dispatch_ms": 2.3403
+    },
+    {
+      "first_ms": 55.3532,
+      "complete_ms": 208.0796,
+      "rows": 100000,
+      "max_dispatch_ms": 3.7163999999999997
+    },
+    {
+      "first_ms": 62.363099999999996,
+      "complete_ms": 221.8201,
+      "rows": 100000,
+      "max_dispatch_ms": 3.3103
+    },
+    {
+      "first_ms": 48.7845,
+      "complete_ms": 215.2195,
+      "rows": 100000,
+      "max_dispatch_ms": 2.7648
+    },
+    {
+      "first_ms": 55.4379,
+      "complete_ms": 263.58160000000004,
+      "rows": 100000,
+      "max_dispatch_ms": 4.4435
+    },
+    {
+      "first_ms": 83.9799,
+      "complete_ms": 291.38770000000005,
+      "rows": 100000,
+      "max_dispatch_ms": 4.7889
+    },
+    {
+      "first_ms": 62.5994,
+      "complete_ms": 291.06910000000005,
+      "rows": 100000,
+      "max_dispatch_ms": 3.9785000000000004
+    },
+    {
+      "first_ms": 62.3779,
+      "complete_ms": 215.0011,
+      "rows": 100000,
+      "max_dispatch_ms": 2.7542
+    },
+    {
+      "first_ms": 55.6472,
+      "complete_ms": 222.0359,
+      "rows": 100000,
+      "max_dispatch_ms": 2.9625
+    },
+    {
+      "first_ms": 48.5405,
+      "complete_ms": 180.1652,
+      "rows": 100000,
+      "max_dispatch_ms": 3.6722
+    },
+    {
+      "first_ms": 48.4999,
+      "complete_ms": 187.3668,
+      "rows": 100000,
+      "max_dispatch_ms": 3.3584
+    },
+    {
+      "first_ms": 48.4348,
+      "complete_ms": 215.078,
+      "rows": 100000,
+      "max_dispatch_ms": 2.9446
+    },
+    {
+      "first_ms": 55.3663,
+      "complete_ms": 235.88,
+      "rows": 100000,
+      "max_dispatch_ms": 4.4066
+    },
+    {
+      "first_ms": 62.2099,
+      "complete_ms": 256.53999999999996,
+      "rows": 100000,
+      "max_dispatch_ms": 3.0946
+    }
+  ]
+}

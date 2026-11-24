@@ -1,0 +1,56 @@
+{
+  "started_utc": "2026-11-24T11:52:44.5174466Z",
+  "environment": {
+    "windows_version": "25H2",
+    "windows_build": "26200.9974",
+    "processor": "11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz",
+    "logical_processors": 16,
+    "ui_culture": "de-DE",
+    "powershell": "5.1.26100.9818",
+    "fixture_drive": "C:\\",
+    "fixture_file_system": "NTFS",
+    "binary_sha256": "93E3CC6B298ABCB0AA7C430FB5FD94790417AC4DB287DC147A2212C63CFB8E7F"
+  },
+  "method": {
+    "cache": "Warm Windows cache. One unmeasured startup process and one in-process navigation warm-up.",
+    "startup": "Time to the first DWM-flushed paint from a dispatched window message. One process per sample.",
+    "navigation": "App-internal timings in one visible process. Dispatch reports the longest sampled message dispatch for each navigation.",
+    "measurement_limits": "App timings do not independently verify desktop composition, queued message delivery or real input latency. Windows scheduling and background activity affect the samples.",
+    "idle": "Process CPU time divided by elapsed time, expressed as a percent of one logical core.",
+    "percentile": "Nearest rank.",
+    "small_entries": 16,
+    "large_entries": 100000,
+    "fixture": "Zero-length text files in local temporary directories."
+  },
+  "startup_ms": {
+    "count": 30,
+    "p50": 83.702,
+    "p95": 118.162,
+    "p99": 212.09
+  },
+  "navigation_first_ms": {
+    "count": 30,
+    "p50": 48.569,
+    "p95": 62.599,
+    "p99": 83.98
+  },
+  "navigation_complete_ms": {
+    "count": 30,
+    "p50": 173.512,
+    "p95": 291.069,
+    "p99": 291.388
+  },
+  "navigation_max_dispatch_ms": {
+    "count": 30,
+    "p50": 2.945,
+    "p95": 4.444,
+    "p99": 4.789
+  },
+  "idle": {
+    "requested_seconds": 30,
+    "settle_seconds": 5,
+    "elapsed_seconds": 30.006,
+    "process_cpu_ms": 0,
+    "percent_one_logical_core": 0
+  }
+}

@@ -1,0 +1,197 @@
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::BTreeMap,
+    ffi::{OsStr, OsString},
+    os::windows::ffi::{OsStrExt, OsStringExt},
+    path::{Path, PathBuf},
+};
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum Location {
+    #[default]
+    Home,
+    Computer,
+    Folder(PathBuf),
+    Search {
+        root: PathBuf,
+        query: String,
+    },
+}
+
+impl Location {
+    pub fn path(path: impl Into<PathBuf>) -> Self {
+        Self::Folder(path.into())
+    }
+
+    pub fn directory(&self) -> Option<&Path> {
+        match self {
+            Self::Folder(path) | Self::Search { root: path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
+    pub fn caption(&self) -> String {
+        match self {
+            Self::Home => "Home".into(),
+            Self::Computer => "This PC".into(),
+            Self::Search { query, .. } => format!("Search: {query}"),
+            Self::Folder(path) => path
+                .file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy()
+                .into(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct History {
+    items: Vec<Location>,
+    cursor: usize,
+}
+
+impl History {
+    pub fn new(location: Location) -> Self {
+        Self {
+            items: vec![location],
+            cursor: 0,
+        }
+    }
+    pub fn current(&self) -> &Location {
+        &self.items[self.cursor]
+    }
+    pub fn can_back(&self) -> bool {
+        self.cursor != 0
+    }
+    pub fn can_forward(&self) -> bool {
+        self.cursor + 1 < self.items.len()
+    }
+    pub fn open(&mut self, location: Location) {
+        if self.current() == &location {
+            return;
+        }
+        self.items.truncate(self.cursor + 1);
+        self.items.push(location);
+        if self.items.len() > 100 {
+            self.items.remove(0);
+        }
+        self.cursor = self.items.len() - 1;
+    }
+    pub fn back(&mut self) -> Option<&Location> {
+        if !self.can_back() {
+            return None;
+        }
+        self.cursor -= 1;
+        Some(self.current())
+    }
+    pub fn forward(&mut self) -> Option<&Location> {
+        if !self.can_forward() {
+            return None;
+        }
+        self.cursor += 1;
+        Some(self.current())
+    }
+}
+
+pub fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
+    value.as_ref().encode_wide().chain(Some(0)).collect()
+}
+
+pub fn from_wide(units: &[u16]) -> OsString {
+    let end = units
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(units.len());
+    OsString::from_wide(&units[..end])
+}
+
+pub fn safe_name(name: &str) -> bool {
+    if name.is_empty()
+        || name.ends_with([' ', '.'])
+        || name.encode_utf16().count() > 255
+        || name.chars().any(|c| c < ' ' || r#"\/:*?"<>|"#.contains(c))
+    {
+        return false;
+    }
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end()
+        .to_ascii_uppercase();
+    if matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) {
+        return false;
+    }
+    !stem
+        .strip_prefix("COM")
+        .or_else(|| stem.strip_prefix("LPT"))
+        .is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    pub hidden: bool,
+    pub hide_extensions: bool,
+    pub details: bool,
+    pub theme: ThemePreference,
+    pub restore_tabs: bool,
+    pub active: usize,
+    pub tabs: Vec<Location>,
+    pub pins: Vec<PathBuf>,
+    pub views: BTreeMap<PathBuf, u32>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub enum ThemePreference {
+    #[default]
+    System,
+    Dark,
+    Light,
+}
+
+pub fn settings_path() -> Option<PathBuf> {
+    if std::env::var_os("BETTEREXPLORER_EPHEMERAL").is_some() {
+        return None;
+    }
+    Some(
+        PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
+            .join("BetterExplorer")
+            .join("settings.json"),
+    )
+}
+
+pub fn read_settings() -> Settings {
+    let Some(path) = settings_path() else {
+        return Settings::default();
+    };
+    let Ok(bytes) = std::fs::read(path) else {
+        return Settings::default();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+pub fn write_settings(settings: &Settings) -> std::io::Result<()> {
+    let Some(path) = settings_path() else {
+        return Ok(());
+    };
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(parent)?;
+    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(&temp, serde_json::to_vec(settings)?)?;
+    if let Err(error) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(temp);
+        return Err(error);
+    }
+    Ok(())
+}

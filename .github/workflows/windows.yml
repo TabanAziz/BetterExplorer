@@ -1,0 +1,24 @@
+name: Windows
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Select Rust stable
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Check formatting
+        run: cargo +stable fmt --all -- --check
+      - name: Clippy
+        run: cargo +stable clippy --locked --all-targets -- -D warnings
+      - name: Tests
+        run: cargo +stable test --locked
+      - name: Release build
+        run: cargo +stable build --release --locked
