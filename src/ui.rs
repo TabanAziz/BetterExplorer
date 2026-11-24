@@ -8,16 +8,16 @@ use crate::{
 };
 use better_explorer::{
     model::{
-        from_wide, read_settings, safe_name, wide, write_settings, History, Location,
+        from_wide, read_settings, safe_name, wide, write_settings, GroupBy, History, Location,
         ModifiedDateFormat, Settings, ThemePreference,
     },
     namespace::Namespace,
     shell::{self, Operation},
-    work::{self, Column, Entry, Request, ScanEvent, Scanner, Sort},
+    work::{self, Column, DateGroup, DateGroups, Entry, Request, ScanEvent, Scanner, Sort},
 };
 use std::{
     cell::{Cell, RefCell},
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     ffi::{OsStr, OsString},
     mem::{size_of, zeroed},
     path::{Path, PathBuf},
@@ -49,6 +49,7 @@ const BENCH_PRESENT: u32 = WM_APP + 7;
 const BENCH_STARTED: u32 = WM_APP + 8;
 const REFRESH_TIMER: usize = 1;
 const SETTINGS_TIMER: usize = 2;
+const GROUP_TIMER: usize = 3;
 const RESIZE_EDGE: i32 = 7;
 
 #[derive(Clone, Copy)]
@@ -149,6 +150,12 @@ const DATE_FORMAT_DAY_FIRST: u16 = 206;
 const DATE_FORMAT_MONTH_FIRST: u16 = 207;
 const RECYCLE_RESTORE: u16 = 208;
 const RECYCLE_EMPTY: u16 = 209;
+const GROUP_NONE: u16 = 214;
+const GROUP_MODIFIED: u16 = 215;
+const OPEN_TERMINAL: u16 = 210;
+const FOLDER_PROPERTIES: u16 = 211;
+const FOLDER_COPY_PATH: u16 = 212;
+const GROUP_SUBMENU: u16 = 213;
 const HOME_RECENT: u16 = 194;
 const HOME_FAVORITES: u16 = 195;
 const HOME_TILES: u16 = 196;
@@ -245,6 +252,12 @@ struct Tab {
     sort: Sort,
     filter: Filter,
     view: u32,
+}
+
+struct ListSelection {
+    paths: HashSet<PathBuf>,
+    focused: Option<PathBuf>,
+    anchor: Option<PathBuf>,
 }
 
 impl Tab {
@@ -390,6 +403,7 @@ struct App {
     preview_id: u64,
     rows: Vec<Arc<Entry>>,
     visible: Vec<usize>,
+    group_headers: Vec<(usize, DateGroup)>,
     edit: Option<Edit>,
     error: Option<String>,
     note: Option<String>,
@@ -522,6 +536,7 @@ impl App {
             preview_id: 0,
             rows: Vec::new(),
             visible: Vec::new(),
+            group_headers: Vec::new(),
             edit: None,
             note: None,
             error: None,
@@ -693,6 +708,33 @@ impl App {
             Location::Folder(path) => Some(path.clone()),
             _ => None,
         }
+    }
+
+    fn sort(&self) -> Sort {
+        match self.location() {
+            Location::Folder(path) => self.settings.folder_order(path).sort,
+            _ => self.tab().sort,
+        }
+    }
+
+    fn group_by(&self) -> GroupBy {
+        match self.location() {
+            Location::Folder(path) if self.tab().view == LV_VIEW_DETAILS => {
+                self.settings.folder_order(path).group
+            }
+            _ => GroupBy::None,
+        }
+    }
+
+    fn group_menu(&self) -> Vec<MenuItem> {
+        if !matches!(self.location(), Location::Folder(_)) || self.tab().view != LV_VIEW_DETAILS {
+            return Vec::new();
+        }
+        let group = self.group_by();
+        vec![
+            MenuItem::new(GROUP_NONE, "None").checked(group == GroupBy::None),
+            MenuItem::new(GROUP_MODIFIED, "Date modified").checked(group == GroupBy::DateModified),
+        ]
     }
 
     fn apply_dpi(&mut self, dpi: u32) {
@@ -1742,22 +1784,37 @@ impl App {
             return;
         };
         let d = |value| scale(value, self.dpi);
+        if item.id == 0 {
+            data.itemHeight = d(9) as u32;
+            data.itemWidth = 0;
+            return;
+        }
         data.itemHeight = d(31) as u32;
         let dc = unsafe { GetDC(self.window) };
         if dc.is_null() {
             data.itemWidth = d(205) as u32;
             return;
         }
-        let text = wide(item.label.replace('&', ""));
-        let mut extent = unsafe { zeroed() };
+        let (label, shortcut) = item.label.split_once('\t').unwrap_or((&item.label, ""));
+        let width = |value: &str| {
+            let text = wide(value.replace("&&", "&"));
+            let mut extent = unsafe { zeroed() };
+            unsafe {
+                GetTextExtentPoint32W(dc, text.as_ptr(), text.len() as i32 - 1, &mut extent);
+            }
+            extent.cx
+        };
+        let previous = unsafe { SelectObject(dc, self.fonts[0]) };
+        let shortcut = if shortcut.is_empty() {
+            0
+        } else {
+            width(shortcut) + d(23)
+        };
+        data.itemWidth = (width(label) + d(60) + shortcut).clamp(d(190), d(482)) as u32;
         unsafe {
-            let previous = SelectObject(dc, self.fonts[0]);
-            GetTextExtentPoint32W(dc, text.as_ptr(), text.len() as i32 - 1, &mut extent);
             SelectObject(dc, previous);
             ReleaseDC(self.window, dc);
         }
-        let shortcut = if item.label.contains('\t') { d(82) } else { 0 };
-        data.itemWidth = (extent.cx + d(45) + shortcut).clamp(d(158), d(482)) as u32;
     }
 
     fn draw_menu(&self, draw: &DRAWITEMSTRUCT) {
@@ -1768,6 +1825,20 @@ impl App {
         let dc = draw.hDC;
         let d = |value| scale(value, self.dpi);
         fill(dc, &r, self.colors.chrome);
+        if item.id == 0 {
+            let y = (r.top + r.bottom) / 2;
+            fill(
+                dc,
+                &RECT {
+                    left: r.left + d(10),
+                    right: r.right - d(10),
+                    top: y,
+                    bottom: y + 1,
+                },
+                self.colors.edge,
+            );
+            return;
+        }
         if draw.itemState & ODS_SELECTED != 0 && item.enabled {
             rounded_fill(
                 dc,
@@ -1788,22 +1859,43 @@ impl App {
             self.colors.muted
         };
         let flags = DT_SINGLELINE | DT_VCENTER;
-        if item.checked {
-            text_at(
+        let scale_icon = d(16);
+        let icon_y = (r.top + r.bottom - scale_icon) / 2;
+        if let Some(glyph) = if item.checked {
+            Some(Glyph::Check)
+        } else {
+            item.glyph()
+        } {
+            let icon_color = if !item.enabled {
+                self.colors.muted
+            } else if matches!(
+                item.id,
+                VIEW | SORT | GROUP_SUBMENU | NEW | RENAME | REFRESH | RECYCLE_RESTORE
+            ) || item.checked
+            {
+                self.colors.accent
+            } else {
+                self.colors.text
+            };
+            draw_glyph(dc, glyph, r.left + d(11), icon_y, scale_icon, icon_color);
+        }
+        if item.submenu && self.colors.dark {
+            let middle = (r.top + r.bottom) / 2;
+            rounded_fill(
                 dc,
-                "\u{2022}",
-                RECT {
-                    left: r.left + d(11),
-                    ..r
+                &RECT {
+                    left: r.right - d(16),
+                    right: r.right - d(5),
+                    top: middle - d(6),
+                    bottom: middle + d(6),
                 },
-                self.fonts[1],
-                self.colors.accent,
-                flags,
+                d(3),
+                rgb(131, 128, 145),
             );
         }
         let text = RECT {
-            left: r.left + d(29),
-            right: r.right - d(12),
+            left: r.left + d(38),
+            right: r.right - d(15),
             ..r
         };
         text_at(
@@ -2106,6 +2198,8 @@ impl App {
             self.update_preview();
             self.rows.clear();
             self.visible.clear();
+            self.group_headers.clear();
+            unsafe { KillTimer(self.window, GROUP_TIMER) };
             self.set_count();
             self.edit = None;
             self.update_navigation();
@@ -2139,7 +2233,7 @@ impl App {
                 id: self.id,
                 location: self.location().clone(),
                 hidden: self.settings.hidden,
-                sort: self.tab().sort,
+                sort: self.sort(),
                 pins: self.settings.pins.clone(),
             });
         }
@@ -2192,21 +2286,7 @@ impl App {
                     self.status();
                 }
                 Event::Scan(ScanEvent::Done(id, rows, error)) if id == self.id => {
-                    let selected = self
-                        .selected_indices()
-                        .into_iter()
-                        .filter_map(|index| self.entry(index))
-                        .map(|entry| entry.path.clone())
-                        .collect::<std::collections::HashSet<_>>();
-                    let focused = usize::try_from(send(
-                        self.list,
-                        LVM_GETNEXTITEM,
-                        usize::MAX,
-                        LVNI_FOCUSED as isize,
-                    ))
-                    .ok()
-                    .and_then(|index| self.entry(index))
-                    .map(|entry| entry.path.clone());
+                    let selection = self.list_selection();
                     self.clear_selection();
                     self.rows = rows;
                     self.error = error;
@@ -2214,31 +2294,7 @@ impl App {
                     self.keep_rows = false;
                     self.rebuild_visible();
                     self.update_drive_buttons();
-                    if focused.is_some() || !selected.is_empty() {
-                        for (index, &row) in self.visible.iter().enumerate() {
-                            let path = &self.rows[row].path;
-                            let mut flags = 0;
-                            if selected.contains(path) {
-                                flags |= LVIS_SELECTED;
-                            }
-                            if focused.as_ref() == Some(path) {
-                                flags |= LVIS_FOCUSED;
-                            }
-                            if flags != 0 {
-                                let state = LVITEMW {
-                                    state: flags,
-                                    stateMask: flags,
-                                    ..unsafe { zeroed() }
-                                };
-                                send(
-                                    self.list,
-                                    LVM_SETITEMSTATE,
-                                    index,
-                                    &state as *const _ as isize,
-                                );
-                            }
-                        }
-                    }
+                    self.restore_list_selection(selection);
                     self.update_preview();
                     self.status();
                     self.layout();
@@ -2253,9 +2309,11 @@ impl App {
                 Event::Boot(settings, places) => {
                     let listing_changed = match self.location() {
                         Location::Home => self.settings.pins != settings.pins,
-                        Location::Folder(_) | Location::Search { .. } => {
+                        Location::Folder(path) => {
                             self.settings.hidden != settings.hidden
+                                || self.settings.folder_order(path) != settings.folder_order(path)
                         }
+                        Location::Search { .. } => self.settings.hidden != settings.hidden,
                         Location::Computer | Location::Settings | Location::Namespace { .. } => {
                             false
                         }
@@ -2301,6 +2359,7 @@ impl App {
                     } else {
                         if view_changed {
                             self.update_view();
+                            self.rebuild_grouping();
                         }
                         if listing_changed {
                             self.reload(true);
@@ -2352,14 +2411,91 @@ impl App {
     fn rebuild_visible(&mut self) {
         let filter = self.tab().filter;
         self.visible.clear();
-        self.visible.extend(
-            self.rows
-                .iter()
-                .enumerate()
-                .filter(|(_, row)| filter.shows(row))
-                .map(|(index, _)| index),
-        );
+        self.group_headers.clear();
+        unsafe { KillTimer(self.window, GROUP_TIMER) };
+        let rows = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| filter.shows(row));
+        let groups = if !self.scanning && self.group_by() == GroupBy::DateModified {
+            DateGroups::current()
+        } else {
+            None
+        };
+        if let Some(groups) = groups {
+            unsafe { SetTimer(self.window, GROUP_TIMER, groups.next_day_ms(), None) };
+            let mut buckets: [_; DateGroup::ALL.len()] = std::array::from_fn(|_| Vec::new());
+            for (index, row) in rows {
+                buckets[groups.group(row.modified) as usize].push(index);
+            }
+            let mut order = DateGroup::ALL;
+            let sort = self.sort();
+            if sort.column == Column::Modified && !sort.descending {
+                order[..DateGroup::Unknown as usize].reverse();
+            }
+            for group in order {
+                let bucket = &buckets[group as usize];
+                if !bucket.is_empty() {
+                    self.group_headers.push((self.visible.len(), group));
+                    self.visible.push(usize::MAX);
+                    self.visible.extend_from_slice(bucket);
+                }
+            }
+        } else {
+            self.visible.extend(rows.map(|(index, _)| index));
+        }
         self.set_count();
+    }
+
+    fn rebuild_grouping(&mut self) {
+        let selection = self.list_selection();
+        self.clear_selection();
+        self.rebuild_visible();
+        self.restore_list_selection(selection);
+    }
+
+    fn group_header(&self, index: usize) -> Option<DateGroup> {
+        self.group_headers
+            .binary_search_by_key(&index, |&(row, _)| row)
+            .ok()
+            .map(|header| self.group_headers[header].1)
+    }
+
+    fn clear_group_selection(&self) {
+        if self.group_headers.is_empty() {
+            return;
+        }
+        let state = LVITEMW {
+            stateMask: LVIS_SELECTED | LVIS_FOCUSED,
+            ..unsafe { zeroed() }
+        };
+        for &(index, _) in &self.group_headers {
+            if send(self.list, LVM_GETITEMSTATE, index, state.stateMask as isize) != 0 {
+                send(
+                    self.list,
+                    LVM_SETITEMSTATE,
+                    index,
+                    &state as *const _ as LPARAM,
+                );
+            }
+        }
+        if self
+            .group_header(send(self.list, LVM_GETSELECTIONMARK, 0, 0) as usize)
+            .is_some()
+        {
+            let focused = send(
+                self.list,
+                LVM_GETNEXTITEM,
+                usize::MAX,
+                LVNI_FOCUSED as isize,
+            );
+            send(self.list, LVM_SETSELECTIONMARK, 0, focused);
+        }
+    }
+
+    fn visible_count(&self) -> usize {
+        self.visible.len() - self.group_headers.len()
     }
 
     fn entry(&self, index: usize) -> Option<&Entry> {
@@ -2371,33 +2507,104 @@ impl App {
 
     fn selected_indices(&self) -> Vec<usize> {
         let mut selected = Vec::new();
-        let mut index = -1;
-        loop {
-            index = send(
-                self.list,
-                LVM_GETNEXTITEM,
-                index as usize,
-                LVNI_SELECTED as isize,
-            );
-            if index < 0 {
-                return selected;
-            }
-            selected.push(index as usize);
+        let mut start = usize::MAX;
+        while let Some(index) = self.next_selected_index(start) {
+            selected.push(index);
+            start = index;
         }
+        selected
     }
 
     fn selection_count(&self) -> usize {
-        send(self.list, LVM_GETSELECTEDCOUNT, 0, 0).max(0) as usize
+        let count = send(self.list, LVM_GETSELECTEDCOUNT, 0, 0).max(0) as usize;
+        if count == 0 {
+            return 0;
+        }
+        let headers = self.group_headers.iter().filter(|&&(index, _)| {
+            send(self.list, LVM_GETITEMSTATE, index, LVIS_SELECTED as isize) != 0
+        });
+        count.saturating_sub(headers.count())
+    }
+
+    fn next_selected_index(&self, mut start: usize) -> Option<usize> {
+        loop {
+            let index = usize::try_from(send(
+                self.list,
+                LVM_GETNEXTITEM,
+                start,
+                LVNI_SELECTED as isize,
+            ))
+            .ok()?;
+            if self.group_header(index).is_none() {
+                return Some(index);
+            }
+            start = index;
+        }
+    }
+
+    fn list_selection(&self) -> ListSelection {
+        let path_at = |row| {
+            usize::try_from(row)
+                .ok()
+                .and_then(|index| self.entry(index))
+                .map(|entry| entry.path.clone())
+        };
+        ListSelection {
+            paths: self
+                .selected_indices()
+                .into_iter()
+                .filter_map(|index| self.entry(index))
+                .map(|entry| entry.path.clone())
+                .collect(),
+            focused: path_at(send(
+                self.list,
+                LVM_GETNEXTITEM,
+                usize::MAX,
+                LVNI_FOCUSED as isize,
+            )),
+            anchor: path_at(send(self.list, LVM_GETSELECTIONMARK, 0, 0)),
+        }
+    }
+
+    fn restore_list_selection(&self, selection: ListSelection) {
+        let mut anchor = -1;
+        if selection.focused.is_some() || selection.anchor.is_some() || !selection.paths.is_empty()
+        {
+            for (index, &row) in self.visible.iter().enumerate() {
+                let Some(entry) = self.rows.get(row) else {
+                    continue;
+                };
+                let path = &entry.path;
+                if selection.anchor.as_ref() == Some(path) {
+                    anchor = index as isize;
+                }
+                let mut flags = 0;
+                if selection.paths.contains(path) {
+                    flags |= LVIS_SELECTED;
+                }
+                if selection.focused.as_ref() == Some(path) {
+                    flags |= LVIS_FOCUSED;
+                }
+                if flags != 0 {
+                    let state = LVITEMW {
+                        state: flags,
+                        stateMask: flags,
+                        ..unsafe { zeroed() }
+                    };
+                    send(
+                        self.list,
+                        LVM_SETITEMSTATE,
+                        index,
+                        &state as *const _ as isize,
+                    );
+                }
+            }
+        }
+        send(self.list, LVM_SETSELECTIONMARK, 0, anchor);
     }
 
     fn first_selected_index(&self) -> Option<usize> {
-        let index = send(
-            self.list,
-            LVM_GETNEXTITEM,
-            usize::MAX,
-            LVNI_SELECTED as isize,
-        );
-        usize::try_from(index).ok()
+        self.next_selected_index(usize::MAX)
     }
 
     fn first_selected(&self) -> Option<&Entry> {
@@ -2447,7 +2654,7 @@ impl App {
         let items = if home {
             self.home_quick_paths.len() + self.home_activity_paths.len()
         } else {
-            self.visible.len()
+            self.visible_count()
         };
         let count = if home { 0 } else { self.selection_count() };
         let summary = if self.scanning {
@@ -2950,6 +3157,29 @@ impl App {
             OPEN | OPEN_TAB | OPEN_WINDOW | OPEN_WITH | PROPERTIES | COPY_PATH | REVEAL => {
                 self.show_selected(id)
             }
+            OPEN_TERMINAL => {
+                let path = self
+                    .first_selected()
+                    .filter(|row| row.directory && row.shell_item.is_none())
+                    .map(|row| row.path.clone())
+                    .or_else(|| self.dest());
+                if let Some(path) = path {
+                    self.operation(Operation::Terminal(path));
+                }
+            }
+            FOLDER_PROPERTIES | FOLDER_COPY_PATH => {
+                if let Some(folder) = self.dest() {
+                    self.show_entry(
+                        if id == FOLDER_PROPERTIES {
+                            PROPERTIES
+                        } else {
+                            COPY_PATH
+                        },
+                        folder,
+                        true,
+                    );
+                }
+            }
             CUT | COPY => {
                 let paths = self.selected_paths();
                 if !paths.is_empty() {
@@ -3110,6 +3340,7 @@ impl App {
                     usize::MAX,
                     &state as *const _ as isize,
                 );
+                self.clear_group_selection();
                 self.status();
             }
             DETAILS => {
@@ -3144,7 +3375,11 @@ impl App {
                         }
                     }
                 }
+                let previous_group = self.group_by();
                 self.apply_view(mode);
+                if previous_group != self.group_by() {
+                    self.rebuild_grouping();
+                }
                 self.layout();
                 self.schedule_save();
             }
@@ -3162,7 +3397,7 @@ impl App {
                 self.schedule_save();
             }
             SORT_NAME | SORT_MODIFIED | SORT_KIND | SORT_SIZE | SORT_REVERSE => {
-                let sort = &mut self.tab_mut().sort;
+                let mut sort = self.sort();
                 let column = match id {
                     SORT_NAME => Column::Name,
                     SORT_MODIFIED => Column::Modified,
@@ -3173,12 +3408,32 @@ impl App {
                 if id == SORT_REVERSE || sort.column == column {
                     sort.descending = !sort.descending;
                 } else {
-                    *sort = Sort {
+                    sort = Sort {
                         column,
-                        descending: false,
+                        descending: column == Column::Modified,
                     };
                 }
-                self.refresh();
+                if let Some(path) = self.dest() {
+                    self.settings.folder_orders.entry(path).or_default().sort = sort;
+                    self.schedule_save();
+                } else {
+                    self.tab_mut().sort = sort;
+                }
+                unsafe { InvalidateRect(self.header, null(), 0) };
+                self.reload(true);
+            }
+            GROUP_NONE | GROUP_MODIFIED => {
+                if let Some(path) = self.dest() {
+                    self.settings.folder_orders.entry(path).or_default().group = if id == GROUP_NONE
+                    {
+                        GroupBy::None
+                    } else {
+                        GroupBy::DateModified
+                    };
+                    self.rebuild_grouping();
+                    self.status();
+                    self.schedule_save();
+                }
             }
             HOME_RECENT | HOME_FAVORITES => {
                 self.home_activity = if id == HOME_RECENT {
@@ -3369,6 +3624,8 @@ struct MenuItem {
     label: String,
     enabled: bool,
     checked: bool,
+    submenu: bool,
+    children: Vec<MenuItem>,
 }
 
 impl MenuItem {
@@ -3378,6 +3635,8 @@ impl MenuItem {
             label: label.into(),
             enabled: true,
             checked: false,
+            submenu: false,
+            children: Vec::new(),
         }
     }
     fn checked(mut self, value: bool) -> Self {
@@ -3391,6 +3650,41 @@ impl MenuItem {
     fn separator() -> Self {
         Self::new(0, "")
     }
+
+    fn submenu(id: u16, label: &str, children: Vec<Self>) -> Self {
+        let mut item = Self::new(id, label);
+        item.submenu = !children.is_empty();
+        item.children = children;
+        item
+    }
+
+    fn glyph(&self) -> Option<Glyph> {
+        Some(match self.id {
+            VIEW => Glyph::View,
+            SORT => Glyph::Sort,
+            GROUP_SUBMENU => Glyph::Details,
+            REFRESH => Glyph::Refresh,
+            NEW => Glyph::Add,
+            NEW_FOLDER => Glyph::Folder,
+            NEW_TEXT => Glyph::Document,
+            OPEN => Glyph::Forward,
+            OPEN_TAB => Glyph::Add,
+            OPEN_WINDOW | REVEAL => Glyph::Restore,
+            OPEN_WITH => Glyph::Document,
+            OPEN_TERMINAL => Glyph::Terminal,
+            CUT => Glyph::Cut,
+            COPY => Glyph::Copy,
+            PASTE => Glyph::Paste,
+            RENAME => Glyph::Rename,
+            DELETE | RECYCLE_EMPTY => Glyph::Delete,
+            SHORTCUT | COPY_PATH | FOLDER_COPY_PATH => Glyph::Link,
+            PIN | FAVORITE => Glyph::Pin,
+            COMPRESS | EXTRACT => Glyph::Archive,
+            PROPERTIES | FOLDER_PROPERTIES => Glyph::Settings,
+            RECYCLE_RESTORE => Glyph::Restore,
+            _ => return None,
+        })
+    }
 }
 
 impl App {
@@ -3403,7 +3697,7 @@ impl App {
                 item(NEW_TEXT, "Text Document"),
             ],
             SORT => {
-                let sort = self.tab().sort;
+                let sort = self.sort();
                 vec![
                     item(SORT_NAME, "Name").checked(sort.column == Column::Name),
                     item(SORT_MODIFIED, self.column_label(1))
@@ -3576,8 +3870,36 @@ impl App {
                             ]
                         };
                     }
-                    let mut items = vec![item(OPEN, "Open\tEnter")];
-                    if !entry.directory && count == 1 {
+                    let mut items = vec![item(OPEN, "Open\tEnter").enabled(count == 1)];
+                    if entry.directory {
+                        items.push(item(OPEN_TAB, "Open in new tab").enabled(count == 1));
+                        items.push(item(OPEN_WINDOW, "Open in new window").enabled(count == 1));
+                        items.push(item(OPEN_TERMINAL, "Open in Terminal").enabled(count == 1));
+                    } else {
+                        items.push(item(OPEN_WITH, "Open with…").enabled(count == 1));
+                    }
+                    items.extend([
+                        line(),
+                        item(CUT, "Cut\tCtrl+X").enabled(!entry.location),
+                        item(COPY, "Copy\tCtrl+C").enabled(!entry.location),
+                        item(RENAME, "Rename\tF2").enabled(!entry.location && count == 1),
+                        item(DELETE, "Delete\tDel").enabled(!entry.location),
+                        item(COPY_PATH, "Copy as path").enabled(count == 1),
+                        line(),
+                    ]);
+                    if entry.directory {
+                        items.push(
+                            item(
+                                PIN,
+                                if self.settings.pins.contains(&entry.path) {
+                                    "Unpin folder"
+                                } else {
+                                    "Pin folder"
+                                },
+                            )
+                            .enabled(count == 1),
+                        );
+                    } else if count == 1 {
                         items.push(item(
                             FAVORITE,
                             if self.settings.favorites.contains(&entry.path) {
@@ -3587,20 +3909,6 @@ impl App {
                             },
                         ));
                     }
-                    if entry.directory {
-                        items.push(item(OPEN_TAB, "Open in new tab"));
-                        items.push(item(OPEN_WINDOW, "Open in new window"));
-                        items.push(item(
-                            PIN,
-                            if self.settings.pins.contains(&entry.path) {
-                                "Unpin folder"
-                            } else {
-                                "Pin folder"
-                            },
-                        ));
-                    } else {
-                        items.push(item(OPEN_WITH, "Open with"));
-                    }
                     if !entry.location && self.dest().is_some() {
                         items.push(item(COMPRESS, "Compress to ZIP…"));
                     }
@@ -3608,29 +3916,41 @@ impl App {
                         items.push(item(EXTRACT, "Extract all…"));
                     }
                     items.extend([
-                        line(),
-                        item(CUT, "Cut\tCtrl+X").enabled(!entry.location),
-                        item(COPY, "Copy\tCtrl+C").enabled(!entry.location),
-                        item(COPY_PATH, "Copy as path"),
-                        item(PASTE, "Paste\tCtrl+V").enabled(self.dest().is_some()),
-                        item(RENAME, "Rename\tF2").enabled(!entry.location && count == 1),
-                        item(DELETE, "Delete\tDel").enabled(!entry.location),
-                        line(),
                         item(SHORTCUT, "Create shortcut…")
                             .enabled(count == 1 && self.dest().is_some()),
-                        item(REVEAL, "Show in Windows File Explorer"),
-                        item(PROPERTIES, "Properties\tAlt+Enter"),
+                        line(),
+                        item(REVEAL, "Show in Windows File Explorer").enabled(count == 1),
+                        item(PROPERTIES, "Properties\tAlt+Enter").enabled(count == 1),
                     ]);
                     items
                 } else {
-                    let folder = self.dest().is_some();
-                    vec![
-                        item(NEW_FOLDER, "New folder").enabled(folder),
-                        item(NEW_TEXT, "New text document").enabled(folder),
-                        item(PASTE, "Paste\tCtrl+V").enabled(folder),
+                    let destination = self.dest().is_some();
+                    let paste = destination && shell::has_file_clipboard();
+                    let mut items = vec![
+                        MenuItem::submenu(VIEW, "View", self.menu(VIEW)),
+                        MenuItem::submenu(SORT, "Sort by", self.menu(SORT)),
+                    ];
+                    let groups = self.group_menu();
+                    if !groups.is_empty() {
+                        items.push(MenuItem::submenu(GROUP_SUBMENU, "Group by", groups));
+                    }
+                    items.extend([
                         item(REFRESH, "Refresh\tF5"),
-                        item(PIN, "Pin or unpin current folder").enabled(folder),
-                    ]
+                        line(),
+                        item(PASTE, "Paste\tCtrl+V").enabled(paste),
+                        MenuItem::submenu(NEW, "New", self.menu(NEW)).enabled(destination),
+                    ]);
+                    if destination {
+                        items.extend([
+                            line(),
+                            item(OPEN_TERMINAL, "Open in Terminal"),
+                            item(FOLDER_COPY_PATH, "Copy folder path"),
+                            item(PIN, "Pin or unpin current folder"),
+                            line(),
+                            item(FOLDER_PROPERTIES, "Properties"),
+                        ]);
+                    }
+                    items
                 }
             }
             _ => Vec::new(),
@@ -3928,7 +4248,7 @@ impl App {
         let bounds = rect(header);
         let d = |v| scale(v, self.dpi);
         fill(dc, &bounds, self.colors.sidebar);
-        let sort = self.tab().sort;
+        let sort = self.sort();
         for index in 0..COLUMNS.len() {
             let label = self.column_label(index);
             let mut r: RECT = unsafe { zeroed() };
@@ -4018,6 +4338,57 @@ impl App {
             return 0;
         }
         match header.code {
+            NM_CUSTOMDRAW if !self.group_headers.is_empty() => {
+                let draw = unsafe { &*(notification as *const NMLVCUSTOMDRAW) };
+                if draw.nmcd.dwDrawStage == CDDS_PREPAINT {
+                    return CDRF_NOTIFYITEMDRAW as LRESULT;
+                }
+                if draw.nmcd.dwDrawStage == CDDS_ITEMPREPAINT {
+                    if let Some(group) = self.group_header(draw.nmcd.dwItemSpec) {
+                        let mut bounds: RECT = unsafe { zeroed() };
+                        if send(
+                            self.list,
+                            LVM_GETITEMRECT,
+                            draw.nmcd.dwItemSpec,
+                            &mut bounds as *mut _ as LPARAM,
+                        ) != 0
+                        {
+                            let width = rect(self.list).right;
+                            bounds.left = scale(8, self.dpi);
+                            bounds.right = width - bounds.left;
+                            let row = RECT {
+                                left: 0,
+                                right: width,
+                                ..bounds
+                            };
+                            let dc = draw.nmcd.hdc;
+                            fill(dc, &row, self.colors.content);
+                            fill(
+                                dc,
+                                &RECT {
+                                    top: bounds.bottom - 1,
+                                    ..bounds
+                                },
+                                self.colors.edge,
+                            );
+                            let color = if self.colors.contrast {
+                                self.colors.text
+                            } else {
+                                self.colors.accent
+                            };
+                            text_at(
+                                dc,
+                                group.label(),
+                                bounds,
+                                self.fonts[1],
+                                color,
+                                DT_SINGLELINE | DT_VCENTER | DT_LEFT,
+                            );
+                        }
+                        return CDRF_SKIPDEFAULT as LRESULT;
+                    }
+                }
+            }
             LVN_GETDISPINFOW => {
                 let display = unsafe { &mut *(notification as *mut NMLVDISPINFOW) };
                 let item = &mut display.item;
@@ -4060,6 +4431,23 @@ impl App {
                             *item.pszText.add(count) = 0;
                         }
                     }
+                } else if let Some(group) = self.group_header(item.iItem as usize) {
+                    if item.mask & LVIF_IMAGE != 0 {
+                        item.iImage = I_IMAGENONE;
+                    }
+                    if item.mask & LVIF_TEXT != 0 && !item.pszText.is_null() && item.cchTextMax > 0
+                    {
+                        let label = wide(if item.iSubItem == 0 {
+                            group.label()
+                        } else {
+                            ""
+                        });
+                        let count = (label.len() - 1).min(item.cchTextMax as usize - 1);
+                        unsafe {
+                            copy_nonoverlapping(label.as_ptr(), item.pszText, count);
+                            *item.pszText.add(count) = 0;
+                        }
+                    }
                 }
             }
             LVN_ITEMCHANGED | LVN_ODSTATECHANGED => {
@@ -4078,8 +4466,24 @@ impl App {
             }
             NM_RCLICK => {
                 let event = unsafe { &*(notification as *const NMITEMACTIVATE) };
-                if event.iItem < 0 {
+                if self.entry(event.iItem as usize).is_none() {
                     self.clear_selection();
+                } else {
+                    let index = event.iItem as usize;
+                    if send(self.list, LVM_GETITEMSTATE, index, LVIS_SELECTED as isize) == 0 {
+                        self.clear_selection();
+                        let selected = LVITEMW {
+                            state: LVIS_SELECTED | LVIS_FOCUSED,
+                            stateMask: LVIS_SELECTED | LVIS_FOCUSED,
+                            ..unsafe { zeroed() }
+                        };
+                        send(
+                            self.list,
+                            LVM_SETITEMSTATE,
+                            index,
+                            &selected as *const _ as LPARAM,
+                        );
+                    }
                 }
                 let mut point = event.ptAction;
                 unsafe {
@@ -4104,14 +4508,132 @@ impl App {
     }
 }
 
+struct PopupMenu(HMENU);
+
+impl PopupMenu {
+    fn new() -> Option<Self> {
+        let handle = unsafe { CreatePopupMenu() };
+        (!handle.is_null()).then_some(Self(handle))
+    }
+
+    fn append(&self, items: Vec<MenuItem>, painted: bool, rows: &mut Vec<MenuItem>) {
+        for (index, mut item) in items.into_iter().enumerate() {
+            let children = std::mem::take(&mut item.children);
+            let child = if children.is_empty() {
+                None
+            } else {
+                let Some(menu) = Self::new() else {
+                    continue;
+                };
+                menu.append(children, painted, rows);
+                Some(menu)
+            };
+            let mut label = wide(&item.label);
+            let info = MENUITEMINFOW {
+                cbSize: size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_FTYPE
+                    | MIIM_STATE
+                    | MIIM_STRING
+                    | MIIM_ID
+                    | MIIM_DATA
+                    | if child.is_some() { MIIM_SUBMENU } else { 0 },
+                fType: (if painted { MFT_OWNERDRAW } else { MFT_STRING })
+                    | if item.id == 0 { MFT_SEPARATOR } else { 0 },
+                fState: (if item.enabled && item.id != 0 {
+                    MFS_ENABLED
+                } else {
+                    MFS_DISABLED
+                }) | if item.checked {
+                    MFS_CHECKED
+                } else {
+                    MFS_UNCHECKED
+                },
+                wID: item.id as u32,
+                dwItemData: rows.len(),
+                dwTypeData: label.as_mut_ptr(),
+                hSubMenu: child.as_ref().map_or(null_mut(), |menu| menu.0),
+                ..unsafe { zeroed() }
+            };
+            if unsafe { InsertMenuItemW(self.0, index as u32, 1, &info) } != 0 {
+                if let Some(menu) = child {
+                    // The parent now owns the submenu.
+                    std::mem::forget(menu);
+                }
+                rows.push(item);
+            }
+        }
+    }
+}
+
+impl Drop for PopupMenu {
+    fn drop(&mut self) {
+        unsafe {
+            DestroyMenu(self.0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod context_menu_tests {
+    use super::*;
+
+    #[test]
+    fn native_menu_keeps_direct_commands_and_nested_commands_addressable() {
+        for painted in [false, true] {
+            let menu = PopupMenu::new().expect("create native test menu");
+            let mut rows = Vec::new();
+            menu.append(
+                vec![
+                    MenuItem::new(RENAME, "Rename\tF2"),
+                    MenuItem::separator(),
+                    MenuItem::submenu(NEW, "New", vec![MenuItem::new(NEW_FOLDER, "Folder")]),
+                ],
+                painted,
+                &mut rows,
+            );
+            unsafe {
+                assert_eq!(GetMenuItemCount(menu.0), 3);
+                assert_eq!(GetMenuItemID(menu.0, 0), RENAME as u32);
+                let mut separator = MENUITEMINFOW {
+                    cbSize: size_of::<MENUITEMINFOW>() as u32,
+                    fMask: MIIM_FTYPE,
+                    ..zeroed()
+                };
+                assert_ne!(GetMenuItemInfoW(menu.0, 1, 1, &mut separator), 0);
+                assert_ne!(separator.fType & MFT_SEPARATOR, 0);
+                let new_menu = GetSubMenu(menu.0, 2);
+                assert!(!new_menu.is_null());
+                assert_eq!(GetMenuItemID(new_menu, 0), NEW_FOLDER as u32);
+                let mut info = MENUITEMINFOW {
+                    cbSize: size_of::<MENUITEMINFOW>() as u32,
+                    fMask: MIIM_DATA | MIIM_FTYPE,
+                    ..zeroed()
+                };
+                assert_ne!(GetMenuItemInfoW(new_menu, 0, 1, &mut info), 0);
+                assert_eq!(rows[info.dwItemData].id, NEW_FOLDER);
+                assert_eq!(info.fType, if painted { MFT_OWNERDRAW } else { MFT_STRING });
+            }
+        }
+    }
+}
+
 fn show_menu(app: &RefCell<App>, id: u16, coordinates: LPARAM) {
     let Ok(mut state) = app.try_borrow_mut() else {
         return;
     };
     let items = state.menu(id);
-    let painted = state.colors.dark && !state.colors.contrast;
+    let painted = !state.colors.contrast;
     let menu_color = state.colors.chrome;
+    let dark_border = (state.colors.dark && painted).then_some(state.colors.edge);
     let window = state.window;
+    let selected_targets = |state: &App| {
+        state
+            .selected_indices()
+            .into_iter()
+            .filter_map(|index| state.entry(index).map(|row| row.path.clone()))
+            .collect::<std::collections::HashSet<_>>()
+    };
+    let target = (id == CONTEXT).then(|| (state.location().clone(), selected_targets(&state)));
     let mut anchor: POINT = unsafe { zeroed() };
     unsafe {
         if id == CONTEXT {
@@ -4155,10 +4677,9 @@ fn show_menu(app: &RefCell<App>, id: u16, coordinates: LPARAM) {
         return;
     }
     unsafe {
-        let menu = CreatePopupMenu();
-        if menu.is_null() {
+        let Some(menu) = PopupMenu::new() else {
             return;
-        }
+        };
         let brush = if painted {
             CreateSolidBrush(menu_color)
         } else {
@@ -4167,43 +4688,21 @@ fn show_menu(app: &RefCell<App>, id: u16, coordinates: LPARAM) {
         if !brush.is_null() {
             let info = MENUINFO {
                 cbSize: size_of::<MENUINFO>() as u32,
-                fMask: MIM_BACKGROUND,
+                fMask: MIM_BACKGROUND | MIM_APPLYTOSUBMENUS,
                 hbrBack: brush,
                 ..zeroed()
             };
-            SetMenuInfo(menu, &info);
+            let mut rows = Vec::new();
+            menu.append(items, painted, &mut rows);
+            SetMenuInfo(menu.0, &info);
+            app.borrow_mut().popup_items = rows;
+        } else {
+            let mut rows = Vec::new();
+            menu.append(items, false, &mut rows);
         }
-        for (index, item) in items.iter().enumerate() {
-            if item.id == 0 {
-                AppendMenuW(menu, MF_SEPARATOR, 0, null());
-            } else {
-                let mut label = wide(&item.label);
-                let info = MENUITEMINFOW {
-                    cbSize: size_of::<MENUITEMINFOW>() as u32,
-                    fMask: MIIM_FTYPE | MIIM_STATE | MIIM_STRING | MIIM_ID | MIIM_DATA,
-                    fType: if painted { MFT_OWNERDRAW } else { MFT_STRING },
-                    fState: (if item.enabled {
-                        MFS_ENABLED
-                    } else {
-                        MFS_DISABLED
-                    }) | if item.checked {
-                        MFS_CHECKED
-                    } else {
-                        MFS_UNCHECKED
-                    },
-                    wID: item.id as u32,
-                    dwItemData: index,
-                    dwTypeData: label.as_mut_ptr(),
-                    ..zeroed()
-                };
-                InsertMenuItemW(menu, index as u32, 1, &info);
-            }
-        }
-        if painted {
-            app.borrow_mut().popup_items = items;
-        }
+        let border = dark_border.map(PopupBorder::apply);
         let selected = TrackPopupMenu(
-            menu,
+            menu.0,
             TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
             anchor.x,
             anchor.y,
@@ -4211,7 +4710,8 @@ fn show_menu(app: &RefCell<App>, id: u16, coordinates: LPARAM) {
             window,
             null(),
         );
-        DestroyMenu(menu);
+        drop(border);
+        drop(menu);
         if painted {
             app.borrow_mut().popup_items.clear();
         }
@@ -4219,7 +4719,13 @@ fn show_menu(app: &RefCell<App>, id: u16, coordinates: LPARAM) {
             DeleteObject(brush);
         }
         if selected > 0 {
-            PostMessageW(window, WM_COMMAND, selected as usize, 0);
+            let mut state = app.borrow_mut();
+            let unchanged = target.is_none_or(|(location, paths)| {
+                state.location() == &location && selected_targets(&state) == paths
+            });
+            if unchanged {
+                state.command(selected as u16);
+            }
         }
     }
 }
@@ -4393,7 +4899,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
         if should_paint {
             benchmark::present(window);
             if let Ok(mut app) = cell.try_borrow_mut() {
-                let (rows, complete) = (app.visible.len(), !app.scanning);
+                let (rows, complete) = (app.visible_count(), !app.scanning);
                 if let Some(bench) = &mut app.bench {
                     bench.painted(rows, complete);
                     if complete {
@@ -4492,6 +4998,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
         }
         SELECTION_CHANGED => {
             app.selection_event = false;
+            app.clear_group_selection();
             app.note = None;
             app.update_preview();
             app.status();
@@ -4511,6 +5018,19 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
         }
         WM_TIMER if wp == SETTINGS_TIMER => {
             app.save();
+            0
+        }
+        WM_TIMER if wp == GROUP_TIMER => {
+            unsafe { KillTimer(window, GROUP_TIMER) };
+            if !app.scanning && app.group_by() == GroupBy::DateModified {
+                app.rebuild_grouping();
+            }
+            0
+        }
+        WM_TIMECHANGE => {
+            if !app.scanning && app.group_by() == GroupBy::DateModified {
+                app.rebuild_grouping();
+            }
             0
         }
         WM_PAINT => {
@@ -4726,6 +5246,72 @@ unsafe extern "system" fn button_proc(
     }
 }
 
+unsafe extern "system" fn group_list_proc(
+    window: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+    _: usize,
+    _: usize,
+) -> LRESULT {
+    unsafe {
+        let key = wp as u16;
+        let move_focus = msg == WM_KEYDOWN
+            && matches!(key, VK_UP | VK_DOWN | VK_HOME | VK_END | VK_PRIOR | VK_NEXT);
+        let click = matches!(msg, WM_LBUTTONDOWN | WM_LBUTTONDBLCLK);
+        if !move_focus && !click {
+            return DefSubclassProc(window, msg, wp, lp);
+        }
+        let pointer = GetWindowLongPtrW(GetParent(window), GWLP_USERDATA) as *const RefCell<App>;
+        if pointer.is_null() {
+            return DefSubclassProc(window, msg, wp, lp);
+        }
+        let app = &*pointer;
+        let grouped = app
+            .try_borrow()
+            .is_ok_and(|app| !app.group_headers.is_empty());
+        if !grouped {
+            return DefSubclassProc(window, msg, wp, lp);
+        }
+        if click {
+            let mut hit = LVHITTESTINFO {
+                pt: POINT {
+                    x: lp as i16 as i32,
+                    y: (lp >> 16) as i16 as i32,
+                },
+                ..zeroed()
+            };
+            let row = send(window, LVM_SUBITEMHITTEST, 0, &mut hit as *mut _ as LPARAM);
+            if app
+                .try_borrow()
+                .is_ok_and(|app| app.group_header(row as usize).is_some())
+            {
+                SetFocus(window);
+                return 0;
+            }
+        }
+        let result = DefSubclassProc(window, msg, wp, lp);
+        if move_focus {
+            let row = send(window, LVM_GETNEXTITEM, usize::MAX, LVNI_FOCUSED as isize);
+            if app
+                .try_borrow()
+                .is_ok_and(|app| app.group_header(row as usize).is_some())
+            {
+                let next = if row == 0 || matches!(key, VK_DOWN | VK_NEXT | VK_HOME) {
+                    VK_DOWN
+                } else {
+                    VK_UP
+                };
+                DefSubclassProc(window, WM_KEYDOWN, next as WPARAM, lp);
+            }
+            if let Ok(app) = app.try_borrow() {
+                app.clear_group_selection();
+            }
+        }
+        result
+    }
+}
+
 struct SettingsLease(windows_sys::Win32::Foundation::HANDLE);
 
 impl SettingsLease {
@@ -4831,6 +5417,7 @@ pub fn run(path: Option<PathBuf>) -> Result<(), std::io::Error> {
             if !app.header.is_null() {
                 SetWindowSubclass(app.header, Some(header_proc), 1, 0);
             }
+            SetWindowSubclass(app.list, Some(group_list_proc), 2, 0);
             for &(_, button) in &app.buttons {
                 SetWindowSubclass(button, Some(button_proc), 1, 0);
             }
@@ -4875,5 +5462,99 @@ pub fn run(path: Option<PathBuf>) -> Result<(), std::io::Error> {
             let _ = write_settings(&app.settings_snapshot());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+    use windows_sys::Win32::{
+        Foundation::FILETIME, System::SystemInformation::GetSystemTimeAsFileTime,
+    };
+
+    #[test]
+    fn keyboard_moves_across_date_headings_without_selecting_them() {
+        unsafe {
+            let controls = INITCOMMONCONTROLSEX {
+                dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
+                dwICC: ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES,
+            };
+            assert_ne!(InitCommonControlsEx(&controls), 0);
+            let window = CreateWindowExW(
+                0,
+                wide("Static").as_ptr(),
+                null(),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                900,
+                700,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null(),
+            );
+            assert!(!window.is_null());
+            let app = Box::new(RefCell::new(App::create(
+                window,
+                Some(r"C:\Example".into()),
+                false,
+            )));
+            SetWindowLongPtrW(
+                window,
+                GWLP_USERDATA,
+                (&*app as *const RefCell<App>) as isize,
+            );
+            let list = app.borrow().list;
+            assert_ne!(SetWindowSubclass(list, Some(group_list_proc), 2, 0), 0);
+
+            let mut now: FILETIME = zeroed();
+            GetSystemTimeAsFileTime(&mut now);
+            let now = u64::from(now.dwHighDateTime) << 32 | u64::from(now.dwLowDateTime);
+            let entry = |name: &str, directory, modified| {
+                Arc::new(Entry {
+                    path: PathBuf::from(name),
+                    name: wide(name),
+                    extension: Vec::new(),
+                    directory,
+                    size: 0,
+                    modified,
+                    location: false,
+                    capacity: None,
+                    shell_item: None,
+                })
+            };
+            {
+                let mut app = app.borrow_mut();
+                app.scanning = false;
+                app.rows = vec![
+                    entry("newer.txt", false, now),
+                    entry("older-folder", true, now - 1_728_000_000_000),
+                ];
+                app.rebuild_visible();
+                assert_eq!(app.visible_count(), 2);
+                assert_eq!(app.group_header(0), Some(DateGroup::Today));
+                assert!(app.group_header(2).is_some());
+            }
+            let selected = LVITEMW {
+                state: LVIS_SELECTED | LVIS_FOCUSED,
+                stateMask: LVIS_SELECTED | LVIS_FOCUSED,
+                ..zeroed()
+            };
+            send(list, LVM_SETITEMSTATE, 1, &selected as *const _ as LPARAM);
+            send(list, WM_KEYDOWN, VK_DOWN as WPARAM, 1);
+            {
+                let mut app = app.borrow_mut();
+                assert_eq!(app.first_selected().unwrap().label(), "older-folder");
+                assert_eq!(
+                    send(list, LVM_GETITEMSTATE, 2, selected.stateMask as LPARAM),
+                    0
+                );
+                app.command(GROUP_NONE);
+                assert_eq!(app.visible.len(), 2);
+                assert_eq!(app.first_selected().unwrap().label(), "older-folder");
+            }
+            DestroyWindow(window);
+        }
     }
 }

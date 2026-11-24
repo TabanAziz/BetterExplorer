@@ -173,9 +173,14 @@ pub struct Settings {
     pub favorites: Vec<PathBuf>,
     pub home_compact: bool,
     pub views: BTreeMap<PathBuf, u32>,
+    pub folder_orders: BTreeMap<PathBuf, FolderOrder>,
 }
 
 impl Settings {
+    pub fn folder_order(&self, path: &Path) -> FolderOrder {
+        self.folder_orders.get(path).copied().unwrap_or_default()
+    }
+
     pub fn record_recent(&mut self, path: PathBuf) {
         self.recent.retain(|entry| entry != &path);
         self.recent.insert(0, path);
@@ -193,6 +198,50 @@ impl Settings {
                 self.active = self.tabs.len();
             }
             self.tabs.push(location);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Column {
+    #[default]
+    Name,
+    Modified,
+    Kind,
+    Size,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sort {
+    pub column: Column,
+    pub descending: bool,
+}
+
+impl Sort {
+    pub const NEWEST_FIRST: Self = Self {
+        column: Column::Modified,
+        descending: true,
+    };
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GroupBy {
+    None,
+    #[default]
+    DateModified,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderOrder {
+    pub sort: Sort,
+    pub group: GroupBy,
+}
+
+impl Default for FolderOrder {
+    fn default() -> Self {
+        Self {
+            sort: Sort::NEWEST_FIRST,
+            group: GroupBy::DateModified,
         }
     }
 }

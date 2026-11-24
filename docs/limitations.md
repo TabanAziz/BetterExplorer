@@ -2,7 +2,7 @@
 
 - The command bar, breadcrumbs, file list and built-in actions use native Windows controls. BetterExplorer has its own visual styling. The interface is currently in English.
 - Network discovery depends on Windows. BetterExplorer lists folders configured in each library. Home shows files opened through BetterExplorer and favorites added from the file context menu. Gallery and Explorer's undo and redo history are pending.
-- The virtual list has Details, List and icon views. Grouped files and the Explorer Tiles and Content layouts are pending. File list icons are generic. The Details pane previews supported local images and text after selection.
+- The virtual list has Details, List and icon views. Date groups appear in Details. Explorer's folder Tiles and Content layouts are pending. File list icons are generic. The Details pane previews supported local images and text after selection.
 - Each file operation captures its target. A paste waiting in the queue may need to be repeated if another copy changes the clipboard before Windows starts it.
 - The app does not host arbitrary Shell context-menu extensions, sharing handlers or OneDrive sync overlays. Windows file associations and properties remain available. A separate menu action shows the item in Windows File Explorer.
 - Search matches file and folder names recursively, skips reparse points and may skip unreadable areas. It does not use Windows Search, search file contents or implement Advanced Query Syntax.

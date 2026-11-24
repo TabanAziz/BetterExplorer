@@ -33,10 +33,12 @@ use windows_sys::Win32::{
     System::{
         DataExchange::{
             CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber,
-            GetOpenClipboardWindow, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+            GetOpenClipboardWindow, IsClipboardFormatAvailable, OpenClipboard,
+            RegisterClipboardFormatW, SetClipboardData,
         },
         Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE},
         Ole::{CF_HDROP, CF_UNICODETEXT},
+        SystemInformation::GetSystemDirectoryW,
     },
     UI::{
         Shell::{
@@ -52,6 +54,7 @@ pub enum Operation {
     OpenWith(PathBuf),
     Properties(PathBuf),
     Reveal(PathBuf),
+    Terminal(PathBuf),
     Recycle {
         keys: Vec<String>,
         restore: bool,
@@ -148,6 +151,7 @@ pub fn run(owner: usize, operation: Operation) -> Result<String, String> {
         }
         Operation::Properties(path) => execute(owner, "properties", path.as_os_str(), None),
         Operation::Reveal(path) => reveal(owner, &path),
+        Operation::Terminal(path) => open_terminal(&path),
         Operation::Recycle { keys, restore } => {
             crate::namespace::recycle_action(&keys, restore, owner.0 as usize)
         }
@@ -219,6 +223,26 @@ pub fn run(owner: usize, operation: Operation) -> Result<String, String> {
         }
     };
     result.map(|()| String::new())
+}
+
+pub fn has_file_clipboard() -> bool {
+    unsafe { IsClipboardFormatAvailable(CF_HDROP as u32) != 0 }
+}
+
+fn open_terminal(folder: &Path) -> Result<(), String> {
+    let mut system = [0u16; 260];
+    let length = unsafe { GetSystemDirectoryW(system.as_mut_ptr(), system.len() as u32) } as usize;
+    if length == 0 || length >= system.len() {
+        return Err("Windows could not locate its terminal executable.".into());
+    }
+    let executable =
+        PathBuf::from(from_wide(&system[..length])).join(r"WindowsPowerShell\v1.0\powershell.exe");
+    std::process::Command::new(executable)
+        .arg("-NoLogo")
+        .current_dir(folder)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Can't open Terminal: {error}"))
 }
 
 fn execute(owner: HWND, verb: &str, path: &OsStr, params: Option<&OsStr>) -> Result<(), String> {

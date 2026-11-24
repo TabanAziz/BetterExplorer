@@ -3,7 +3,6 @@ use crate::{
     namespace,
 };
 use std::{
-    cmp::Ordering as Order,
     ffi::{OsStr, OsString},
     fs,
     os::windows::fs::MetadataExt,
@@ -28,27 +27,152 @@ use windows::{
 use windows_sys::Win32::{
     Foundation::{FILETIME, SYSTEMTIME},
     Storage::FileSystem::{
-        FileTimeToLocalFileTime, GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDriveStringsW,
-        GetVolumeInformationW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SYSTEM,
+        GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDriveStringsW, GetVolumeInformationW,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_ATTRIBUTE_SYSTEM,
     },
-    System::Time::FileTimeToSystemTime,
+    System::{
+        SystemInformation::{GetLocalTime, GetSystemTimeAsFileTime},
+        Time::{
+            FileTimeToSystemTime, SystemTimeToFileTime, SystemTimeToTzSpecificLocalTimeEx,
+            TzSpecificLocalTimeToSystemTimeEx,
+        },
+    },
     UI::Shell::StrCmpLogicalW,
 };
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Column {
-    #[default]
-    Name,
-    Modified,
-    Kind,
-    Size,
+pub use crate::model::{Column, Sort};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DateGroup {
+    Future,
+    Today,
+    Yesterday,
+    EarlierThisWeek,
+    LastWeek,
+    EarlierThisMonth,
+    LastMonth,
+    EarlierThisYear,
+    LongAgo,
+    Unknown,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Sort {
-    pub column: Column,
-    pub descending: bool,
+impl DateGroup {
+    pub const ALL: [Self; 10] = [
+        Self::Future,
+        Self::Today,
+        Self::Yesterday,
+        Self::EarlierThisWeek,
+        Self::LastWeek,
+        Self::EarlierThisMonth,
+        Self::LastMonth,
+        Self::EarlierThisYear,
+        Self::LongAgo,
+        Self::Unknown,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Future => "Future",
+            Self::Today => "Today",
+            Self::Yesterday => "Yesterday",
+            Self::EarlierThisWeek => "Earlier this week",
+            Self::LastWeek => "Last week",
+            Self::EarlierThisMonth => "Earlier this month",
+            Self::LastMonth => "Last month",
+            Self::EarlierThisYear => "Earlier this year",
+            Self::LongAgo => "A long time ago",
+            Self::Unknown => "Unspecified",
+        }
+    }
+}
+
+const DAY_TICKS: u64 = 864_000_000_000;
+
+fn system_time_ticks(time: &SYSTEMTIME) -> Option<u64> {
+    let mut file_time: FILETIME = unsafe { std::mem::zeroed() };
+    (unsafe { SystemTimeToFileTime(time, &mut file_time) } != 0)
+        .then_some(u64::from(file_time.dwHighDateTime) << 32 | u64::from(file_time.dwLowDateTime))
+}
+
+fn ticks_system_time(ticks: u64) -> Option<SYSTEMTIME> {
+    let mut time = unsafe { std::mem::zeroed() };
+    let file_time = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    (unsafe { FileTimeToSystemTime(&file_time, &mut time) } != 0).then_some(time)
+}
+
+pub struct DateGroups([u64; 8]);
+
+impl DateGroups {
+    pub fn current() -> Option<Self> {
+        let mut now = unsafe { std::mem::zeroed() };
+        unsafe { GetLocalTime(&mut now) };
+        Self::for_local_date(now.wYear, now.wMonth, now.wDay)
+    }
+
+    fn for_local_date(year: u16, month: u16, day: u16) -> Option<Self> {
+        let local_date = |year, month, day| {
+            system_time_ticks(&SYSTEMTIME {
+                wYear: year,
+                wMonth: month,
+                wDay: day,
+                ..unsafe { std::mem::zeroed() }
+            })
+        };
+        let today = local_date(year, month, day)?;
+        // Windows FILETIME begins on a Monday. Work in local calendar days until
+        // converting each boundary to UTC, so daylight saving never shifts a day.
+        let monday = today - (today / DAY_TICKS % 7) * DAY_TICKS;
+        let (prior_year, prior_month) = if month == 1 {
+            (year - 1, 12)
+        } else {
+            (year, month - 1)
+        };
+        let boundaries = [
+            today + DAY_TICKS,
+            today,
+            today.saturating_sub(DAY_TICKS),
+            monday,
+            monday.saturating_sub(7 * DAY_TICKS),
+            local_date(year, month, 1)?,
+            local_date(prior_year, prior_month, 1)?,
+            local_date(year, 1, 1)?,
+        ];
+        let mut starts = [0; 8];
+        for (start, boundary) in starts.iter_mut().zip(boundaries) {
+            let local = ticks_system_time(boundary)?;
+            let mut utc = unsafe { std::mem::zeroed() };
+            if unsafe { TzSpecificLocalTimeToSystemTimeEx(std::ptr::null(), &local, &mut utc) } == 0
+            {
+                return None;
+            }
+            *start = system_time_ticks(&utc)?;
+        }
+        Some(Self(starts))
+    }
+
+    pub fn group(&self, modified: u64) -> DateGroup {
+        if modified == 0 {
+            return DateGroup::Unknown;
+        }
+        self.0
+            .iter()
+            .position(|&start| modified >= start)
+            .map_or(DateGroup::LongAgo, |index| DateGroup::ALL[index])
+    }
+
+    pub fn next_day_ms(&self) -> u32 {
+        let mut now: FILETIME = unsafe { std::mem::zeroed() };
+        unsafe { GetSystemTimeAsFileTime(&mut now) };
+        let now = u64::from(now.dwHighDateTime) << 32 | u64::from(now.dwLowDateTime);
+        self.0[0]
+            .saturating_sub(now)
+            .div_ceil(10_000)
+            .clamp(1_000, u64::from(u32::MAX)) as u32
+    }
 }
 
 #[derive(Debug)]
@@ -125,16 +249,11 @@ impl Entry {
         if self.modified == 0 {
             return String::new();
         }
-        let utc = FILETIME {
-            dwLowDateTime: self.modified as u32,
-            dwHighDateTime: (self.modified >> 32) as u32,
+        let Some(utc) = ticks_system_time(self.modified) else {
+            return String::new();
         };
-        let mut local = unsafe { std::mem::zeroed() };
         let mut date: SYSTEMTIME = unsafe { std::mem::zeroed() };
-        if unsafe {
-            FileTimeToLocalFileTime(&utc, &mut local) != 0
-                && FileTimeToSystemTime(&local, &mut date) != 0
-        } {
+        if unsafe { SystemTimeToTzSpecificLocalTimeEx(std::ptr::null(), &utc, &mut date) } != 0 {
             let SYSTEMTIME {
                 wYear: year,
                 wMonth: month,
@@ -184,7 +303,15 @@ pub enum ScanEvent {
 }
 
 pub fn sort_entries(entries: &mut [Arc<Entry>], sort: Sort) {
+    let folders_first = sort.column != Column::Modified;
+    sort_entries_with_folders(entries, sort, folders_first);
+}
+
+fn sort_entries_with_folders(entries: &mut [Arc<Entry>], sort: Sort, folders_first: bool) {
     entries.sort_unstable_by(|left, right| {
+        if folders_first && left.directory != right.directory {
+            return right.directory.cmp(&left.directory);
+        }
         let name_order =
             || unsafe { StrCmpLogicalW(left.name.as_ptr(), right.name.as_ptr()) }.cmp(&0);
         let field = match sort.column {
@@ -202,14 +329,10 @@ pub fn sort_entries(entries: &mut [Arc<Entry>], sort: Sort) {
             Column::Size => left.size.cmp(&right.size),
         }
         .then_with(name_order);
-        let field = if sort.descending {
+        if sort.descending {
             field.reverse()
         } else {
             field
-        };
-        match right.directory.cmp(&left.directory) {
-            Order::Equal => field,
-            order => order,
         }
     });
 }
@@ -321,6 +444,7 @@ pub fn scan(request: Request, latest: &AtomicU64, mut publish: impl FnMut(ScanEv
     }
     let mut entries = Vec::new();
     let mut error = None;
+    let file_system = matches!(location, Location::Folder(_) | Location::Search { .. });
     match location {
         Location::Settings => (),
         Location::Namespace { kind, child, .. } => {
@@ -393,7 +517,11 @@ pub fn scan(request: Request, latest: &AtomicU64, mut publish: impl FnMut(ScanEv
     if stale() {
         return;
     }
-    sort_entries(&mut entries, sort);
+    if file_system {
+        sort_entries(&mut entries, sort);
+    } else {
+        sort_entries_with_folders(&mut entries, sort, true);
+    }
     if !stale() {
         publish(ScanEvent::Done(id, entries, error));
     }
@@ -696,5 +824,68 @@ fn watch_loop(signal: Arc<WatchSignal>, changed: impl Fn(u64)) {
         unsafe {
             FindCloseChangeNotification(directory);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn modified_groups_follow_local_calendar_boundaries() {
+        let groups = DateGroups::for_local_date(2026, 11, 24).unwrap();
+        let modified = |month, day, hour, minute| {
+            let local = SYSTEMTIME {
+                wYear: 2026,
+                wMonth: month,
+                wDay: day,
+                wHour: hour,
+                wMinute: minute,
+                ..unsafe { std::mem::zeroed() }
+            };
+            let mut utc = unsafe { std::mem::zeroed() };
+            assert_ne!(
+                unsafe { TzSpecificLocalTimeToSystemTimeEx(std::ptr::null(), &local, &mut utc) },
+                0
+            );
+            system_time_ticks(&utc).unwrap()
+        };
+        assert_eq!(groups.group(modified(11, 24, 0, 0)), DateGroup::Today);
+        assert_eq!(groups.group(modified(11, 23, 23, 59)), DateGroup::Yesterday);
+        assert_eq!(
+            groups.group(modified(11, 11, 12, 0)),
+            DateGroup::EarlierThisMonth
+        );
+        assert_eq!(groups.group(modified(10, 21, 12, 0)), DateGroup::LastMonth);
+        assert_eq!(groups.group(0), DateGroup::Unknown);
+    }
+
+    #[test]
+    fn date_modified_sort_interleaves_folders_and_files() {
+        let entry = |name: &str, directory, modified| {
+            let mut entry = Entry::place(PathBuf::from(name), name);
+            entry.location = false;
+            entry.directory = directory;
+            entry.modified = modified;
+            Arc::new(entry)
+        };
+        let mut entries = [
+            entry("older.txt", false, 1),
+            entry("folder", true, 2),
+            entry("newer.txt", false, 3),
+        ];
+
+        sort_entries(
+            &mut entries,
+            Sort {
+                column: Column::Modified,
+                descending: true,
+            },
+        );
+
+        assert_eq!(
+            entries.map(|entry| entry.label()),
+            ["newer.txt", "folder", "older.txt"]
+        );
     }
 }

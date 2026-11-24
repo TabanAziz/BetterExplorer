@@ -96,8 +96,7 @@ fn entry_at_local_date(month: u16, day: u16) -> better_explorer::work::Entry {
     use better_explorer::work::Entry;
     use windows_sys::Win32::{
         Foundation::{FILETIME, SYSTEMTIME},
-        Storage::FileSystem::LocalFileTimeToFileTime,
-        System::Time::SystemTimeToFileTime,
+        System::Time::{SystemTimeToFileTime, TzSpecificLocalTimeToSystemTimeEx},
     };
     let date = SYSTEMTIME {
         wYear: 2026,
@@ -107,10 +106,13 @@ fn entry_at_local_date(month: u16, day: u16) -> better_explorer::work::Entry {
         wMinute: 5,
         ..unsafe { std::mem::zeroed() }
     };
-    let mut local: FILETIME = unsafe { std::mem::zeroed() };
+    let mut converted: SYSTEMTIME = unsafe { std::mem::zeroed() };
     let mut utc: FILETIME = unsafe { std::mem::zeroed() };
-    assert_ne!(unsafe { SystemTimeToFileTime(&date, &mut local) }, 0);
-    assert_ne!(unsafe { LocalFileTimeToFileTime(&local, &mut utc) }, 0);
+    assert_ne!(
+        unsafe { TzSpecificLocalTimeToSystemTimeEx(std::ptr::null(), &date, &mut converted) },
+        0
+    );
+    assert_ne!(unsafe { SystemTimeToFileTime(&converted, &mut utc) }, 0);
     Entry {
         path: "example.txt".into(),
         name: wide("example.txt"),
@@ -180,4 +182,36 @@ fn date_modified_sort_uses_timestamps_across_month_boundaries() {
         entries.map(|entry| entry.date(ModifiedDateFormat::DayMonthYear)),
         ["28.01.2026 17:05", "14.02.2026 17:05"]
     );
+}
+
+#[test]
+fn regular_folders_group_by_modified_date_until_overridden() {
+    use better_explorer::model::{FolderOrder, GroupBy, Settings};
+    use better_explorer::work::Column;
+    use std::path::Path;
+
+    let downloads = Path::new(r"C:\Users\Example\Downloads");
+    let projects = Path::new(r"C:\Projects");
+    let mut settings: Settings = serde_json::from_str(r#"{"details":true}"#).unwrap();
+    let projects_default = settings.folder_order(projects);
+    assert_eq!(projects_default.sort.column, Column::Modified);
+    assert!(projects_default.sort.descending);
+    assert_eq!(projects_default.group, GroupBy::DateModified);
+    assert_eq!(settings.folder_order(downloads), projects_default);
+
+    settings.folder_orders.insert(
+        downloads.into(),
+        FolderOrder {
+            sort: Sort {
+                column: Column::Name,
+                descending: false,
+            },
+            group: GroupBy::None,
+        },
+    );
+    let restored: Settings =
+        serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
+    assert_eq!(restored.folder_order(downloads).sort, Sort::default());
+    assert_eq!(restored.folder_order(downloads).group, GroupBy::None);
+    assert_eq!(restored.folder_order(projects), projects_default);
 }

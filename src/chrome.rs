@@ -1,6 +1,6 @@
 use better_explorer::model::{from_wide, wide, ThemePreference};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     ffi::OsString,
     mem::{size_of, zeroed},
@@ -18,6 +18,7 @@ use windows_sys::Win32::{
     System::{
         LibraryLoader::GetModuleHandleW,
         Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD},
+        Threading::GetCurrentThreadId,
     },
     UI::{
         Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
@@ -486,6 +487,11 @@ pub enum Glyph {
     Restore,
     Chevron,
     Settings,
+    Terminal,
+    Link,
+    Document,
+    Archive,
+    Check,
 }
 
 pub fn rounded_fill(dc: HDC, bounds: &RECT, radius: i32, color: u32) {
@@ -506,6 +512,86 @@ pub fn rounded_fill(dc: HDC, bounds: &RECT, radius: i32, color: u32) {
         SelectObject(dc, old_brush);
         DeleteObject(brush);
     }
+}
+
+thread_local! {
+    static POPUP_BORDER: Cell<Option<u32>> = const { Cell::new(None) };
+}
+
+pub struct PopupBorder {
+    hook: HHOOK,
+    previous: Option<u32>,
+}
+
+impl PopupBorder {
+    pub fn apply(color: u32) -> Self {
+        let previous = POPUP_BORDER.replace(Some(color));
+        let hook = unsafe {
+            SetWindowsHookExW(
+                WH_CALLWNDPROCRET,
+                Some(paint_popup_border),
+                null_mut(),
+                GetCurrentThreadId(),
+            )
+        };
+        Self { hook, previous }
+    }
+}
+
+impl Drop for PopupBorder {
+    fn drop(&mut self) {
+        if !self.hook.is_null() {
+            unsafe {
+                UnhookWindowsHookEx(self.hook);
+            }
+        }
+        POPUP_BORDER.set(self.previous);
+    }
+}
+
+// A menu's non-client frame is painted by Windows after the owner draws its rows.
+// Repaint only menu windows on this UI thread, including native submenus.
+unsafe extern "system" fn paint_popup_border(code: i32, wp: WPARAM, lp: LPARAM) -> isize {
+    if code >= 0 && lp != 0 {
+        let event = unsafe { &*(lp as *const CWPRETSTRUCT) };
+        let printing = event.message == WM_PRINT && event.lParam as i32 & PRF_NONCLIENT != 0;
+        if printing || matches!(event.message, WM_PAINT | WM_NCPAINT) {
+            let mut class = [0u16; 8];
+            let length =
+                unsafe { GetClassNameW(event.hwnd, class.as_mut_ptr(), class.len() as i32) };
+            if length == 6 && class[..6].iter().copied().eq("#32768".encode_utf16()) {
+                if let Some(color) = POPUP_BORDER.get() {
+                    let mut rect: RECT = unsafe { zeroed() };
+                    if unsafe { GetWindowRect(event.hwnd, &mut rect) } != 0 {
+                        let rect = RECT {
+                            left: 0,
+                            top: 0,
+                            right: rect.right - rect.left,
+                            bottom: rect.bottom - rect.top,
+                        };
+                        let dc = if printing {
+                            event.wParam as HDC
+                        } else {
+                            unsafe { GetWindowDC(event.hwnd) }
+                        };
+                        if !dc.is_null() {
+                            unsafe {
+                                let brush = CreateSolidBrush(color);
+                                if !brush.is_null() {
+                                    FrameRect(dc, &rect, brush);
+                                    DeleteObject(brush);
+                                }
+                                if !printing {
+                                    ReleaseDC(event.hwnd, dc);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    unsafe { CallNextHookEx(null_mut(), code, wp, lp) }
 }
 
 struct IconBitmap {
@@ -858,6 +944,28 @@ fn draw_glyph_shape(dc: HDC, glyph: Glyph, x: i32, y: i32, size: i32, color: u32
                 stroke(&[(5, 4), (5, 3), (13, 3), (13, 11), (12, 11)]);
             }
             Glyph::Chevron => stroke(&[(6, 4), (10, 8), (6, 12)]),
+            Glyph::Terminal => {
+                box_(1, 3, 15, 13);
+                stroke(&[(4, 6), (6, 8), (4, 10)]);
+                stroke(&[(8, 10), (12, 10)]);
+            }
+            Glyph::Link => {
+                stroke(&[(6, 5), (9, 2), (12, 2), (14, 4), (14, 7), (11, 10)]);
+                stroke(&[(10, 11), (7, 14), (4, 14), (2, 12), (2, 9), (5, 6)]);
+                stroke(&[(5, 11), (11, 5)]);
+            }
+            Glyph::Document => {
+                stroke(&[(4, 2), (10, 2), (13, 5), (13, 14), (4, 14), (4, 2)]);
+                stroke(&[(10, 2), (10, 5), (13, 5)]);
+                stroke(&[(6, 8), (11, 8)]);
+                stroke(&[(6, 11), (11, 11)]);
+            }
+            Glyph::Archive => {
+                box_(2, 6, 14, 14);
+                box_(1, 2, 15, 6);
+                stroke(&[(6, 9), (10, 9)]);
+            }
+            Glyph::Check => stroke(&[(3, 8), (7, 12), (14, 4)]),
         }
         SelectObject(dc, old_brush);
         SelectObject(dc, old);

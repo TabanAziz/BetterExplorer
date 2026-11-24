@@ -26,6 +26,8 @@ To remove the installed program, run Setup.exe from the extracted bundle with th
 - Ctrl+T and Ctrl+W manage tabs. Use More to reorder tabs and enable tab restoration.
 - Wheel scrolling eases toward the new position, including the first row at the upper edge.
 - View offers Details, List and four icon sizes. This PC shows available space on local fixed drives.
+- Folders open newest first, with files and subfolders together. Details groups entries by modification date. Use Sort by and Group by to change the folder preference.
+- Right-click an item to find actions such as Rename and Properties. Right-click empty space for View, Sort by, Group by, New and Open in Terminal.
 - Ctrl+F searches file and folder names below the current directory. Escape or **Stop search** cancels an active search.
 - The command bar and context menu handle copy, cut, paste, rename, Recycle Bin deletion, properties, shortcuts and ZIP files. Copy and move use Windows Shell dialogs.
 - The Details button shows metadata and previews supported local images and text files. Ctrl+Shift+N creates a folder.
