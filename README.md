@@ -21,6 +21,12 @@
 
 Part of the Better series with [Better Task Manager](https://github.com/TabanAziz/BetterTaskManager) and [BetterClipboard](https://github.com/TabanAziz/BetterClipboard).
 
+## Why BetterExplorer exists
+
+Finding a file in Windows File Explorer can take a frustratingly long time, especially in a large folder or a location outside the Windows search index. BetterExplorer is my take on the file manager Microsoft should have shipped with Windows 11. It keeps familiar file browsing and puts responsiveness first, including when a search takes time.
+
+BetterExplorer shows matches as they arrive and lets you stop a search whenever you need to. Home and This PC use the Windows index for filename searches. **Search all drives** can also reach readable folders outside that index and may take longer. The benchmarks below cover launch and folder browsing. Search timings and a head-to-head comparison with File Explorer are still pending.
+
 ## What you get
 
 | Feature | How it works |
