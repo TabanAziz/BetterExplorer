@@ -34,9 +34,9 @@ use windows_sys::Win32::{
     Globalization::{CompareStringOrdinal, CSTR_EQUAL},
     Storage::FileSystem::{
         FileIdInfo, FileRenameInfo, GetFileInformationByHandleEx, SetFileInformationByHandle,
-        DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
-        FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE,
+        DELETE, FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     },
 };
 
@@ -178,6 +178,7 @@ impl Recording {
         Some(
             ResultSink {
                 failure: None,
+                moved: None,
                 capture: Some(Observer {
                     capture,
                     changes: Arc::clone(&self.changes),
@@ -191,6 +192,83 @@ impl Recording {
         let label = self.label?;
         let changes = std::mem::take(&mut *self.changes.lock().unwrap());
         (!changes.is_empty()).then_some(Step { label, changes })
+    }
+
+    /// Rename ordinary local items by handle. The Shell handles the remainder if a rename
+    /// needs a conflict dialog, elevation, a different volume or special provider behavior.
+    pub(super) fn move_local(&mut self, paths: &[PathBuf], folder: &Path) -> usize {
+        if crate::work::network_path(folder) {
+            return 0;
+        }
+        let Ok(folder) = std::path::absolute(folder) else {
+            return 0;
+        };
+        let Ok(target) = OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&folder)
+        else {
+            return 0;
+        };
+        const SPECIAL: u32 = FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_OFFLINE;
+        if !target
+            .metadata()
+            .is_ok_and(|info| info.is_dir() && info.file_attributes() & SPECIAL == 0)
+        {
+            return 0;
+        }
+        let Ok(parent) = identity(&target) else {
+            return 0;
+        };
+        let mut moved = Vec::new();
+        for path in paths {
+            if crate::work::network_path(path) {
+                break;
+            }
+            let Ok(before) = Location::capture(path) else {
+                break;
+            };
+            let Some(name) = before.path.file_name() else {
+                break;
+            };
+            if before.parent == parent || before.parent.volume != parent.volume {
+                break;
+            }
+            let Ok(file) = open(&before.path, DELETE, true) else {
+                break;
+            };
+            let Ok(id) = identity(&file) else { break };
+            if id.volume != parent.volume
+                || !file
+                    .metadata()
+                    .is_ok_and(|info| info.file_attributes() & SPECIAL == 0)
+            {
+                break;
+            }
+            let after = Location {
+                path: folder.join(name),
+                parent,
+            };
+            if rename_by_handle(&file, &after.path).is_err() {
+                break;
+            }
+            notify_move(&file, &before.path, &after.path);
+            moved.push(Change::Move {
+                from: Tracked {
+                    location: after,
+                    id,
+                },
+                to: before,
+            });
+        }
+        let count = moved.len();
+        if count != 0 {
+            self.label = Some("Move");
+            self.attempted += count;
+            self.changes.lock().unwrap().extend(moved);
+        }
+        count
     }
 
     pub(super) fn recycle(&mut self, owner: HWND, paths: &[PathBuf]) -> Result<(), String> {

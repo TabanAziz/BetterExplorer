@@ -228,6 +228,48 @@ function Restore-InstalledWinE {
     }
 }
 
+function Invoke-FolderManagerControl {
+    param([string] $Executable, [string] $Owner, [string] $Command, [string] $TestRoot)
+
+    $arguments = @($Command, '--owner', ('"{0}"' -f $Owner))
+    if ($TestRoot) { $arguments += @('--test-root', ('"{0}"' -f $TestRoot)) }
+    $process = Start-Process -FilePath $Executable -ArgumentList $arguments -PassThru -WindowStyle Hidden
+    try {
+        $process.WaitForExit()
+        $code = $process.ExitCode
+        if ($Command -eq '--folder-manager-state' -and $code -in 0, 2, 3, 4) { return $code }
+        if ($code -ne 0) {
+            throw 'Could not change the folder default. Check the Default folder manager option in BetterExplorer Settings.'
+        }
+        return $code
+    } finally {
+        $process.Dispose()
+    }
+}
+
+function Clear-OwnedFolderManager {
+    param([string] $Owner, [string] $Executable, [string] $TestRoot)
+
+    if ($Executable -and [IO.File]::Exists($Executable)) {
+        $null = Invoke-FolderManagerControl $Executable $Owner '--folder-manager-off' $TestRoot
+        return
+    }
+
+    $root = if ($TestRoot) { 'Software\BetterExplorer.SetupTests\' + [IO.Path]::GetFileName($TestRoot) }
+        else { 'Software\Classes' }
+    foreach ($class in 'Directory', 'Drive') {
+        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("$root\$class\shell\BetterExplorer.Open")
+        if ($null -eq $key) { continue }
+        try {
+            if ($key.GetValue('BetterExplorerExecutable') -ceq $Owner) {
+                throw 'The installed BetterExplorer executable is missing. Extract a fresh install bundle, then run Setup.exe --uninstall or uninstall.ps1 from that bundle.'
+            }
+        } finally {
+            $key.Dispose()
+        }
+    }
+}
+
 function Remove-PayloadStage {
     param([string] $Path)
 

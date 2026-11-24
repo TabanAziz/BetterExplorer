@@ -5,7 +5,8 @@ BetterExplorer targets Windows 11 x64. The reference machine runs Windows 11 Pro
 - The window thread owns controls, navigation history, selection and visible data. It never enumerates directories or runs a transfer.
 - Enumeration workers publish the first results in small batches, then produce the sorted snapshot. Windows-indexed PC search and remote folders use a separate scan lane. Navigation supersedes old requests. An in-flight kernel call may finish before cancellation takes effect.
 - The file list uses `LVS_OWNERDATA`. It supplies text and icons on demand and uses date headings in Details. File type icons resolve on a worker and reuse bounded caches. The scroll timer runs during wheel motion, and folder notifications refresh the layout while keeping the current rows visible.
-- A separate COM apartment runs Windows Shell operations and the per-window undo queue. The operating system handles conflict prompts, progress, and Recycle Bin integration. Outgoing drag-and-drop uses native OLE file data and offers Copy.
+- A separate COM apartment runs Windows Shell operations and the per-window undo queue. Ordinary same-volume moves use file handles and keep undo data. The Shell handles other moves, conflict prompts and Recycle Bin integration. Native OLE drag-and-drop negotiates copy or move and resolves the destination from the folder under the pointer.
+- ZIP, 7z and TAR operations run on the file operation worker. They stage output beside its destination, publish it without replacing existing items, and record the actual result for Undo.
 - Network, Recycle Bin, and Libraries are listed through Windows Shell namespaces. An explicit menu action can reveal an item in Windows File Explorer.
 - Settings and window placement are stored locally per user. Benchmarks and diagnostics run on request.
 

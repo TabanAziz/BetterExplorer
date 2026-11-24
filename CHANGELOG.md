@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Reduced work during file selection and dimmed cut items until the clipboard changes or the cut is completed.
+- Added folder drop targets, standard drag modifiers, faster same-volume moves, and clearer errors for unavailable paste sources.
+- Expanded the New menu with document and archive formats.
+- Added direct ZIP, 7z, and TAR actions with automatic output names and optional compression settings.
+- Added an optional default folder manager setting in BetterExplorer and Setup, separate from Win+E.
+
 ## 0.1.7
 
 - Unified Win+E, date format, and nine theme previews in one scrollable Settings page.

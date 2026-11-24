@@ -34,8 +34,8 @@ BetterExplorer shows matches as they arrive and lets you stop a search whenever 
 | **Navigation** | Tabbed windows, editable breadcrumbs, Quick access, Recent, Favorites, and built-in views for This PC, Network, Recycle Bin, and Libraries. |
 | **File views** | Details, List, and four icon sizes. Date grouping puts files and folders in the same timeline. Windows file type icons load in the background. |
 | **Search** | Search filenames under the active folder or use the Windows index from Home and This PC. **Search all drives** searches readable folders on local drives. |
-| **File actions** | Copy, cut, paste, move, rename, create, and recycle. Drag files out to Windows drop targets, and use Ctrl+Z or Ctrl+Y for supported operations in the current window. |
-| **ZIP and previews** | Create and extract ZIP files, view image and text previews, and use native Windows properties and Open with. |
+| **File actions** | Copy, cut, paste, move, rename, create, and recycle. Cut items appear dimmed. Drag files onto folders or out to Windows drop targets. Ctrl+Z and Ctrl+Y work for supported operations in the current window. |
+| **Archives and previews** | Compress or extract ZIP, 7z and TAR from the file menu. Use More options to choose the archive path, format and compression level. Preview images and text and access native Windows properties and Open with. |
 | **Personalization** | Nine theme choices, two date formats, saved window size and position, and optional tab restoration. |
 
 ![Settings with nine theme previews](assets/screenshots/settings.png)
@@ -55,6 +55,10 @@ The executable is **1.79 MiB**. One 30-second idle sample recorded 0 ms of app C
 BetterExplorer is a preview for **Windows 11 x64**. Download the portable ZIP from the [latest release](https://github.com/TabanAziz/BetterExplorer/releases/latest), extract it, and run `BetterExplorer.exe`. The release includes SHA-256 checksums. The executable is unsigned.
 
 Open **Settings** or press **Ctrl+,** to choose what **Win+E** opens. Selecting BetterExplorer starts a small helper for your Windows session and configures it to run at sign-in. Choose **File Explorer** in Settings before moving or removing a portable copy that manages the shortcut.
+
+**Default folder manager** is a separate option in Setup and Settings. Enable it to open folders and drives in BetterExplorer when apps use the Windows shell's default folder command. Choose **Windows default** to restore the previous folder handler before moving or removing a portable copy. Apps that launch `explorer.exe` directly continue to open File Explorer.
+
+Use `BetterExplorer.exe --select "C:\path\to\file.txt"` to open the containing folder and select a file or subfolder.
 
 ## Keys
 

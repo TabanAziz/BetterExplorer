@@ -6,6 +6,8 @@ param(
     [switch] $Quiet,
     [ValidateSet('WindowsExplorer', 'BetterExplorer')]
     [string] $WinE,
+    [ValidateSet('WindowsExplorer', 'BetterExplorer')]
+    [string] $FolderManager,
     [ValidateNotNullOrEmpty()]
     [string] $TestRoot
 )
@@ -15,14 +17,14 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'install-common.ps1')
 
 function Show-SetupDialog {
-    param([bool] $WinEEnabled, [string] $Version, [string] $Executable)
+    param([bool] $WinEEnabled, [int] $FolderManagerState, [string] $Version, [string] $Executable)
 
     $form = [Windows.Forms.Form]::new()
     $icon = $null
     $image = $null
     try {
         $form.Text = 'BetterExplorer Setup'
-        $form.ClientSize = [Drawing.Size]::new(460, 284)
+        $form.ClientSize = [Drawing.Size]::new(460, 343)
         $form.AutoScaleDimensions = [Drawing.SizeF]::new(96, 96)
         $form.AutoScaleMode = [Windows.Forms.AutoScaleMode]::Dpi
         $form.StartPosition = [Windows.Forms.FormStartPosition]::CenterScreen
@@ -74,30 +76,56 @@ function Show-SetupDialog {
         $betterOption.Checked = $WinEEnabled
         $betterOption.TabIndex = 1
 
+        $folderOption = [Windows.Forms.CheckBox]::new()
+        $folderOption.Text = 'Use BetterExplorer as the default folder manager'
+        $folderOption.AutoSize = $true
+        $folderOption.Location = [Drawing.Point]::new(24, 198)
+        $initialFolderChoice = switch ($FolderManagerState) {
+            0 { [Windows.Forms.CheckState]::Checked }
+            3 { [Windows.Forms.CheckState]::Indeterminate }
+            default { [Windows.Forms.CheckState]::Unchecked }
+        }
+        $folderOption.CheckState = $initialFolderChoice
+        $folderOption.Enabled = $FolderManagerState -ne 4
+        $folderOption.TabIndex = 2
+
+        $folderHint = [Windows.Forms.Label]::new()
+        $folderHint.Text = switch ($FolderManagerState) {
+            3 { 'The folder default changed. Select or clear to update it.' }
+            4 { 'Another registration uses the BetterExplorer folder command.' }
+            default { 'For folders and drives opened through the Windows shell.' }
+        }
+        $folderHint.AutoSize = $true
+        $folderHint.ForeColor = [Drawing.SystemColors]::GrayText
+        $folderHint.Location = [Drawing.Point]::new(43, 224)
+
         $shortcutOption = [Windows.Forms.CheckBox]::new()
         $shortcutOption.Text = 'Create a Start menu shortcut'
         $shortcutOption.AutoSize = $true
-        $shortcutOption.Location = [Drawing.Point]::new(24, 198)
-        $shortcutOption.TabIndex = 2
+        $shortcutOption.Location = [Drawing.Point]::new(24, 256)
+        $shortcutOption.TabIndex = 3
 
         $installButton = [Windows.Forms.Button]::new()
         $installButton.Text = 'Install'
-        $installButton.SetBounds(246, 237, 90, 34)
-        $installButton.TabIndex = 3
+        $installButton.SetBounds(246, 296, 90, 34)
+        $installButton.TabIndex = 4
         $installButton.DialogResult = [Windows.Forms.DialogResult]::OK
 
         $cancelButton = [Windows.Forms.Button]::new()
         $cancelButton.Text = 'Cancel'
-        $cancelButton.SetBounds(346, 237, 90, 34)
-        $cancelButton.TabIndex = 4
+        $cancelButton.SetBounds(346, 296, 90, 34)
+        $cancelButton.TabIndex = 5
         $cancelButton.DialogResult = [Windows.Forms.DialogResult]::Cancel
 
-        $form.Controls.AddRange(@($header, $question, $windowsOption, $betterOption, $shortcutOption, $installButton, $cancelButton))
+        $form.Controls.AddRange(@($header, $question, $windowsOption, $betterOption, $folderOption, $folderHint, $shortcutOption, $installButton, $cancelButton))
         $form.AcceptButton = $installButton
         $form.CancelButton = $cancelButton
         if ($form.ShowDialog() -ne [Windows.Forms.DialogResult]::OK) { return }
         [pscustomobject] @{
             WinE = if ($betterOption.Checked) { 'BetterExplorer' } else { 'WindowsExplorer' }
+            FolderManager = if ($folderOption.Enabled -and $folderOption.CheckState -ne $initialFolderChoice) {
+                if ($folderOption.Checked) { 'BetterExplorer' } else { 'WindowsExplorer' }
+            }
             StartMenuShortcut = $shortcutOption.Checked
         }
     } finally {
@@ -144,6 +172,7 @@ $install = {
     $shortcutStage = $null
     $oldMoved = $false
     $newMoved = $false
+    $shortcutMoved = $false
     $winEPauseAttempted = $false
     $winEChangeAttempted = $false
     $completed = $false
@@ -177,6 +206,7 @@ $install = {
             files = $bundle.files
             shortcut_sha256 = $shortcutHash
             win_e_cli = 1
+            folder_manager_cli = 1
         }
         Write-PayloadManifest $manifest (Join-Path $stage $script:BetterExplorerInstallManifest)
 
@@ -197,7 +227,15 @@ $install = {
             $winEChangeAttempted = $true
             $null = Invoke-WinEControl $executable $command
         }
-        if ($createShortcut) { [IO.File]::Move($shortcutStage, $paths.Shortcut) }
+        if ($createShortcut) {
+            [IO.File]::Move($shortcutStage, $paths.Shortcut)
+            $shortcutMoved = $true
+        }
+        if ($FolderManager) {
+            $command = if ($FolderManager -eq 'BetterExplorer') { '--folder-manager-on' }
+                else { '--folder-manager-off' }
+            $null = Invoke-FolderManagerControl $executable $executable $command $lockRoot
+        }
         $completed = $true
     } catch {
         $failure = $_
@@ -210,6 +248,9 @@ $install = {
             }
         }
         try {
+            if ($shortcutMoved -and (Get-InstalledShortcutHash $paths.Shortcut $shortcutHash)) {
+                [IO.File]::Delete($paths.Shortcut)
+            }
             if ($newMoved) { [IO.Directory]::Move($paths.Application, $stage) }
             if ($oldMoved) { [IO.Directory]::Move($backup, $paths.Application) }
         } catch {
@@ -245,14 +286,17 @@ try {
     $addShortcut = $StartMenuShortcut.IsPresent
     if ($interactive) {
         $installedExecutable = Join-Path $paths.Application 'BetterExplorer.exe'
+        $bundleExecutable = Join-Path $PSScriptRoot 'BetterExplorer.exe'
+        $currentFolderManager = Invoke-FolderManagerControl $bundleExecutable $installedExecutable '--folder-manager-state'
         $currentWinE = $false
         if (Test-Path -LiteralPath $paths.Application) {
             $installed = Read-PayloadManifest -Directory $paths.Application -Name $script:BetterExplorerInstallManifest
             $currentWinE = (Get-InstalledWinEState $installedExecutable $installed).Enabled
         }
-        $options = Show-SetupDialog $currentWinE $bundle.version (Join-Path $PSScriptRoot 'BetterExplorer.exe')
+        $options = Show-SetupDialog $currentWinE $currentFolderManager $bundle.version $bundleExecutable
         if (-not $options) { return }
         $WinE = $options.WinE
+        $FolderManager = $options.FolderManager
         $addShortcut = $options.StartMenuShortcut
     }
     $lockRoot = if ($TestRoot) { $paths.Programs }

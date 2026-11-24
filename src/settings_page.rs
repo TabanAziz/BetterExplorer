@@ -28,12 +28,16 @@ pub const WIN_E_WINDOWS: u16 = 191;
 pub const WIN_E_BETTER: u16 = 192;
 pub const DATE_FORMAT_DAY_FIRST: u16 = 206;
 pub const DATE_FORMAT_MONTH_FIRST: u16 = 207;
+pub const FOLDER_DEFAULT_WINDOWS: u16 = 219;
+pub const FOLDER_DEFAULT_BETTER: u16 = 220;
 pub const CONTENT_TOP: i32 = 79;
 const PAGE_TITLE: u16 = 221;
 const SHORTCUT_HEADING: u16 = 222;
 const SHORTCUT_STATUS: u16 = 224;
 const DATE_HEADING: u16 = 225;
 const DATE_HINT: u16 = 226;
+const FOLDER_DEFAULT_HEADING: u16 = 227;
+const FOLDER_DEFAULT_STATUS: u16 = 228;
 const THEME_HEADING: u16 = 229;
 pub const THEME_START: u16 = 230;
 const GALLERY_COLUMNS: i32 = 3;
@@ -62,7 +66,7 @@ pub fn accessible_name(label: &str, selected: bool) -> String {
 }
 
 pub fn is_muted_label(id: u16) -> bool {
-    matches!(id, SHORTCUT_STATUS | DATE_HINT)
+    matches!(id, SHORTCUT_STATUS | DATE_HINT | FOLDER_DEFAULT_STATUS)
 }
 
 #[derive(Clone, Copy)]
@@ -112,9 +116,23 @@ pub const DATE_CHOICES: [Choice; 2] = [
     },
 ];
 
+pub const FOLDER_DEFAULT_CHOICES: [Choice; 2] = [
+    Choice {
+        id: FOLDER_DEFAULT_WINDOWS,
+        caption: "Windows default",
+        example: None,
+    },
+    Choice {
+        id: FOLDER_DEFAULT_BETTER,
+        caption: "BetterExplorer",
+        example: None,
+    },
+];
+
 pub fn choice(id: u16) -> Option<Choice> {
     SHORTCUT_CHOICES
         .into_iter()
+        .chain(FOLDER_DEFAULT_CHOICES)
         .chain(DATE_CHOICES)
         .find(|choice| choice.id == id)
 }
@@ -126,6 +144,8 @@ pub struct Page {
     title: HWND,
     shortcut_heading: HWND,
     shortcut_status: HWND,
+    folder_default_heading: HWND,
+    folder_default_status: HWND,
     date_heading: HWND,
     date_hint: HWND,
     theme_heading: HWND,
@@ -172,6 +192,8 @@ impl Page {
             title: label(PAGE_TITLE, "Settings"),
             shortcut_heading: label(SHORTCUT_HEADING, "Win+E shortcut"),
             shortcut_status: label(SHORTCUT_STATUS, ""),
+            folder_default_heading: label(FOLDER_DEFAULT_HEADING, "Default folder manager"),
+            folder_default_status: label(FOLDER_DEFAULT_STATUS, ""),
             date_heading: label(DATE_HEADING, "Date modified format"),
             date_hint: label(DATE_HINT, "Used in file lists and item details."),
             theme_heading: label(THEME_HEADING, "Themes"),
@@ -181,6 +203,7 @@ impl Page {
         };
         let failed = SHORTCUT_CHOICES
             .into_iter()
+            .chain(FOLDER_DEFAULT_CHOICES)
             .chain(DATE_CHOICES)
             .map(|choice| (choice.id, choice.caption))
             .chain(
@@ -196,6 +219,8 @@ impl Page {
                 page.title,
                 page.shortcut_heading,
                 page.shortcut_status,
+                page.folder_default_heading,
+                page.folder_default_status,
                 page.date_heading,
                 page.date_hint,
                 page.theme_heading,
@@ -217,6 +242,7 @@ impl Page {
     pub fn buttons(&self) -> impl Iterator<Item = HWND> + '_ {
         SHORTCUT_CHOICES
             .into_iter()
+            .chain(FOLDER_DEFAULT_CHOICES)
             .chain(DATE_CHOICES)
             .map(|choice| choice.id)
             .chain(THEME_START..THEME_START + ThemePreference::ALL.len() as u16)
@@ -232,6 +258,8 @@ impl Page {
             (self.title, self.fonts[0]),
             (self.shortcut_heading, self.fonts[1]),
             (self.shortcut_status, fonts[0]),
+            (self.folder_default_heading, self.fonts[1]),
+            (self.folder_default_status, fonts[0]),
             (self.date_heading, self.fonts[1]),
             (self.date_hint, fonts[0]),
             (self.theme_heading, self.fonts[1]),
@@ -269,6 +297,10 @@ impl Page {
 
     pub fn set_status(&self, value: impl AsRef<OsStr>) {
         text(self.shortcut_status, value);
+    }
+
+    pub fn set_folder_default_status(&self, value: impl AsRef<OsStr>) {
+        text(self.folder_default_status, value);
     }
 
     pub fn layout(&self, sidebar: i32, width: i32, height: i32, dpi: u32) {
@@ -484,6 +516,13 @@ impl Page {
                 SHORTCUT_CHOICES,
             ),
             (
+                layout.folder_default,
+                self.folder_default_heading,
+                self.folder_default_status,
+                36,
+                FOLDER_DEFAULT_CHOICES,
+            ),
+            (
                 layout.dates,
                 self.date_heading,
                 self.date_hint,
@@ -550,8 +589,9 @@ struct Layout {
     right: i32,
     height: i32,
     label_right: i32,
-    dividers: [i32; 2],
+    dividers: [i32; 3],
     shortcut: Row,
+    folder_default: Row,
     dates: Row,
     theme_heading: i32,
     gallery: i32,
@@ -591,10 +631,22 @@ impl Layout {
                 bottom: d(top + offset + height),
             },
         };
-        let (shortcut, dates, dividers, theme_heading) = if side_by_side {
-            (row(72, 2, 42), row(148, 0, 54), [137, 215], 228)
+        let (shortcut, folder_default, dates, dividers, theme_heading) = if side_by_side {
+            (
+                row(72, 2, 42),
+                row(148, 2, 42),
+                row(224, 0, 54),
+                [137, 213, 291],
+                304,
+            )
         } else {
-            (row(72, 63, 42), row(199, 46, 54), [188, 310], 322)
+            (
+                row(72, 63, 42),
+                row(199, 63, 42),
+                row(326, 46, 54),
+                [188, 315, 437],
+                449,
+            )
         };
         Self {
             left,
@@ -603,6 +655,7 @@ impl Layout {
             label_right,
             dividers: dividers.map(d),
             shortcut,
+            folder_default,
             dates,
             theme_heading: d(theme_heading),
             gallery: d(theme_heading + 24),
@@ -650,7 +703,11 @@ impl Layout {
                 colors.edge,
             );
         }
-        for track in [self.shortcut.track, self.dates.track] {
+        for track in [
+            self.shortcut.track,
+            self.folder_default.track,
+            self.dates.track,
+        ] {
             let track = RECT {
                 top: track.top - offset,
                 bottom: track.bottom - offset,
@@ -867,7 +924,7 @@ mod tests {
     use windows_sys::Win32::Foundation::SIZE;
 
     #[test]
-    fn full_size_settings_place_all_themes_below_the_date_choices() {
+    fn full_size_settings_stack_choices_and_scroll_to_all_themes() {
         for dpi in [96, 120, 144, 168, 192] {
             let d = |value| scale(value, dpi);
             let layout = Layout::new(
@@ -875,10 +932,12 @@ mod tests {
                 d(608) - d(CONTENT_TOP) - d(7),
                 dpi,
             );
-            assert!(layout.shortcut.track.bottom < layout.dates.top);
+            assert!(layout.shortcut.track.bottom < layout.folder_default.top);
+            assert!(layout.folder_default.track.bottom < layout.dates.top);
             assert!(layout.dates.track.bottom < layout.theme_heading);
             assert!(layout.theme_heading < layout.theme_bounds(0).top);
-            assert_eq!(layout.max_scroll(), 0, "at {dpi} DPI");
+            assert!(layout.max_scroll() > 0, "at {dpi} DPI");
+            assert!(layout.theme_bounds(8).bottom - layout.max_scroll() <= layout.height);
         }
     }
 

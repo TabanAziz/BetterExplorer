@@ -62,6 +62,7 @@ internal static class SetupLauncher
                     parameters.Add(name, true);
                     break;
                 case "-wine":
+                case "-foldermanager":
                 case "-testroot":
                     if (index + 1 == args.Length || args[index + 1].StartsWith("-", StringComparison.Ordinal))
                         throw new ArgumentException("A value is required for " + argument + ".");

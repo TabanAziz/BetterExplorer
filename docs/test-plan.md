@@ -28,7 +28,7 @@ Use a disposable fixture folder for write tests.
 2. Change between Details, List and icon sizes. Sort each column. Scroll to the end of the icon view and then back to the first row. Try with an empty folder and a long filename.
 3. Search a nested fixture by name, then stop an active search. Toggle Hidden items. Check keyboard focus and the details pane.
 4. Create a text file, rename it, copy and cut using the Windows clipboard, then paste into a second test folder. Test a name conflict, cancel and verify source and destination. Test the Recycle Bin and restore through the Shell.
-5. Create a ZIP, extract it and compare its contents. Confirm that selecting an existing destination leaves it intact.
+5. Use Compress to for ZIP, 7z and TAR. Use Extract all and compare the resulting contents. Repeat with conflicting names and use Undo and Redo. Use More options to choose a different destination, format and compression level.
 6. Repeat navigation and opening files in light/dark, contrast, 100/125/150/200% DPI and on two monitors. Use Narrator. Record separate outcomes per configuration.
 7. Compare launch and first content on a clean Windows build. Compare hashes, timestamps and throughput for large copies. Test disconnected SMB, inaccessible folders, encrypted files and cloud placeholders in a test environment.
 

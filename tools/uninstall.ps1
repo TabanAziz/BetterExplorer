@@ -11,7 +11,10 @@ $paths = Get-InstallLocations $TestRoot
 $lockRoot = if ($TestRoot) { $paths.Programs }
 Invoke-InstallLock -TestRoot $lockRoot -Action {
     $executable = Join-Path $paths.Application 'BetterExplorer.exe'
+    $bundleExecutable = Join-Path $PSScriptRoot 'BetterExplorer.exe'
+    if ($bundleExecutable -ieq $executable) { $bundleExecutable = $null }
     if (-not (Test-Path -LiteralPath $paths.Application)) {
+        Clear-OwnedFolderManager $executable $bundleExecutable $lockRoot
         if (-not $TestRoot -and (Test-OwnedWinERegistration $executable)) {
             Set-LegacyWinERegistration $executable $false
         }
@@ -28,6 +31,7 @@ Invoke-InstallLock -TestRoot $lockRoot -Action {
     $removed = [Collections.Generic.List[string]]::new()
     $cleanupStage = $true
     $winEChangeAttempted = $false
+    $shortcutStage = Join-Path $stage 'BetterExplorer.lnk'
     $null = New-Item -ItemType Directory -Path $stage
     try {
         if ($previousWinE.Enabled) {
@@ -45,14 +49,21 @@ Invoke-InstallLock -TestRoot $lockRoot -Action {
             $removed.Add($name)
         }
         if ($shortcutHash -and (Get-InstalledShortcutHash $paths.Shortcut $shortcutHash)) {
-            [IO.File]::Delete($paths.Shortcut)
+            [IO.File]::Move($paths.Shortcut, $shortcutStage)
         }
+        $stagedExecutable = Join-Path $stage 'BetterExplorer.exe'
+        $controller = if ($manifest.PSObject.Properties['folder_manager_cli'] -and
+            $manifest.folder_manager_cli -eq 1 -and [IO.File]::Exists($stagedExecutable)) {
+            $stagedExecutable
+        } else { $bundleExecutable }
+        Clear-OwnedFolderManager $executable $controller $lockRoot
     } catch {
         $failure = $_
         try {
             foreach ($name in $removed) {
                 [IO.File]::Move((Join-Path $stage $name), (Join-Path $paths.Application $name))
             }
+            if ([IO.File]::Exists($shortcutStage)) { [IO.File]::Move($shortcutStage, $paths.Shortcut) }
         } catch {
             $cleanupStage = $false
             Write-Warning "Rollback left installation files in $stage. $($_.Exception.Message)"
@@ -66,7 +77,10 @@ Invoke-InstallLock -TestRoot $lockRoot -Action {
         }
         throw $failure
     } finally {
-        if ($cleanupStage) { Remove-PayloadStage $stage }
+        if ($cleanupStage) {
+            if ([IO.File]::Exists($shortcutStage)) { [IO.File]::Delete($shortcutStage) }
+            Remove-PayloadStage $stage
+        }
     }
 
     $remaining = @(Get-ChildItem -LiteralPath $paths.Application -Force)

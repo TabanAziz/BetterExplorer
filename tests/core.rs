@@ -91,6 +91,61 @@ impl Drop for Cleanup {
 }
 
 #[test]
+fn launch_scan_can_reveal_one_hidden_item() {
+    use better_explorer::model::wide;
+    use better_explorer::work::Scanner;
+    use std::{sync::mpsc, time::Duration};
+    use windows_sys::Win32::Storage::FileSystem::{
+        SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM,
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    std::fs::write(root.join("Visible.txt"), b"visible").unwrap();
+    for name in ["Target.txt", "Other.txt"] {
+        let path = root.join(name);
+        std::fs::write(&path, b"hidden").unwrap();
+        assert_ne!(
+            unsafe {
+                SetFileAttributesW(
+                    wide(&path).as_ptr(),
+                    FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,
+                )
+            },
+            0,
+        );
+    }
+    let (events, received) = mpsc::channel();
+    let scanner = Scanner::start(move |event| {
+        let _ = events.send(event);
+    });
+    scanner.request_revealing(
+        Request {
+            id: 1,
+            location: Location::Folder(root.into()),
+            hidden: false,
+            sort: Sort::default(),
+            pins: Vec::new(),
+        },
+        Some(root.join("target.txt")),
+    );
+    loop {
+        match received.recv_timeout(Duration::from_secs(5)).unwrap() {
+            ScanEvent::Done(1, rows, error) => {
+                assert_eq!(error, None);
+                assert_eq!(
+                    rows.iter().map(|row| row.label()).collect::<Vec<_>>(),
+                    ["Target.txt", "Visible.txt"]
+                );
+                break;
+            }
+            ScanEvent::Batch(1, _) => (),
+            _ => panic!("unexpected scan event"),
+        }
+    }
+}
+
+#[test]
 fn settings_tab_is_not_saved_as_a_folder_to_restore() {
     use better_explorer::model::Settings;
     let first = Location::path(r"C:\Projects");

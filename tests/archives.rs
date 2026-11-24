@@ -1,6 +1,9 @@
 #![cfg(windows)]
 
-use better_explorer::archive::{compress, extract};
+use better_explorer::archive::{
+    compress, compress_with, extract, extract_with, Compression, Format, Level,
+};
+use better_explorer::shell::{History, Operation};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -8,6 +11,131 @@ use std::process::Command;
 use tempfile::tempdir;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
+
+#[test]
+fn recorded_quick_archive_actions_undo_the_actual_nonconflicting_outputs() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let source = root.join("Draft.v2.txt");
+    let occupied_archive = root.join("Draft.v2.tar");
+    let occupied_folder = root.join("Draft.v2 (2)");
+    let archive = root.join("Draft.v2 (2).tar");
+    let extracted = root.join("Draft.v2 (2) (2)");
+    fs::write(&source, b"source text").unwrap();
+    fs::write(&occupied_archive, b"older archive").unwrap();
+    fs::create_dir(&occupied_folder).unwrap();
+    fs::write(occupied_folder.join("keep.txt"), b"older folder").unwrap();
+
+    let mut history = History::default();
+    history
+        .run(
+            0,
+            Operation::Compress {
+                sources: vec![source],
+                output: occupied_archive.clone(),
+                options: Compression {
+                    format: Format::Tar,
+                    level: Level::Fast,
+                },
+                automatic: true,
+            },
+        )
+        .unwrap();
+    assert!(archive.is_file());
+    assert_eq!(history.undo_label(), Some("Compress"));
+    history
+        .run(
+            0,
+            Operation::Extract {
+                source: archive.clone(),
+                output: occupied_folder.clone(),
+                automatic: true,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        fs::read(extracted.join("Draft.v2.txt")).unwrap(),
+        b"source text"
+    );
+    assert_eq!(history.undo_label(), Some("Extract"));
+
+    history.run(0, Operation::Undo).unwrap();
+    assert!(!extracted.exists());
+    history.run(0, Operation::Undo).unwrap();
+    assert!(!archive.exists());
+    assert_eq!(fs::read(occupied_archive).unwrap(), b"older archive");
+    assert_eq!(
+        fs::read(occupied_folder.join("keep.txt")).unwrap(),
+        b"older folder"
+    );
+    history.run(0, Operation::Redo).unwrap();
+    history.run(0, Operation::Redo).unwrap();
+    assert_eq!(
+        fs::read(extracted.join("Draft.v2.txt")).unwrap(),
+        b"source text"
+    );
+}
+
+#[test]
+fn quick_formats_preserve_contents_and_pick_conflict_free_names() {
+    let workspace = tempdir().unwrap();
+    let root = workspace.path();
+    let source = root.join("project.v1");
+    fs::create_dir_all(source.join("empty.dir")).unwrap();
+    fs::write(source.join("Überblick 📁.txt"), b"text").unwrap();
+    fs::write(source.join("empty.txt"), b"").unwrap();
+
+    for format in Format::ALL {
+        let output = root.join(format!("project.v1.{}", format.extension()));
+        fs::write(&output, b"keep archive").unwrap();
+        let options = Compression {
+            format,
+            level: Level::Fast,
+        };
+        let archive = compress_with(
+            std::slice::from_ref(&source),
+            &output,
+            options,
+            true,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            archive.file_name().unwrap(),
+            format!("project.v1 (2).{}", format.extension()).as_str()
+        );
+        assert_eq!(fs::read(&output).unwrap(), b"keep archive");
+
+        let extracted = extract_with(&archive, &source, true, |_| {}).unwrap();
+        assert_ne!(extracted.file_name(), source.file_name());
+        let extracted = extracted.join("project.v1");
+        assert_eq!(
+            fs::read(extracted.join("Überblick 📁.txt")).unwrap(),
+            b"text"
+        );
+        assert_eq!(fs::read(extracted.join("empty.txt")).unwrap(), b"");
+        assert!(extracted.join("empty.dir").is_dir());
+    }
+}
+
+#[test]
+fn quick_archive_retries_a_destination_claimed_during_publication() {
+    let workspace = tempdir().unwrap();
+    let file = workspace.path().join("report.txt");
+    let output = workspace.path().join("report.zip");
+    fs::write(&file, b"report").unwrap();
+    let mut attempts = Vec::new();
+    let archive = compress_with(&[file], &output, Compression::default(), true, |path| {
+        attempts.push(path.file_name().unwrap().to_owned());
+        if attempts.len() == 1 {
+            fs::write(path, b"keep me").unwrap();
+        }
+    })
+    .unwrap();
+    assert_eq!(attempts, ["report.zip", "report (2).zip"]);
+    assert_eq!(fs::read(&output).unwrap(), b"keep me");
+    assert!(archive.is_file());
+}
 
 #[test]
 fn zip_round_trip_keeps_selected_roots_contents_and_empty_directories() {

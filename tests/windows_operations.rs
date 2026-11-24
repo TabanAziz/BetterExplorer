@@ -101,6 +101,38 @@ fn shell_copy_and_move_preserve_unicode_paths_and_file_bytes() {
 }
 
 #[test]
+fn recorded_local_moves_stay_undoable_if_a_later_source_has_disappeared() {
+    let fixture = tempfile::tempdir().unwrap();
+    let original = fixture.path().join("first.txt");
+    let missing = fixture.path().join("gone.txt");
+    let target = fixture.path().join("destination");
+    fs::create_dir(&target).unwrap();
+    fs::write(&original, b"keep these contents").unwrap();
+
+    let mut history = better_explorer::shell::History::default();
+    let error = history
+        .run(
+            0,
+            Operation::Transfer {
+                paths: vec![original.clone(), missing],
+                target: target.clone(),
+                moving: true,
+            },
+        )
+        .unwrap_err();
+    assert!(error.contains("gone.txt"), "{error}");
+    assert!(error.contains("Undo is available for 1 item"), "{error}");
+    assert!(!original.exists());
+    assert_eq!(
+        fs::read(target.join("first.txt")).unwrap(),
+        b"keep these contents"
+    );
+    history.run(0, Operation::Undo).unwrap();
+    assert_eq!(fs::read(original).unwrap(), b"keep these contents");
+    assert!(!target.join("first.txt").exists());
+}
+
+#[test]
 fn shell_shortcut_loads_with_its_original_unicode_target() {
     let fixture = tempfile::tempdir().expect("create fixture");
     let source = fixture.path().join("Überblick 数据 📄.txt");

@@ -4,22 +4,26 @@ use crate::{
     breadcrumb,
     chrome::*,
     file_icon_cache::{FileIconCache, GENERIC_FILE},
-    file_icons,
+    file_icons, folder_manager,
     home_page::{Activity, HomePage, Icon, Item},
     preview::{self, Content},
     settings_page::{
         self, Choice, DATE_CHOICES, DATE_FORMAT_DAY_FIRST, DATE_FORMAT_MONTH_FIRST,
-        SHORTCUT_CHOICES, THEME_START, WIN_E_BETTER, WIN_E_WINDOWS,
+        FOLDER_DEFAULT_BETTER, FOLDER_DEFAULT_CHOICES, FOLDER_DEFAULT_WINDOWS, SHORTCUT_CHOICES,
+        THEME_START, WIN_E_BETTER, WIN_E_WINDOWS,
     },
     theme_visuals,
     window_geometry::{self, WindowPosition, WindowSize},
 };
 use better_explorer::{
+    archive::{self, Compression, Format, Level},
+    drag_drop::{self, WindowDropTarget},
     model::{
         from_wide, read_settings, safe_name, wide, write_settings, GroupBy, History, Location,
         ModifiedDateFormat, Settings, ThemePreference,
     },
     namespace::Namespace,
+    new_document::{available_documents, load_catalog, DocumentKind},
     shell::{self, Operation},
     work::{self, Column, DateGroup, DateGroups, Entry, Request, ScanEvent, Scanner, Sort},
 };
@@ -39,7 +43,10 @@ use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
     Graphics::Gdi::*,
     System::{
-        LibraryLoader::GetModuleHandleW, SystemServices::SS_NOPREFIX, Threading::CreateMutexW,
+        DataExchange::{AddClipboardFormatListener, RemoveClipboardFormatListener},
+        LibraryLoader::GetModuleHandleW,
+        SystemServices::SS_NOPREFIX,
+        Threading::CreateMutexW,
     },
     UI::{
         Controls::*, HiDpi::GetDpiForWindow, Input::KeyboardAndMouse::*, Shell::*,
@@ -106,7 +113,9 @@ const REVEAL: u16 = 127;
 const PIN: u16 = 128;
 const SHORTCUT: u16 = 129;
 const NEW_FOLDER: u16 = 130;
-const NEW_TEXT: u16 = 131;
+const NEW_SHORTCUT: u16 = 269;
+const NEW_DOCUMENT_START: u16 = 270;
+const NEW_DOCUMENT_END: u16 = document_command(DocumentKind::Zip);
 const PERMANENT: u16 = 132;
 const ENTER_PATH: u16 = 133;
 const ENTER_SEARCH: u16 = 134;
@@ -146,6 +155,13 @@ const LARGE_ICONS: u16 = 186;
 const XLARGE_ICONS: u16 = 187;
 const COMPRESS: u16 = 188;
 const EXTRACT: u16 = 189;
+const COMPRESS_ZIP: u16 = 285;
+const COMPRESS_7Z: u16 = 286;
+const COMPRESS_TAR: u16 = 287;
+const COMPRESS_OPTIONS: u16 = 288;
+const ARCHIVE_FORMAT: u16 = 289;
+const ARCHIVE_LEVEL: u16 = 290;
+const ARCHIVE_BROWSE: u16 = 291;
 const HOME: u16 = 170;
 const COMPUTER: u16 = 171;
 const NETWORK: u16 = 180;
@@ -237,6 +253,10 @@ enum Event {
         status: Option<hotkey::Status>,
         error: Option<String>,
     },
+    FolderManager {
+        status: Option<folder_manager::Status>,
+        error: Option<String>,
+    },
     Operation {
         result: Result<String, String>,
         refresh: bool,
@@ -275,6 +295,11 @@ struct ListSelection {
     paths: HashSet<PathBuf>,
     focused: Option<PathBuf>,
     anchor: Option<PathBuf>,
+}
+
+struct CutSelection {
+    paths: HashSet<PathBuf>,
+    receipt: shell::ClipboardWriteReceipt,
 }
 
 impl Tab {
@@ -340,11 +365,81 @@ impl Filter {
 
 enum Edit {
     Create(PathBuf, bool),
+    CreateDocument(PathBuf, DocumentKind),
+    NewShortcut(PathBuf),
     Rename(PathBuf, Option<OsString>),
     Delete(Vec<PathBuf>),
     Shortcut(PathBuf, PathBuf),
     Compress(Vec<PathBuf>, PathBuf),
-    Extract(PathBuf, PathBuf),
+}
+
+struct ArchiveOptions {
+    format_label: HWND,
+    format: HWND,
+    level_label: HWND,
+    level: HWND,
+}
+
+impl ArchiveOptions {
+    fn create(window: HWND) -> Self {
+        let combo = |id| {
+            new_control(
+                window,
+                "ComboBox",
+                "",
+                id,
+                WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32,
+                0,
+            )
+        };
+        let controls = Self {
+            format_label: new_control(window, "Static", "Format", 0, SS_NOPREFIX, 0),
+            format: combo(ARCHIVE_FORMAT),
+            level_label: new_control(window, "Static", "Compression", 0, SS_NOPREFIX, 0),
+            level: combo(ARCHIVE_LEVEL),
+        };
+        for format in Format::ALL {
+            send(
+                controls.format,
+                CB_ADDSTRING,
+                0,
+                wide(format.label()).as_ptr() as LPARAM,
+            );
+        }
+        for level in Level::ALL {
+            send(
+                controls.level,
+                CB_ADDSTRING,
+                0,
+                wide(level.label()).as_ptr() as LPARAM,
+            );
+        }
+        controls
+    }
+
+    fn controls(&self) -> [HWND; 4] {
+        [self.format_label, self.format, self.level_label, self.level]
+    }
+
+    fn format(&self) -> Format {
+        Format::ALL
+            .get(send(self.format, CB_GETCURSEL, 0, 0) as usize)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn compression(&self) -> Compression {
+        let format = self.format();
+        let level = if format == Format::Tar {
+            Level::Fast
+        } else {
+            Level::ALL
+                .get(send(self.level, CB_GETCURSEL, 0, 0) as usize)
+                .copied()
+                .unwrap_or_default()
+        };
+        Compression { format, level }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -378,11 +473,13 @@ struct App {
     search: HWND,
     title: HWND,
     summary: HWND,
+    summary_text: RefCell<String>,
     detail_title: HWND,
     detail_body: HWND,
     status: HWND,
     edit_label: HWND,
     edit_name: HWND,
+    archive_options: ArchiveOptions,
     images: [HIMAGELIST; 2],
     file_icons: FileIconCache,
     icon_size: i32,
@@ -398,6 +495,9 @@ struct App {
     hotkey_status: Option<hotkey::Status>,
     hotkey_request: Option<HotkeyRequest>,
     hotkey_error: Option<String>,
+    folder_manager_status: Option<folder_manager::Status>,
+    folder_manager_busy: bool,
+    folder_manager_error: Option<String>,
     places: Vec<(PathBuf, &'static str)>,
     crumbs: Vec<PathBuf>,
     crumb_slots: Vec<Option<Location>>,
@@ -420,6 +520,7 @@ struct App {
     scanning: bool,
     pending_drag: Option<Vec<PathBuf>>,
     active_drag: bool,
+    drop_target: Option<WindowDropTarget>,
     busy: usize,
     id: u64,
     events: Events,
@@ -428,8 +529,10 @@ struct App {
     file_history: [Option<&'static str>; 2],
     file_history_revision: u64,
     clipboard_write: Option<shell::ClipboardWriteReceipt>,
+    cut: Option<CutSelection>,
     keep_rows: bool,
     saved: Option<SyncSender<Settings>>,
+    launch_selection: Option<PathBuf>,
     save_worker: Option<std::thread::JoinHandle<()>>,
     save_enabled: bool,
     watcher: Option<work::Watcher>,
@@ -458,6 +561,7 @@ impl App {
             (PATH, "Path choices"),
             (ACCEPT, "Apply"),
             (CANCEL, "Cancel"),
+            (ARCHIVE_BROWSE, "Browse…"),
             (STOP_SEARCH, "Stop search"),
             (SEARCH_ALL_DRIVES, "Search all drives"),
             (FRAME_MIN, "Minimize"),
@@ -541,11 +645,13 @@ impl App {
             search: input(SEARCH),
             title: label(0),
             summary: label(SUMMARY),
+            summary_text: RefCell::default(),
             detail_title: label(0),
             detail_body: label(0),
             status: label(STATUS),
             edit_label: label(0),
             edit_name: input(NAME),
+            archive_options: ArchiveOptions::create(window),
             images: [0; 2],
             file_icons: FileIconCache::default(),
             icon_size: 52,
@@ -561,6 +667,9 @@ impl App {
             hotkey_status: None,
             hotkey_request: None,
             hotkey_error: None,
+            folder_manager_status: None,
+            folder_manager_busy: false,
+            folder_manager_error: None,
             places: Vec::new(),
             crumbs: Vec::new(),
             crumb_slots: Vec::new(),
@@ -583,6 +692,7 @@ impl App {
             scanning: true,
             pending_drag: None,
             active_drag: false,
+            drop_target: None,
             busy: 0,
             id: 0,
             events: Arc::new(Mutex::new(VecDeque::new())),
@@ -591,8 +701,10 @@ impl App {
             file_history: [None; 2],
             file_history_revision: 0,
             clipboard_write: None,
+            cut: None,
             keep_rows: false,
             saved: None,
+            launch_selection: None,
             save_worker: None,
             save_enabled,
             watcher: None,
@@ -606,6 +718,7 @@ impl App {
             better_explorer::scroll::install(list);
         }
         send(list, CCM_SETUNICODEFORMAT, 1, 0);
+        send(list, LVM_SETCALLBACKMASK, LVIS_CUT as usize, 0);
         let styles =
             LVS_EX_DOUBLEBUFFER | LVS_EX_FULLROWSELECT | LVS_EX_HEADERDRAGDROP | LVS_EX_LABELTIP;
         send(
@@ -640,9 +753,6 @@ impl App {
         app.apply_dpi(dpi);
         app.update_theme_controls();
         app.update_view();
-        unsafe {
-            DragAcceptFiles(window, 1);
-        }
         app.update_sidebar();
         app.update_navigation();
         app.status();
@@ -652,6 +762,7 @@ impl App {
 
     fn start(&mut self) {
         let owner = self.window as usize;
+        unsafe { AddClipboardFormatListener(self.window) };
         let scan_queue = Arc::clone(&self.events);
         self.scanner = Some(Scanner::start(move |event| {
             publish(&scan_queue, owner, Event::Scan(event))
@@ -696,6 +807,7 @@ impl App {
                         owner,
                         Event::KnownPlaces(work::known_places()),
                     );
+                    load_catalog();
                     while let Ok(settings) = receiver.recv() {
                         if let Err(error) = write_settings(&settings) {
                             publish(
@@ -763,6 +875,41 @@ impl App {
         }
     }
 
+    fn file_drop_folder(&self, mut screen: POINT) -> Option<PathBuf> {
+        if self.recycling()
+            || unsafe {
+                IsWindowVisible(self.list) == 0 || ScreenToClient(self.list, &mut screen) == 0
+            }
+        {
+            return None;
+        }
+        let mut bounds = rect(self.list);
+        if send(self.list, LVM_GETVIEW, 0, 0) as u32 == LV_VIEW_DETAILS
+            && unsafe { IsWindowVisible(self.header) != 0 }
+        {
+            bounds.top = rect(self.header).bottom;
+        }
+        if unsafe { PtInRect(&bounds, screen) } == 0 {
+            return None;
+        }
+        let mut hit = LVHITTESTINFO {
+            pt: screen,
+            ..unsafe { zeroed() }
+        };
+        let row = send(
+            self.list,
+            LVM_SUBITEMHITTEST,
+            0,
+            &mut hit as *mut _ as LPARAM,
+        );
+        usize::try_from(row)
+            .ok()
+            .and_then(|index| self.entry(index))
+            .filter(|entry| entry.directory && entry.path.is_absolute())
+            .map(|entry| entry.path.clone())
+            .or_else(|| self.dest())
+    }
+
     fn sort(&self) -> Sort {
         match self.location() {
             Location::Folder(path) => self.settings.folder_order(path).sort,
@@ -806,7 +953,10 @@ impl App {
             self.edit_name,
             self.edit_label,
             self.detail_body,
-        ] {
+        ]
+        .into_iter()
+        .chain(self.archive_options.controls())
+        {
             send(control, WM_SETFONT, self.fonts[0] as usize, 1);
         }
         for control in [self.title, self.detail_title, self.header] {
@@ -926,15 +1076,21 @@ impl App {
             "Explorer"
         });
         unsafe {
-            SetWindowTheme(
+            for control in [
                 self.navigation,
-                if self.colors.contrast {
-                    null()
-                } else {
-                    theme.as_ptr()
-                },
-                null(),
-            );
+                self.archive_options.format,
+                self.archive_options.level,
+            ] {
+                SetWindowTheme(
+                    control,
+                    if self.colors.contrast {
+                        null()
+                    } else {
+                        theme.as_ptr()
+                    },
+                    null(),
+                );
+            }
         }
         for handle in old {
             if !handle.is_null() {
@@ -1048,6 +1204,12 @@ impl App {
                 !status.another_copy
                     && (status.configured || status.running) == (id == WIN_E_BETTER)
             }),
+            FOLDER_DEFAULT_WINDOWS => {
+                self.folder_manager_status == Some(folder_manager::Status::Inactive)
+            }
+            FOLDER_DEFAULT_BETTER => {
+                self.folder_manager_status == Some(folder_manager::Status::Active)
+            }
             DATE_FORMAT_DAY_FIRST => {
                 self.settings.modified_date_format == ModifiedDateFormat::DayMonthYear
             }
@@ -1074,6 +1236,71 @@ impl App {
     fn update_modified_date_controls(&self) {
         for choice in DATE_CHOICES {
             self.update_setting_choice(choice, self.booted);
+        }
+    }
+
+    fn request_folder_manager(&mut self, enabled: Option<bool>) {
+        if self.folder_manager_busy {
+            return;
+        }
+        self.folder_manager_busy = true;
+        self.folder_manager_error = None;
+        self.update_folder_manager_controls();
+        let events = Arc::clone(&self.events);
+        let owner = self.window as usize;
+        let work = std::thread::Builder::new()
+            .name("Folder manager settings".into())
+            .spawn(move || {
+                let change = enabled.map(folder_manager::set_enabled).transpose();
+                let status = folder_manager::status();
+                let error = change
+                    .as_ref()
+                    .err()
+                    .or_else(|| status.as_ref().err())
+                    .map(ToString::to_string);
+                publish(
+                    &events,
+                    owner,
+                    Event::FolderManager {
+                        status: status.ok(),
+                        error,
+                    },
+                );
+            });
+        if let Err(error) = work {
+            self.folder_manager_busy = false;
+            self.folder_manager_error = Some(error.to_string());
+            self.update_folder_manager_controls();
+        }
+    }
+
+    fn update_folder_manager_controls(&self) {
+        let Some(controls) = &self.settings_controls else {
+            return;
+        };
+        let message = if let Some(error) = &self.folder_manager_error {
+            error.as_str()
+        } else if self.folder_manager_busy {
+            "Checking the folder default…"
+        } else {
+            match self.folder_manager_status {
+                Some(folder_manager::Status::Conflict) => {
+                    "Another copy or shell entry uses the BetterExplorer folder command."
+                }
+                Some(folder_manager::Status::Partial) => {
+                    "The folder default changed. Choose an option to update it."
+                }
+                Some(folder_manager::Status::Active) => {
+                    "Windows default restores the previous folder handler."
+                }
+                _ => "For folders and drives opened through the Windows shell.",
+            }
+        };
+        controls.set_folder_default_status(message);
+        for choice in FOLDER_DEFAULT_CHOICES {
+            let conflict = self.folder_manager_status == Some(folder_manager::Status::Conflict)
+                && choice.id == FOLDER_DEFAULT_BETTER;
+            self.update_setting_choice(choice, !self.folder_manager_busy && !conflict);
         }
     }
 
@@ -1349,6 +1576,8 @@ impl App {
         let drive_mode = self.drive_cards();
         let section = !matches!(self.location(), Location::Folder(_));
         let list_y = if section { 155 } else { 123 };
+        let archive_options = matches!(self.edit, Some(Edit::Compress(..)));
+        let stack_archive_actions = w - content_x < d(435);
         set_visible(self.title, section && !settings_tab && !home_tab);
         set_visible(self.summary, section && !settings_tab && !home_tab);
         if let Some(home) = &self.home {
@@ -1377,7 +1606,9 @@ impl App {
             d(list_y),
             list_width,
             status_y
-                - d(if self.edit.is_some() {
+                - d(if archive_options {
+                    list_y + if stack_archive_actions { 118 } else { 83 }
+                } else if self.edit.is_some() {
                     list_y + 48
                 } else {
                     list_y
@@ -1411,18 +1642,7 @@ impl App {
             d(195),
             d(40),
         );
-        let detail_top = if matches!(self.preview, Some(Content::Bitmap(_))) {
-            320
-        } else {
-            181
-        };
-        move_to(
-            self.detail_body,
-            listing_right + d(14),
-            d(detail_top),
-            d(196),
-            status_y - d(detail_top + 11),
-        );
+        self.layout_detail_body(listing_right, status_y);
         set_visible(self.detail_title, self.settings.details && !settings_tab);
         set_visible(self.detail_body, self.settings.details && !settings_tab);
         set_visible(self.status, !settings_tab);
@@ -1490,7 +1710,60 @@ impl App {
         ] {
             set_visible(control, self.edit.is_some());
         }
-        if self.edit.is_some() {
+        for control in self
+            .archive_options
+            .controls()
+            .into_iter()
+            .chain([self.button(ARCHIVE_BROWSE)])
+        {
+            set_visible(control, archive_options);
+        }
+        if archive_options {
+            let actions_y = status_y - d(39);
+            let options_y = actions_y - if stack_archive_actions { d(35) } else { 0 };
+            let path_y = options_y - d(35);
+            move_to(self.edit_label, content_x, path_y + d(5), d(84), d(24));
+            move_to(
+                self.edit_name,
+                content_x + d(86),
+                path_y,
+                w - content_x - d(185),
+                d(27),
+            );
+            pos(ARCHIVE_BROWSE, w - d(92), path_y, d(79), d(28));
+            move_to(
+                self.archive_options.format_label,
+                content_x,
+                options_y + d(5),
+                d(48),
+                d(24),
+            );
+            move_to(
+                self.archive_options.format,
+                content_x + d(50),
+                options_y,
+                d(66),
+                d(140),
+            );
+            move_to(
+                self.archive_options.level_label,
+                content_x + d(124),
+                options_y + d(5),
+                d(83),
+                d(24),
+            );
+            let level_right = w - d(if stack_archive_actions { 13 } else { 155 });
+            let level_x = content_x + d(209);
+            move_to(
+                self.archive_options.level,
+                level_x,
+                options_y,
+                (level_right - level_x).min(d(106)),
+                d(140),
+            );
+            pos(ACCEPT, w - d(147), actions_y, d(63), d(28));
+            pos(CANCEL, w - d(76), actions_y, d(63), d(28));
+        } else if self.edit.is_some() {
             let y = status_y - d(39);
             move_to(self.edit_label, content_x, y + d(5), d(154), d(24));
             move_to(
@@ -2421,16 +2694,20 @@ impl App {
                 watcher.watch(self.id, None);
             }
             self.request_hotkey(HotkeyRequest::Read);
+            self.request_folder_manager(None);
             return;
         }
         if let Some(scanner) = &self.scanner {
-            scanner.request(Request {
-                id: self.id,
-                location: self.location().clone(),
-                hidden: self.settings.hidden,
-                sort: self.sort(),
-                pins: self.settings.pins.clone(),
-            });
+            scanner.request_revealing(
+                Request {
+                    id: self.id,
+                    location: self.location().clone(),
+                    hidden: self.settings.hidden,
+                    sort: self.sort(),
+                    pins: self.settings.pins.clone(),
+                },
+                self.launch_selection.clone(),
+            );
         }
         if let Some(watcher) = &self.watcher {
             watcher.watch(self.id, self.dest());
@@ -2497,14 +2774,14 @@ impl App {
                     self.rebuild_visible();
                     self.update_drive_buttons();
                     self.restore_list_selection(selection);
+                    self.apply_launch_selection();
                     self.update_preview();
                     self.status();
                     self.layout();
                 }
                 Event::Scan(_) => (),
                 Event::Preview(id, content) if id == self.preview_id => {
-                    self.preview = content;
-                    self.layout();
+                    self.set_preview(content);
                     self.status();
                 }
                 Event::Preview(..) => (),
@@ -2520,6 +2797,12 @@ impl App {
                     self.hotkey_status = status;
                     self.hotkey_error = error;
                     self.update_shortcut_controls();
+                }
+                Event::FolderManager { status, error } => {
+                    self.folder_manager_status = status;
+                    self.folder_manager_error = error;
+                    self.folder_manager_busy = false;
+                    self.update_folder_manager_controls();
                 }
                 Event::SettingsError(error) => {
                     self.note = Some(error);
@@ -2541,6 +2824,7 @@ impl App {
                         self.schedule_save();
                     }
                     self.busy = self.busy.saturating_sub(1);
+                    self.sync_cut();
                     if refresh {
                         self.reload(true);
                     }
@@ -2731,6 +3015,57 @@ impl App {
         }
     }
 
+    fn apply_launch_selection(&mut self) {
+        let Some(target) = self.launch_selection.take() else {
+            return;
+        };
+        if target.parent() != self.location().directory() {
+            return;
+        }
+        let Some(name) = target.file_name().map(wide) else {
+            return;
+        };
+        let mut index = None;
+        for row in 0..self.visible.len() {
+            let Some(entry) = self.entry(row) else {
+                continue;
+            };
+            if entry.path == target {
+                index = Some(row);
+                break;
+            }
+            if index.is_none()
+                && unsafe {
+                    windows_sys::Win32::Globalization::CompareStringOrdinal(
+                        entry.name.as_ptr(),
+                        -1,
+                        name.as_ptr(),
+                        -1,
+                        1,
+                    ) == 2
+                }
+            {
+                index = Some(row);
+            }
+        }
+        if let Some(index) = index {
+            self.clear_selection();
+            let state = LVITEMW {
+                state: LVIS_SELECTED | LVIS_FOCUSED,
+                stateMask: LVIS_SELECTED | LVIS_FOCUSED,
+                ..unsafe { zeroed() }
+            };
+            send(
+                self.list,
+                LVM_SETITEMSTATE,
+                index,
+                &state as *const _ as isize,
+            );
+            send(self.list, LVM_SETSELECTIONMARK, 0, index as isize);
+            send(self.list, LVM_ENSUREVISIBLE, index, 0);
+        }
+    }
+
     fn restore_list_selection(&self, selection: ListSelection) {
         let mut anchor = -1;
         if selection.focused.is_some() || selection.anchor.is_some() || !selection.paths.is_empty()
@@ -2785,6 +3120,60 @@ impl App {
             .collect()
     }
 
+    fn layout_detail_body(&self, listing_right: i32, status_y: i32) {
+        let d = |value| scale(value, self.dpi);
+        let top = if matches!(self.preview, Some(Content::Bitmap(_))) {
+            320
+        } else {
+            181
+        };
+        move_to(
+            self.detail_body,
+            listing_right + d(14),
+            d(top),
+            d(196),
+            status_y - d(top + 11),
+        );
+    }
+
+    fn set_preview(&mut self, preview: Option<Content>) {
+        let bitmap_changed = matches!(self.preview, Some(Content::Bitmap(_)))
+            || matches!(preview, Some(Content::Bitmap(_)));
+        self.preview = preview;
+        if bitmap_changed && self.settings.details && *self.location() != Location::Settings {
+            let d = |value| scale(value, self.dpi);
+            let bounds = rect(self.window);
+            let left = bounds.right - d(226);
+            let bottom = bounds.bottom - d(27);
+            self.layout_detail_body(left, bottom);
+            let detail = RECT {
+                left,
+                top: d(172),
+                right: bounds.right,
+                bottom,
+            };
+            unsafe {
+                RedrawWindow(
+                    self.window,
+                    &detail,
+                    null_mut(),
+                    RDW_INVALIDATE | RDW_ALLCHILDREN,
+                );
+            }
+        }
+    }
+
+    fn sync_cut(&mut self) {
+        if self
+            .cut
+            .as_ref()
+            .is_some_and(|cut| !cut.receipt.is_current())
+        {
+            self.cut = None;
+            unsafe { InvalidateRect(self.list, null(), 0) };
+        }
+    }
+
     fn update_preview(&mut self) {
         let requested = if self.settings.details && self.selection_count() == 1 {
             self.first_selected()
@@ -2798,7 +3187,7 @@ impl App {
         }
         self.preview_key = requested;
         self.preview_id = self.preview_id.wrapping_add(1).max(1);
-        self.preview = None;
+        self.set_preview(None);
         if let Some((path, _, _)) = &self.preview_key {
             if self.preview_worker.is_none() {
                 let events = Arc::clone(&self.events);
@@ -2811,7 +3200,6 @@ impl App {
                 worker.request(self.preview_id, path.clone());
             }
         }
-        self.layout();
     }
 
     fn status(&self) {
@@ -2841,7 +3229,13 @@ impl App {
         } else {
             format!("{items} items")
         };
-        text(self.summary, &summary);
+        {
+            let mut shown = self.summary_text.borrow_mut();
+            if *shown != summary {
+                text(self.summary, &summary);
+                shown.clone_from(&summary);
+            }
+        }
         let status = if let Some(message) = self.note.as_ref().or(self.error.as_ref()) {
             message.clone()
         } else if self.busy != 0 {
@@ -2886,7 +3280,7 @@ impl App {
             summary
         };
         text(self.status, status);
-        let selected = self.first_selected();
+        let selected = (count != 0).then(|| self.first_selected()).flatten();
         let actionable = !home && selected.is_some_and(|entry| !entry.location);
         for id in [CUT, COPY] {
             set_enabled(self.button(id), actionable);
@@ -2897,6 +3291,11 @@ impl App {
         );
         set_enabled(self.button(RENAME), actionable && count == 1);
         if self.settings.details {
+            if count > 1 {
+                text(self.detail_title, format!("{count} items selected"));
+                text(self.detail_body, "");
+                return;
+            }
             match selected {
                 Some(entry) => {
                     text(self.detail_title, entry.label());
@@ -3113,13 +3512,16 @@ impl App {
 
     fn begin_edit(&mut self, edit: Edit, prompt: &str, value: impl AsRef<OsStr>) {
         let deletion = matches!(edit, Edit::Delete(_));
+        let accept = match &edit {
+            Edit::Delete(_) => "Delete",
+            Edit::NewShortcut(_) => "Next",
+            Edit::Compress(..) => "Create",
+            _ => "Apply",
+        };
         self.edit = Some(edit);
         text(self.edit_label, prompt);
         text(self.edit_name, value);
-        text(
-            self.button(ACCEPT),
-            if deletion { "Delete" } else { "Apply" },
-        );
+        text(self.button(ACCEPT), accept);
         self.layout();
         if deletion {
             unsafe {
@@ -3141,10 +3543,56 @@ impl App {
                 paths,
                 permanent: true,
             },
+            Edit::Compress(sources, target) => {
+                let options = self.archive_options.compression();
+                let output = compression_output(Path::new(&name), options.format)
+                    .map(|path| target.join(path))
+                    .filter(|path| path.is_absolute());
+                let Some(output) = output else {
+                    self.edit = Some(Edit::Compress(sources, target));
+                    self.note = Some("Enter a valid archive path and file name.".into());
+                    self.status();
+                    return;
+                };
+                Operation::Compress {
+                    sources,
+                    output,
+                    options,
+                    automatic: false,
+                }
+            }
+            Edit::NewShortcut(target) => {
+                let input = name.trim();
+                let input = input
+                    .strip_prefix('"')
+                    .and_then(|value| value.strip_suffix('"'))
+                    .unwrap_or(input);
+                if input.is_empty() {
+                    self.edit = Some(Edit::NewShortcut(target));
+                    self.note = Some("Enter the path to a file or folder.".into());
+                    self.status();
+                    return;
+                }
+                let source = target.join(input);
+                self.note = None;
+                self.begin_edit(
+                    Edit::Shortcut(source, target),
+                    "Shortcut name",
+                    "New Shortcut.lnk",
+                );
+                self.status();
+                return;
+            }
             edit => {
                 if let Edit::Rename(_, Some(extension)) = &edit {
                     name.push('.');
                     name.push_str(&extension.to_string_lossy());
+                }
+                if let Edit::CreateDocument(_, kind) = &edit {
+                    let extension = kind.extension();
+                    if !name.is_empty() && !name.to_ascii_lowercase().ends_with(extension) {
+                        name.push_str(extension);
+                    }
                 }
                 if !safe_name(&name) {
                     self.edit = Some(edit);
@@ -3158,6 +3606,11 @@ impl App {
                         name,
                         directory,
                     },
+                    Edit::CreateDocument(target, template) => Operation::CreateDocument {
+                        target,
+                        name,
+                        template,
+                    },
                     Edit::Rename(path, _) => Operation::Rename { path, name },
                     Edit::Shortcut(source, target) => {
                         if !name.to_ascii_lowercase().ends_with(".lnk") {
@@ -3168,20 +3621,7 @@ impl App {
                             target: target.join(name),
                         }
                     }
-                    Edit::Compress(sources, folder) => {
-                        if !name.to_ascii_lowercase().ends_with(".zip") {
-                            name.push_str(".zip");
-                        }
-                        Operation::Compress {
-                            sources,
-                            output: folder.join(name),
-                        }
-                    }
-                    Edit::Extract(source, folder) => Operation::Extract {
-                        source,
-                        output: folder.join(name),
-                    },
-                    Edit::Delete(_) => unreachable!(),
+                    Edit::Compress(..) | Edit::Delete(_) | Edit::NewShortcut(_) => unreachable!(),
                 }
             }
         };
@@ -3189,6 +3629,51 @@ impl App {
         self.operation(operation);
         unsafe {
             SetFocus(self.list);
+        }
+    }
+
+    fn archive_format_changed(&self) {
+        let format = self.archive_options.format();
+        set_enabled(self.archive_options.level, format != Format::Tar);
+        let name = read(self.edit_name);
+        if let Some(output) = compression_output(Path::new(&name), format) {
+            text(self.edit_name, output);
+        }
+    }
+
+    fn compress(&mut self, format: Format, advanced: bool) {
+        let sources = self.selected_paths();
+        let (Some(first), Some(target)) = (sources.first(), self.dest()) else {
+            return;
+        };
+        let stem = if sources.len() == 1 {
+            if self.first_selected().is_some_and(|entry| entry.directory) {
+                first.file_name()
+            } else {
+                first.file_stem()
+            }
+            .unwrap_or(OsStr::new("Archive"))
+        } else {
+            OsStr::new("Archive")
+        };
+        let extension = format!(".{}", format.extension());
+        let output = target.join(archive::suggested_name(&stem.to_string_lossy(), &extension));
+        if advanced {
+            send(self.archive_options.format, CB_SETCURSEL, 0, 0);
+            send(self.archive_options.level, CB_SETCURSEL, 0, 0);
+            set_enabled(self.archive_options.level, true);
+            self.begin_edit(Edit::Compress(sources, target), "Archive path", output);
+            send(self.edit_name, EM_SETREADONLY, 0, 0);
+        } else {
+            self.operation(Operation::Compress {
+                sources,
+                output,
+                options: Compression {
+                    format,
+                    level: Level::Fast,
+                },
+                automatic: true,
+            });
         }
     }
 
@@ -3360,6 +3845,11 @@ impl App {
             WIN_E_WINDOWS | WIN_E_BETTER if *self.location() == Location::Settings => {
                 self.request_hotkey(HotkeyRequest::Change(id == WIN_E_BETTER));
             }
+            FOLDER_DEFAULT_WINDOWS | FOLDER_DEFAULT_BETTER
+                if *self.location() == Location::Settings =>
+            {
+                self.request_folder_manager(Some(id == FOLDER_DEFAULT_BETTER));
+            }
             DATE_FORMAT_DAY_FIRST | DATE_FORMAT_MONTH_FIRST
                 if self.booted && *self.location() == Location::Settings =>
             {
@@ -3427,12 +3917,20 @@ impl App {
                 let paths = self.selected_paths();
                 if !paths.is_empty() {
                     let receipt = shell::ClipboardWriteReceipt::capture();
+                    let cut = (id == CUT).then(|| CutSelection {
+                        paths: paths.iter().cloned().collect(),
+                        receipt: receipt.clone(),
+                    });
                     if self.operation(Operation::Clipboard {
                         paths,
                         cut: id == CUT,
                         receipt: receipt.clone(),
                     }) {
                         self.clipboard_write = Some(receipt);
+                        if let Some(cut) = cut {
+                            self.cut = Some(cut);
+                            unsafe { InvalidateRect(self.list, null(), 0) };
+                        }
                     }
                 }
             }
@@ -3489,21 +3987,25 @@ impl App {
                     send(self.edit_name, EM_SETREADONLY, 1, 0);
                 }
             }
-            NEW_FOLDER | NEW_TEXT => {
+            NEW_FOLDER => {
                 if let Some(target) = self.dest() {
-                    let directory = id == NEW_FOLDER;
+                    self.begin_edit(Edit::Create(target, true), "New folder name", "New folder");
+                    send(self.edit_name, EM_SETREADONLY, 0, 0);
+                }
+            }
+            NEW_SHORTCUT => {
+                if let Some(target) = self.dest() {
+                    self.begin_edit(Edit::NewShortcut(target), "File or folder path", "");
+                    send(self.edit_name, EM_SETREADONLY, 0, 0);
+                }
+            }
+            NEW_DOCUMENT_START..=NEW_DOCUMENT_END => {
+                let kind = available_documents().find(|kind| document_command(*kind) == id);
+                if let (Some(target), Some(kind)) = (self.dest(), kind) {
                     self.begin_edit(
-                        Edit::Create(target, directory),
-                        if directory {
-                            "New folder name"
-                        } else {
-                            "New document name"
-                        },
-                        if directory {
-                            "New folder"
-                        } else {
-                            "New Text Document.txt"
-                        },
+                        Edit::CreateDocument(target, kind),
+                        "New file name",
+                        format!("New {}{}", kind.title(), kind.extension()),
                     );
                     send(self.edit_name, EM_SETREADONLY, 0, 0);
                 }
@@ -3532,36 +4034,30 @@ impl App {
                     send(self.edit_name, EM_SETREADONLY, 0, 0);
                 }
             }
-            COMPRESS => {
-                let sources = self.selected_paths();
-                if let (Some(first), Some(target)) = (sources.first(), self.dest()) {
-                    let default = if sources.len() == 1 {
-                        let base = first.file_stem().unwrap_or(OsStr::new("Archive"));
-                        format!("{}.zip", base.to_string_lossy())
-                    } else {
-                        "Archive.zip".into()
-                    };
-                    self.begin_edit(Edit::Compress(sources, target), "ZIP archive name", default);
-                    send(self.edit_name, EM_SETREADONLY, 0, 0);
-                }
-            }
+            COMPRESS_ZIP => self.compress(Format::Zip, false),
+            COMPRESS_7Z => self.compress(Format::SevenZip, false),
+            COMPRESS_TAR => self.compress(Format::Tar, false),
+            COMPRESS_OPTIONS => self.compress(Format::Zip, true),
             EXTRACT => {
+                if self.selection_count() != 1 {
+                    return;
+                }
                 if let Some(entry) = self
                     .first_selected()
-                    .filter(|item| is_zip(&item.path) && !item.directory)
+                    .filter(|entry| !entry.directory && Format::from_path(&entry.path).is_some())
                 {
                     let source = entry.path.clone();
                     if let Some(parent) = source.parent() {
-                        let default = source
+                        let stem = source
                             .file_stem()
-                            .unwrap_or(OsStr::new("Extracted"))
-                            .to_owned();
-                        self.begin_edit(
-                            Edit::Extract(source.clone(), parent.into()),
-                            "Extract to folder",
-                            default,
-                        );
-                        send(self.edit_name, EM_SETREADONLY, 0, 0);
+                            .and_then(OsStr::to_str)
+                            .unwrap_or("Extracted");
+                        let output = parent.join(archive::suggested_name(stem, ""));
+                        self.operation(Operation::Extract {
+                            source,
+                            output,
+                            automatic: true,
+                        });
                     }
                 }
             }
@@ -3876,6 +4372,7 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        self.drop_target.take();
         unsafe {
             for image in self.images {
                 if image != 0 {
@@ -3898,6 +4395,10 @@ struct MenuItem {
     checked: bool,
     submenu: bool,
     children: Vec<MenuItem>,
+}
+
+const fn document_command(kind: DocumentKind) -> u16 {
+    NEW_DOCUMENT_START + kind as u16
 }
 
 impl MenuItem {
@@ -3938,7 +4439,9 @@ impl MenuItem {
             REFRESH => Glyph::Refresh,
             NEW => Glyph::Add,
             NEW_FOLDER => Glyph::Folder,
-            NEW_TEXT => Glyph::Document,
+            NEW_SHORTCUT => Glyph::Shortcut,
+            NEW_DOCUMENT_END => Glyph::Archive,
+            NEW_DOCUMENT_START..=NEW_DOCUMENT_END => Glyph::Document,
             OPEN => Glyph::Forward,
             OPEN_TAB => Glyph::NewTab,
             OPEN_WINDOW => Glyph::Restore,
@@ -3956,7 +4459,7 @@ impl MenuItem {
             COPY_PATH | FOLDER_COPY_PATH => Glyph::Link,
             PIN => Glyph::Pushpin,
             FAVORITE => Glyph::Pin,
-            COMPRESS | EXTRACT => Glyph::Archive,
+            COMPRESS | EXTRACT | COMPRESS_ZIP | COMPRESS_7Z | COMPRESS_TAR => Glyph::Archive,
             PROPERTIES | FOLDER_PROPERTIES => Glyph::Settings,
             _ => return None,
         })
@@ -3983,10 +4486,13 @@ impl App {
         let item = MenuItem::new;
         let line = MenuItem::separator;
         match id {
-            NEW => vec![
+            NEW => [
                 item(NEW_FOLDER, "Folder\tCtrl+Shift+N"),
-                item(NEW_TEXT, "Text Document"),
-            ],
+                item(NEW_SHORTCUT, "Shortcut"),
+            ]
+            .into_iter()
+            .chain(available_documents().map(|kind| item(document_command(kind), kind.title())))
+            .collect(),
             SORT => {
                 let sort = self.sort();
                 vec![
@@ -4211,10 +4717,20 @@ impl App {
                         ));
                     }
                     if !entry.location && self.dest().is_some() {
-                        items.push(item(COMPRESS, "Compress to ZIP…"));
+                        items.push(MenuItem::submenu(
+                            COMPRESS,
+                            "Compress to",
+                            vec![
+                                item(COMPRESS_ZIP, "ZIP File"),
+                                item(COMPRESS_7Z, "7z File"),
+                                item(COMPRESS_TAR, "TAR File"),
+                                line(),
+                                item(COMPRESS_OPTIONS, "More options…"),
+                            ],
+                        ));
                     }
-                    if !entry.directory && count == 1 && is_zip(&entry.path) {
-                        items.push(item(EXTRACT, "Extract all…"));
+                    if !entry.directory && count == 1 && Format::from_path(&entry.path).is_some() {
+                        items.push(item(EXTRACT, "Extract all"));
                     }
                     items.extend([
                         item(SHORTCUT, "Create shortcut…")
@@ -4682,6 +5198,16 @@ impl App {
                     .get(item.iItem as usize)
                     .and_then(|&row| self.rows.get(row))
                 {
+                    if item.mask & LVIF_STATE != 0 && item.stateMask & LVIS_CUT != 0 {
+                        item.state &= !LVIS_CUT;
+                        if self
+                            .cut
+                            .as_ref()
+                            .is_some_and(|cut| cut.paths.contains(&entry.path))
+                        {
+                            item.state |= LVIS_CUT;
+                        }
+                    }
                     if item.mask & LVIF_IMAGE != 0 {
                         item.iImage = if matches!(self.location(), Location::Computer) {
                             2
@@ -4760,10 +5286,17 @@ impl App {
                 }
             }
             LVN_ITEMCHANGED | LVN_ODSTATECHANGED => {
-                if !self.selection_event {
+                let (old, new) = if header.code == LVN_ITEMCHANGED {
+                    let event = unsafe { &*(notification as *const NMLISTVIEW) };
+                    (event.uOldState, event.uNewState)
+                } else {
+                    let event = unsafe { &*(notification as *const NMLVODSTATECHANGE) };
+                    (event.uOldState, event.uNewState)
+                };
+                if (old ^ new) & LVIS_SELECTED != 0 && !self.selection_event {
                     self.selection_event = true;
-                    unsafe {
-                        PostMessageW(self.window, SELECTION_CHANGED, 0, 0);
+                    if unsafe { PostMessageW(self.window, SELECTION_CHANGED, 0, 0) } == 0 {
+                        self.selection_event = false;
                     }
                 }
             }
@@ -4952,6 +5485,208 @@ mod context_menu_tests {
     }
 
     #[test]
+    fn new_menu_uses_the_same_document_and_shortcut_commands_in_both_places() {
+        unsafe {
+            let controls = INITCOMMONCONTROLSEX {
+                dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
+                dwICC: ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES,
+            };
+            assert_ne!(InitCommonControlsEx(&controls), 0);
+            let window = CreateWindowExW(
+                0,
+                wide("Static").as_ptr(),
+                null(),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                960,
+                608,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null(),
+            );
+            assert!(!window.is_null());
+            let fixture = tempfile::tempdir().unwrap();
+            let folder = fixture.path().to_owned();
+            let mut app = App::create(window, Some(folder.clone()), false, Settings::default());
+            let (operations, pending) = sync_channel(2);
+            app.operations = Some(operations);
+
+            let toolbar = app.menu(NEW);
+            let background = app.menu(CONTEXT);
+            let new = background.iter().find(|item| item.id == NEW).unwrap();
+            assert!(new.enabled);
+            assert_eq!(
+                toolbar.iter().map(|item| item.id).collect::<Vec<_>>(),
+                new.children.iter().map(|item| item.id).collect::<Vec<_>>(),
+            );
+
+            app.command(document_command(DocumentKind::Word));
+            text(app.edit_name, "Draft");
+            app.command(ACCEPT);
+            assert!(matches!(
+                pending.try_recv(),
+                Ok(Operation::CreateDocument { target, name, template: DocumentKind::Word })
+                    if target == folder && name == "Draft.docx"
+            ));
+
+            app.command(NEW_SHORTCUT);
+            text(app.edit_name, "\"Résumé.txt\"");
+            app.command(ACCEPT);
+            text(app.edit_name, "Shortcut");
+            app.command(ACCEPT);
+            assert!(matches!(
+                pending.try_recv(),
+                Ok(Operation::Shortcut { source, target })
+                    if source == folder.join("Résumé.txt") && target == folder.join("Shortcut.lnk")
+            ));
+            DestroyWindow(window);
+        }
+    }
+
+    #[test]
+    fn archive_menu_runs_quick_actions_and_keeps_advanced_options_accessible() {
+        unsafe {
+            let controls = INITCOMMONCONTROLSEX {
+                dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
+                dwICC: ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES,
+            };
+            assert_ne!(InitCommonControlsEx(&controls), 0);
+            let window = CreateWindowExW(
+                0,
+                wide("Static").as_ptr(),
+                null(),
+                WS_POPUP,
+                0,
+                0,
+                960,
+                608,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null(),
+            );
+            assert!(!window.is_null());
+            let fixture = tempfile::tempdir().unwrap();
+            let folder = fixture.path().to_owned();
+            let source = folder.join("Report.v2.7Z");
+            let mut app = App::create(window, Some(folder.clone()), false, Settings::default());
+            let (operations, pending) = sync_channel(1);
+            app.operations = Some(operations);
+            app.rows.push(Arc::new(Entry {
+                path: source.clone(),
+                name: wide("Report.v2.7Z"),
+                extension: wide("7Z"),
+                directory: false,
+                size: 0,
+                modified: 0,
+                location: false,
+                capacity: None,
+                shell_item: None,
+            }));
+            app.visible.push(0);
+            send(app.list, LVM_SETITEMCOUNT, 1, 0);
+            let selected = LVITEMW {
+                state: LVIS_SELECTED,
+                stateMask: LVIS_SELECTED,
+                ..zeroed()
+            };
+            send(
+                app.list,
+                LVM_SETITEMSTATE,
+                0,
+                &selected as *const _ as LPARAM,
+            );
+
+            let menu = app.menu(CONTEXT);
+            let compress = menu.iter().find(|item| item.id == COMPRESS).unwrap();
+            assert!(compress.submenu);
+            for (command, extension, format) in [
+                (COMPRESS_ZIP, "zip", Format::Zip),
+                (COMPRESS_7Z, "7z", Format::SevenZip),
+                (COMPRESS_TAR, "tar", Format::Tar),
+            ] {
+                assert!(compress
+                    .children
+                    .iter()
+                    .any(|item| item.id == command && item.enabled));
+                app.command(command);
+                assert!(app.edit.is_none());
+                assert!(matches!(
+                    pending.try_recv(),
+                    Ok(Operation::Compress { sources, output, options, automatic: true })
+                        if sources == [source.clone()] && output == folder.join(format!("Report.v2.{extension}"))
+                            && options.format == format && options.level == Level::Fast
+                ));
+            }
+            assert!(menu.iter().any(|item| item.id == EXTRACT && item.enabled));
+            app.command(EXTRACT);
+            assert!(app.edit.is_none());
+            assert!(matches!(
+                pending.try_recv(),
+                Ok(Operation::Extract { source: archive, output, automatic: true })
+                    if archive == source && output == folder.join("Report.v2")
+            ));
+
+            assert!(compress
+                .children
+                .iter()
+                .any(|item| item.id == COMPRESS_OPTIONS && item.enabled));
+            app.command(COMPRESS_OPTIONS);
+            assert!(matches!(app.edit, Some(Edit::Compress(..))));
+            assert!(pending.try_recv().is_err());
+            text(app.edit_name, folder.join("Other").join("Custom.name.zip"));
+            send(app.archive_options.format, CB_SETCURSEL, 1, 0);
+            app.archive_format_changed();
+            send(app.archive_options.level, CB_SETCURSEL, 2, 0);
+            assert_eq!(
+                PathBuf::from(read(app.edit_name)),
+                folder.join("Other").join("Custom.name.7z"),
+            );
+
+            let bounds = |control| {
+                let mut rect = zeroed();
+                assert_ne!(GetWindowRect(control, &mut rect), 0);
+                rect
+            };
+            for dpi in [96, 120, 144] {
+                app.apply_dpi(dpi);
+                for width in [512, 552, 680, 960] {
+                    let width = scale(width, dpi);
+                    SetWindowPos(
+                        window,
+                        null_mut(),
+                        0,
+                        0,
+                        width,
+                        scale(608, dpi),
+                        SWP_NOZORDER,
+                    );
+                    app.layout();
+                    let level = bounds(app.archive_options.level);
+                    let create = bounds(app.button(ACCEPT));
+                    assert!(
+                        level.right <= create.left || level.bottom <= create.top,
+                        "compression options overlap Create at {width}px and {dpi} DPI",
+                    );
+                    assert!(bounds(app.edit_name).right < bounds(app.button(ARCHIVE_BROWSE)).left);
+                    assert!(level.right > level.left);
+                }
+            }
+
+            app.command(ACCEPT);
+            assert!(matches!(
+                pending.try_recv(),
+                Ok(Operation::Compress { sources, output, options, automatic: false })
+                    if sources == [source] && output == folder.join("Other").join("Custom.name.7z")
+                        && options.format == Format::SevenZip && options.level == Level::Smaller
+            ));
+            DestroyWindow(window);
+        }
+    }
+
+    #[test]
     fn control_z_and_y_queue_history_commands_and_preserve_text_editing() {
         unsafe {
             let controls = INITCOMMONCONTROLSEX {
@@ -5135,9 +5870,51 @@ fn show_menu(app: &RefCell<App>, id: u16, coordinates: LPARAM) {
     }
 }
 
-fn is_zip(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+fn compression_output(path: &Path, format: Format) -> Option<PathBuf> {
+    let leaf = path.file_name()?.to_str()?;
+    if !safe_name(leaf) || path.as_os_str().to_str()?.ends_with(['/', '\\']) {
+        return None;
+    }
+    let name = match Format::from_path(path) {
+        Some(typed) if typed == format => return Some(path.to_owned()),
+        Some(_) => format!("{}.{}", path.file_stem()?.to_str()?, format.extension()),
+        None => format!("{leaf}.{}", format.extension()),
+    };
+    safe_name(&name).then(|| path.with_file_name(name))
+}
+
+fn browse_archive_folder(app: &RefCell<App>) {
+    let (window, target, name) = {
+        let Ok(app) = app.try_borrow() else { return };
+        let Some(Edit::Compress(_, target)) = &app.edit else {
+            return;
+        };
+        (app.window, target.clone(), read(app.edit_name))
+    };
+    let path = target.join(&name);
+    let initial = path
+        .parent()
+        .filter(|parent| parent.is_absolute())
+        .unwrap_or(&target);
+    let result = shell::choose_archive_folder(window as usize, initial);
+    let mut app = app.borrow_mut();
+    if !matches!(&app.edit, Some(Edit::Compress(_, folder)) if *folder == target) {
+        return;
+    }
+    match result {
+        Ok(Some(folder)) => {
+            let leaf = Path::new(&name)
+                .file_name()
+                .unwrap_or(OsStr::new("Archive"));
+            text(app.edit_name, folder.join(leaf));
+            app.archive_format_changed();
+        }
+        Ok(None) => {}
+        Err(error) => {
+            app.note = Some(format!("Could not browse for an archive folder. {error}"));
+            app.status();
+        }
+    }
 }
 
 fn title_tab_widths(width: i32, count: i32, motif_width: i32, dpi: u32) -> (i32, i32) {
@@ -5181,6 +5958,18 @@ fn key(app: &RefCell<App>, message: &MSG) -> bool {
         return false;
     };
     let focus = unsafe { GetFocus() };
+    if matches!(app.edit, Some(Edit::Compress(..))) {
+        if focus == app.button(ARCHIVE_BROWSE) && message.wParam as u16 == VK_RETURN {
+            unsafe { PostMessageW(app.window, WM_COMMAND, ARCHIVE_BROWSE as WPARAM, 0) };
+            return true;
+        }
+        if [app.archive_options.format, app.archive_options.level].contains(&focus)
+            && matches!(message.wParam as u16, VK_RETURN | VK_ESCAPE)
+            && send(focus, CB_GETDROPPEDSTATE, 0, 0) != 0
+        {
+            return false;
+        }
+    }
     let edit = if app.edit.is_some() {
         app.edit_name
     } else {
@@ -5261,6 +6050,15 @@ fn key(app: &RefCell<App>, message: &MSG) -> bool {
         (VK_RETURN, false, true, _) if focus == app.list => PROPERTIES,
         (VK_ESCAPE, false, false, _) if app.edit.is_some() => CANCEL,
         (VK_ESCAPE, false, false, _) if app.scanning && app.location().is_search() => STOP_SEARCH,
+        (VK_ESCAPE, false, false, _) if focus == app.list && app.cut.is_some() => {
+            if let Some(receipt) = app.cut.as_ref().map(|cut| cut.receipt.clone()) {
+                if app.operation(Operation::CancelCut(receipt.clone())) {
+                    receipt.cancel_pending();
+                    app.sync_cut();
+                }
+            }
+            return true;
+        }
         (0x41, true, false, false) if !typing && *app.location() != Location::Home => SELECT_ALL,
         (0x58, true, false, false) if !typing => CUT,
         (0x43, true, false, false) if !typing => COPY,
@@ -5399,6 +6197,10 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
         return unsafe { DefWindowProcW(window, message, wp, lp) };
     }
     let cell = unsafe { &*pointer };
+    if message == WM_COMMAND && wp == ARCHIVE_BROWSE as WPARAM {
+        browse_archive_folder(cell);
+        return 0;
+    }
     if message == BENCH_STARTED {
         let mut bench = cell.borrow_mut().bench.take();
         if let Some(bench) = &mut bench {
@@ -5460,7 +6262,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
             paths
         };
         // DoDragDrop runs a modal Windows message loop, so the app cannot be borrowed here.
-        let result = better_explorer::drag_drop::copy_paths(&paths);
+        let result = drag_drop::drag_paths(&paths);
         let mut app = cell.borrow_mut();
         app.active_drag = false;
         if let Err(error) = result {
@@ -5470,7 +6272,13 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
         return 0;
     }
     if message == WM_DESTROY {
+        let drop_target = cell
+            .try_borrow_mut()
+            .ok()
+            .and_then(|mut app| app.drop_target.take());
+        drop(drop_target);
         unsafe {
+            RemoveClipboardFormatListener(window);
             PostQuitMessage(0);
         }
         return 0;
@@ -5499,6 +6307,10 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
             0
         }
         WM_COMMAND => {
+            if wp as u16 == ARCHIVE_FORMAT && wp >> 16 == CBN_SELCHANGE as usize {
+                app.archive_format_changed();
+                return 0;
+            }
             if wp as u16 == NAVIGATION && wp >> 16 == LBN_SELCHANGE as usize {
                 app.select_sidebar();
                 return 0;
@@ -5559,6 +6371,10 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
             app.note = None;
             app.update_preview();
             app.status();
+            0
+        }
+        WM_CLIPBOARDUPDATE => {
+            app.sync_cut();
             0
         }
         CHANGE if wp == app.id as usize => {
@@ -5751,11 +6567,16 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
         }
         WM_DROPFILES => {
             let handle = wp as HDROP;
-            let paths = unsafe { shell::dropped_paths(handle) };
-            unsafe {
+            let mut point = POINT { x: 0, y: 0 };
+            let paths = unsafe {
+                DragQueryPoint(handle, &mut point);
+                let paths = shell::dropped_paths(handle);
                 DragFinish(handle);
-            }
-            if let Some(target) = app.dest() {
+                ClientToScreen(window, &mut point);
+                paths
+            };
+            if let Some(target) = app.file_drop_folder(point) {
+                let paths = drag_drop::legacy_copy_paths(paths, &target);
                 if !paths.is_empty() {
                     app.operation(Operation::Transfer {
                         paths,
@@ -5789,7 +6610,9 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
                 return 0;
             }
             let position = WindowPosition::normal(window).or(app.normal_position);
+            let drop_target = app.drop_target.take();
             drop(app);
+            drop(drop_target);
             if let Some(position) = position {
                 let _ = position.save();
             }
@@ -5805,6 +6628,48 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
             unsafe { DefWindowProcW(window, message, wp, lp) }
         }
     }
+}
+
+fn register_file_drop_target(window: HWND, cell: &RefCell<App>) {
+    let result = WindowDropTarget::register(
+        windows::Win32::Foundation::HWND(window),
+        move |point| {
+            with_file_drop_app(window, |app| {
+                app.try_borrow().ok()?.file_drop_folder(POINT {
+                    x: point.x,
+                    y: point.y,
+                })
+            })
+        },
+        move |paths, target, moving| {
+            with_file_drop_app(window, |app| {
+                Some(app.try_borrow_mut().ok()?.operation(Operation::Transfer {
+                    paths,
+                    target,
+                    moving,
+                }))
+            })
+            .unwrap_or(false)
+        },
+    );
+    let mut app = cell.borrow_mut();
+    match result {
+        Ok(target) => app.drop_target = Some(target),
+        Err(error) => {
+            unsafe { DragAcceptFiles(window, 1) };
+            app.note = Some(error);
+            app.status();
+        }
+    }
+}
+
+fn with_file_drop_app<T>(
+    window: HWND,
+    action: impl FnOnce(&RefCell<App>) -> Option<T>,
+) -> Option<T> {
+    let pointer = unsafe { GetWindowLongPtrW(window, GWLP_USERDATA) } as *const RefCell<App>;
+    // The registration is revoked before run() drops the App stored in GWLP_USERDATA.
+    unsafe { pointer.as_ref() }.and_then(action)
 }
 
 fn set_composition(window: HWND, enabled: bool) {
@@ -6047,7 +6912,7 @@ impl Drop for SettingsLease {
     }
 }
 
-pub fn run(path: Option<PathBuf>) -> Result<(), std::io::Error> {
+pub fn run(path: Option<PathBuf>, selection: Option<PathBuf>) -> Result<(), std::io::Error> {
     unsafe {
         let settings = SettingsLease::acquire();
         let controls = INITCOMMONCONTROLSEX {
@@ -6128,6 +6993,7 @@ pub fn run(path: Option<PathBuf>) -> Result<(), std::io::Error> {
             settings.is_some(),
             read_settings(),
         )));
+        app.borrow_mut().launch_selection = selection;
         SetWindowLongPtrW(
             window,
             GWLP_USERDATA,
@@ -6144,6 +7010,7 @@ pub fn run(path: Option<PathBuf>) -> Result<(), std::io::Error> {
                 SetWindowSubclass(button, Some(button_proc), 1, 0);
             }
         }
+        register_file_drop_target(window, &app);
         let without_activation = std::env::var_os("BETTEREXPLORER_BENCH_NOACTIVATE").is_some();
         ShowWindow(
             window,
@@ -6201,7 +7068,181 @@ mod group_tests {
     };
 
     #[test]
-    fn keyboard_moves_across_date_headings_without_selecting_them() {
+    fn browse_drop_target_uses_the_folder_row_and_icon_under_the_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("Destination");
+        std::fs::create_dir(&destination).unwrap();
+        unsafe {
+            let controls = INITCOMMONCONTROLSEX {
+                dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
+                dwICC: ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES,
+            };
+            assert_ne!(InitCommonControlsEx(&controls), 0);
+            let window = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                wide("Static").as_ptr(),
+                null(),
+                WS_POPUP | WS_VISIBLE,
+                -20_000,
+                -20_000,
+                900,
+                700,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null(),
+            );
+            assert!(!window.is_null());
+            let app = Box::new(RefCell::new(App::create(
+                window,
+                Some(directory.path().to_path_buf()),
+                false,
+                Settings::default(),
+            )));
+            SetWindowLongPtrW(
+                window,
+                GWLP_USERDATA,
+                (&*app as *const RefCell<App>) as isize,
+            );
+            register_file_drop_target(window, &app);
+            {
+                let mut app = app.borrow_mut();
+                assert!(app.drop_target.is_some());
+                app.rows = vec![Arc::new(Entry {
+                    path: destination.clone(),
+                    name: wide("Destination"),
+                    extension: Vec::new(),
+                    directory: true,
+                    size: 0,
+                    modified: 0,
+                    location: false,
+                    capacity: None,
+                    shell_item: None,
+                })];
+                app.rebuild_visible();
+                for view in [LV_VIEW_DETAILS, LV_VIEW_ICON] {
+                    app.apply_view(view);
+                    let row = app.visible.iter().position(|&row| row == 0).unwrap();
+                    let mut bounds = RECT {
+                        left: LVIR_ICON as i32,
+                        ..zeroed()
+                    };
+                    assert_ne!(
+                        send(
+                            app.list,
+                            LVM_GETITEMRECT,
+                            row,
+                            &mut bounds as *mut _ as LPARAM
+                        ),
+                        0
+                    );
+                    let mut point = POINT {
+                        x: (bounds.left + bounds.right) / 2,
+                        y: (bounds.top + bounds.bottom) / 2,
+                    };
+                    assert_ne!(ClientToScreen(app.list, &mut point), 0);
+                    assert_eq!(
+                        app.file_drop_folder(point).as_deref(),
+                        Some(destination.as_path()),
+                        "view {view}"
+                    );
+                    if view == LV_VIEW_DETAILS {
+                        let mut header = POINT { x: 12, y: 5 };
+                        assert_ne!(ClientToScreen(app.list, &mut header), 0);
+                        assert!(app.file_drop_folder(header).is_none());
+                    }
+                }
+                let mut background = POINT {
+                    x: 12,
+                    y: rect(app.list).bottom - 12,
+                };
+                assert_ne!(ClientToScreen(app.list, &mut background), 0);
+                assert_eq!(
+                    app.file_drop_folder(background).as_deref(),
+                    Some(directory.path())
+                );
+                let mut sidebar = POINT { x: -25, y: 100 };
+                assert_ne!(ClientToScreen(app.list, &mut sidebar), 0);
+                assert!(app.file_drop_folder(sidebar).is_none());
+                app.drop_target.take();
+            }
+            DestroyWindow(window);
+        }
+    }
+
+    #[test]
+    fn virtual_list_reports_cut_state_only_for_marked_paths() {
+        unsafe {
+            let controls = INITCOMMONCONTROLSEX {
+                dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
+                dwICC: ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES,
+            };
+            assert_ne!(InitCommonControlsEx(&controls), 0);
+            let window = CreateWindowExW(
+                0,
+                wide("Static").as_ptr(),
+                null(),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                900,
+                700,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null(),
+            );
+            assert!(!window.is_null());
+            let mut app = App::create(
+                window,
+                Some(r"C:\Example".into()),
+                false,
+                Settings::default(),
+            );
+            let cut = PathBuf::from(r"C:\Example\cut.txt");
+            for path in [&cut, &PathBuf::from(r"C:\Example\other.txt")] {
+                app.rows.push(Arc::new(Entry {
+                    path: path.clone(),
+                    name: wide(path.file_name().unwrap()),
+                    extension: Vec::new(),
+                    directory: false,
+                    size: 0,
+                    modified: 0,
+                    location: false,
+                    capacity: None,
+                    shell_item: None,
+                }));
+            }
+            app.visible = vec![0, 1];
+            app.cut = Some(CutSelection {
+                paths: HashSet::from([cut]),
+                receipt: shell::ClipboardWriteReceipt::capture(),
+            });
+            assert_eq!(send(app.list, LVM_GETCALLBACKMASK, 0, 0), LVIS_CUT as isize);
+            for (i_item, expected) in [(0, LVIS_CUT), (1, 0)] {
+                let mut notification = NMLVDISPINFOW {
+                    hdr: NMHDR {
+                        hwndFrom: app.list,
+                        idFrom: 0,
+                        code: LVN_GETDISPINFOW,
+                    },
+                    item: LVITEMW {
+                        iItem: i_item,
+                        mask: LVIF_STATE,
+                        stateMask: LVIS_CUT,
+                        state: LVIS_SELECTED | LVIS_CUT,
+                        ..zeroed()
+                    },
+                };
+                app.on_notify(&mut notification as *mut _ as LPARAM);
+                assert_eq!(notification.item.state, LVIS_SELECTED | expected);
+            }
+            DestroyWindow(window);
+        }
+    }
+
+    #[test]
+    fn launch_selection_and_keyboard_navigation_skip_date_headings() {
         unsafe {
             let controls = INITCOMMONCONTROLSEX {
                 dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
@@ -6242,7 +7283,7 @@ mod group_tests {
             let now = u64::from(now.dwHighDateTime) << 32 | u64::from(now.dwLowDateTime);
             let entry = |name: &str, directory, modified| {
                 Arc::new(Entry {
-                    path: PathBuf::from(name),
+                    path: Path::new(r"C:\Example").join(name),
                     name: wide(name),
                     extension: Vec::new(),
                     directory,
@@ -6264,6 +7305,13 @@ mod group_tests {
                 assert_eq!(app.visible_count(), 2);
                 assert_eq!(app.group_header(0), Some(DateGroup::Today));
                 assert!(app.group_header(2).is_some());
+                app.launch_selection = Some(PathBuf::from(r"C:\Example\OLDER-FOLDER"));
+                app.apply_launch_selection();
+                assert_eq!(
+                    app.first_selected().map(Entry::label).as_deref(),
+                    Some("older-folder")
+                );
+                app.clear_selection();
             }
             let selected = LVITEMW {
                 state: LVIS_SELECTED | LVIS_FOCUSED,

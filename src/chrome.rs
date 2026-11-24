@@ -352,7 +352,10 @@ pub fn set_visible(window: HWND, visible: bool) {
 
 pub fn set_enabled(window: HWND, enabled: bool) {
     unsafe {
-        windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow(window, enabled as i32);
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, IsWindowEnabled};
+        if (IsWindowEnabled(window) != 0) != enabled {
+            EnableWindow(window, enabled as i32);
+        }
     }
 }
 

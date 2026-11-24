@@ -1,6 +1,7 @@
 use crate::{
     archive,
     model::{from_wide, safe_name, wide},
+    new_document::{self, DocumentKind},
 };
 use std::{
     ffi::OsStr,
@@ -8,27 +9,32 @@ use std::{
     mem::{size_of, zeroed},
     path::{Path, PathBuf},
     ptr::{copy_nonoverlapping, null},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc, Mutex,
+    },
 };
 use windows::{
     core::{implement, Interface, Ref, HRESULT, PCWSTR},
     Win32::{
         Foundation::HWND,
         System::Com::{
-            CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER,
-            COINIT_APARTMENTTHREADED,
+            CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IPersistFile,
+            CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
         },
         UI::Shell::{
-            FileOperation, IFileOperation, IFileOperationProgressSink,
-            IFileOperationProgressSink_Impl, IShellItem, IShellLinkW, SHCreateItemFromParsingName,
-            SHOpenWithDialog, ShellLink, COPYENGINE_S_USER_IGNORED, FILEOPERATION_FLAGS,
-            FOFX_ADDUNDORECORD, FOFX_EARLYFAILURE, FOFX_RECYCLEONDELETE, FOFX_SHOWELEVATIONPROMPT,
-            FOF_ALLOWUNDO, FOF_RENAMEONCOLLISION, FOF_WANTNUKEWARNING, OAIF_EXEC, OPENASINFO,
+            FileOpenDialog, FileOperation, IFileOpenDialog, IFileOperation,
+            IFileOperationProgressSink, IFileOperationProgressSink_Impl, IShellItem, IShellLinkW,
+            SHCreateItemFromParsingName, SHOpenWithDialog, ShellLink, COPYENGINE_S_USER_IGNORED,
+            FILEOPERATION_FLAGS, FOFX_ADDUNDORECORD, FOFX_EARLYFAILURE, FOFX_RECYCLEONDELETE,
+            FOFX_SHOWELEVATIONPROMPT, FOF_ALLOWUNDO, FOF_RENAMEONCOLLISION, FOF_WANTNUKEWARNING,
+            FOS_DONTADDTORECENT, FOS_FORCEFILESYSTEM, FOS_NOCHANGEDIR, FOS_PICKFOLDERS, OAIF_EXEC,
+            OPENASINFO, SIGDN_FILESYSPATH,
         },
     },
 };
 use windows_sys::Win32::{
-    Foundation::GlobalFree,
+    Foundation::{GlobalFree, ERROR_ACCESS_DENIED, ERROR_BUSY, ERROR_CANCELLED},
     Storage::FileSystem::{MoveFileExW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL},
     System::{
         DataExchange::{
@@ -70,6 +76,7 @@ pub enum Operation {
         cut: bool,
         receipt: ClipboardWriteReceipt,
     },
+    CancelCut(ClipboardWriteReceipt),
     CopyPath(PathBuf),
     Paste {
         target: PathBuf,
@@ -84,6 +91,11 @@ pub enum Operation {
         target: PathBuf,
         name: String,
         directory: bool,
+    },
+    CreateDocument {
+        target: PathBuf,
+        name: String,
+        template: DocumentKind,
     },
     Rename {
         path: PathBuf,
@@ -100,10 +112,13 @@ pub enum Operation {
     Compress {
         sources: Vec<PathBuf>,
         output: PathBuf,
+        options: archive::Compression,
+        automatic: bool,
     },
     Extract {
         source: PathBuf,
         output: PathBuf,
+        automatic: bool,
     },
 }
 
@@ -116,6 +131,7 @@ impl Operation {
                 | Self::Paste { .. }
                 | Self::Transfer { .. }
                 | Self::Create { .. }
+                | Self::CreateDocument { .. }
                 | Self::Rename { .. }
                 | Self::Delete { .. }
                 | Self::Recycle { .. }
@@ -180,9 +196,13 @@ fn run_recorded(
             cut,
             receipt,
         } => {
-            if let Err(error) = put_files(owner, &paths, cut, &receipt) {
-                *receipt.state.lock().unwrap() = ClipboardWriteState::Failed;
-                return Err(error);
+            match put_files(owner, &paths, cut, &receipt) {
+                Ok(false) => return Ok("Cut canceled.".into()),
+                Ok(true) => (),
+                Err(error) => {
+                    *receipt.state.lock().unwrap() = ClipboardWriteState::Failed;
+                    return Err(error);
+                }
             }
             return Ok(format!(
                 "{} {} item(s).",
@@ -190,30 +210,63 @@ fn run_recorded(
                 paths.len()
             ));
         }
+        Operation::CancelCut(receipt) => {
+            if let Some(sequence) = receipt.written_sequence() {
+                clear_clipboard_if_unchanged(owner, sequence)?;
+            }
+            return Ok("Cut canceled.".into());
+        }
         Operation::CopyPath(path) => {
             let data = wide(path);
             write_clipboard(owner, &[(CF_UNICODETEXT as u32, as_bytes(&data))], None)?;
             return Ok("Copied path.".into());
         }
         Operation::Paste { target, receipt } => {
-            let (paths, moving, sequence) = read_clipboard(owner, &receipt)?;
-            transfer(owner, &paths, &target, moving, recording)?;
-            if moving {
-                clear_clipboard_if_unchanged(owner, sequence);
+            let (mut paths, moving, sequence) = read_clipboard(owner, &receipt)?;
+            let missing = if moving {
+                discard_missing_cut_sources(&mut paths)
+            } else {
+                0
+            };
+            if paths.is_empty() {
+                retire_cut(owner, sequence)?;
+                return Err("The cut items are no longer at their original locations. Select the items again.".into());
+            }
+            let moved = moving.then(|| Arc::new(AtomicBool::new(false)));
+            let result = transfer(owner, &paths, &target, moving, recording, moved.as_ref());
+            let completed = moved.is_some_and(|moved| moved.load(Ordering::Relaxed));
+            let cleanup = if moving && (result.is_ok() || completed) {
+                retire_cut(owner, sequence)
+                    .err()
+                    .map(|error| format!(" {error}"))
+            } else {
+                None
+            };
+            let cleanup = cleanup.as_deref().unwrap_or("");
+            match result {
+                Err(error) if completed => {
+                    return Err(format!(
+                        "{error} Cut the remaining items again before retrying.{cleanup}"
+                    ))
+                }
+                Err(error) => return Err(error),
+                Ok(()) => (),
+            }
+            if missing != 0 {
+                return Ok(format!("Items moved. {missing} cut item(s) were no longer at their original locations.{cleanup}"));
             }
             return Ok(if moving {
-                "Items moved."
+                format!("Items moved.{cleanup}")
             } else {
-                "Items copied."
-            }
-            .into());
+                "Items copied.".into()
+            });
         }
         Operation::Transfer {
             paths,
             target,
             moving,
         } => {
-            transfer(owner, &paths, &target, moving, recording)?;
+            transfer(owner, &paths, &target, moving, recording, None)?;
             return Ok(if moving {
                 "Items moved."
             } else {
@@ -226,6 +279,24 @@ fn run_recorded(
             name,
             directory,
         } => create(owner, &target, &name, directory, recording),
+        Operation::CreateDocument {
+            target,
+            name,
+            template,
+        } => {
+            if !safe_name(&name) {
+                return Err("Enter a valid Windows file name.".into());
+            }
+            let output = target.join(name);
+            let capture = recording
+                .as_ref()
+                .and_then(|_| history::Capture::created(&output));
+            new_document::create(&output, template)?;
+            if let (Some(recording), Some(capture)) = (recording, capture) {
+                capture.publish_created(recording, "Create", &output);
+            }
+            Ok(())
+        }
         Operation::Rename { path, name } => rename(owner, &path, &name, recording),
         Operation::Delete { paths, permanent } => delete(owner, &paths, permanent, recording),
         Operation::Shortcut { source, target } => {
@@ -238,28 +309,94 @@ fn run_recorded(
             }
             Ok(())
         }
-        Operation::Compress { sources, output } => {
-            let capture = recording
-                .as_ref()
-                .and_then(|_| history::Capture::created(&output));
-            archive::compress(&sources, &output)?;
+        Operation::Compress {
+            sources,
+            output,
+            options,
+            automatic,
+        } => {
+            let mut capture = None;
+            let actual = archive::compress_with(&sources, &output, options, automatic, |path| {
+                capture = recording
+                    .as_ref()
+                    .and_then(|_| history::Capture::created(path));
+            })?;
             if let (Some(recording), Some(capture)) = (recording, capture) {
-                capture.publish_created(recording, "Compress", &output);
+                capture.publish_created(recording, "Compress", &actual);
             }
-            return Ok("ZIP archive created.".into());
+            return Ok(format!("Created {}.", archive_output_name(&actual)));
         }
-        Operation::Extract { source, output } => {
-            let capture = recording
-                .as_ref()
-                .and_then(|_| history::Capture::created(&output));
-            archive::extract(&source, &output)?;
+        Operation::Extract {
+            source,
+            output,
+            automatic,
+        } => {
+            let mut capture = None;
+            let actual = archive::extract_with(&source, &output, automatic, |path| {
+                capture = recording
+                    .as_ref()
+                    .and_then(|_| history::Capture::created(path));
+            })?;
             if let (Some(recording), Some(capture)) = (recording, capture) {
-                capture.publish_created(recording, "Extract", &output);
+                capture.publish_created(recording, "Extract", &actual);
             }
-            return Ok("ZIP archive extracted.".into());
+            return Ok(format!("Extracted to {}.", archive_output_name(&actual)));
         }
     };
     result.map(|()| String::new())
+}
+
+fn archive_output_name(path: &Path) -> String {
+    path.file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+        .into_owned()
+}
+
+pub fn choose_archive_folder(owner: usize, initial: &Path) -> Result<Option<PathBuf>, String> {
+    let _apartment = Apartment::start().map_err(|error| error.to_string())?;
+    unsafe {
+        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)
+            .map_err(|error| error.to_string())?;
+        let title = wide("Archive destination folder");
+        dialog
+            .SetTitle(PCWSTR(title.as_ptr()))
+            .map_err(|error| error.to_string())?;
+        let options = dialog.GetOptions().map_err(|error| error.to_string())?;
+        dialog
+            .SetOptions(
+                options
+                    | FOS_PICKFOLDERS
+                    | FOS_FORCEFILESYSTEM
+                    | FOS_NOCHANGEDIR
+                    | FOS_DONTADDTORECENT,
+            )
+            .map_err(|error| error.to_string())?;
+        if let Ok(folder) = item(initial) {
+            let _ = dialog.SetFolder(&folder);
+        }
+        match dialog.Show(Some(HWND(owner as *mut _))) {
+            Err(error) if error.code() == HRESULT::from_win32(ERROR_CANCELLED) => return Ok(None),
+            result => result.map_err(|error| error.to_string())?,
+        }
+        let selected = dialog.GetResult().map_err(|error| error.to_string())?;
+        let name = selected
+            .GetDisplayName(SIGDN_FILESYSPATH)
+            .map_err(|error| error.to_string())?;
+        let path = PathBuf::from(from_wide(name.as_wide()));
+        CoTaskMemFree(Some(name.as_ptr().cast()));
+        Ok(Some(path))
+    }
+}
+
+fn discard_missing_cut_sources(paths: &mut Vec<PathBuf>) -> usize {
+    let count = paths.len();
+    // Only remove definite missing items. Permission and provider errors still go through
+    // the Shell so that it can report them or offer elevation.
+    paths.retain(|path| {
+        !std::fs::symlink_metadata(path).is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+    });
+    count - paths.len()
 }
 
 pub fn has_file_clipboard() -> bool {
@@ -321,11 +458,21 @@ fn perform(
     flags: FILEOPERATION_FLAGS,
     queue: impl FnOnce(&IFileOperation) -> windows::core::Result<()>,
 ) -> Result<(), String> {
+    perform_tracked(owner, flags, None, queue)
+}
+
+fn perform_tracked(
+    owner: HWND,
+    flags: FILEOPERATION_FLAGS,
+    moved: Option<Arc<AtomicBool>>,
+    queue: impl FnOnce(&IFileOperation) -> windows::core::Result<()>,
+) -> Result<(), String> {
     let run = || -> windows::core::Result<_> {
         let failure = Arc::new(Mutex::new(None));
         let sink: IFileOperationProgressSink = ResultSink {
             failure: Some(Arc::clone(&failure)),
             capture: None,
+            moved,
         }
         .into();
         // The COM apartment and all Shell objects stay on the operation thread.
@@ -371,15 +518,32 @@ fn transfer(
     target: &Path,
     moving: bool,
     mut recording: Option<&mut history::Recording>,
+    moved: Option<&Arc<AtomicBool>>,
 ) -> Result<(), String> {
+    let paths = if moving {
+        let count = recording
+            .as_deref_mut()
+            .map_or(0, |recording| recording.move_local(paths, target));
+        if count != 0 {
+            if let Some(moved) = moved {
+                moved.store(true, Ordering::Relaxed);
+            }
+        }
+        &paths[count..]
+    } else {
+        paths
+    };
+    if paths.is_empty() {
+        return Ok(());
+    }
     let mut flags = operation_flags(recording.is_some());
     if recording.is_some() && !moving && history::same_source_folder(paths, target) {
         flags |= FOF_RENAMEONCOLLISION;
     }
-    perform(owner, flags, |operation| {
-        let destination = item(target)?;
+    perform_tracked(owner, flags, moved.cloned(), |operation| {
+        let destination = transfer_item(target, "destination")?;
         for path in paths {
-            let source = item(path)?;
+            let source = transfer_item(path, "source item")?;
             let sink = recording.as_deref_mut().and_then(|recording| {
                 recording.track(
                     if moving { "Move" } else { "Copy" },
@@ -395,6 +559,15 @@ fn transfer(
             }
         }
         Ok(())
+    })
+}
+
+fn transfer_item(path: &Path, role: &str) -> windows::core::Result<IShellItem> {
+    item(path).map_err(|error| {
+        windows::core::Error::new(
+            error.code(),
+            format!("Can't open the {role} {}: {error}", path.display()),
+        )
     })
 }
 
@@ -505,6 +678,7 @@ fn shortcut(source: &Path, target: &Path) -> Result<(), String> {
 struct ResultSink {
     failure: Option<Arc<Mutex<Option<HRESULT>>>>,
     capture: Option<history::Observer>,
+    moved: Option<Arc<AtomicBool>>,
 }
 
 impl ResultSink_Impl {
@@ -569,6 +743,12 @@ impl IFileOperationProgressSink_Impl for ResultSink_Impl {
         result: HRESULT,
         output: Ref<IShellItem>,
     ) -> windows::core::Result<()> {
+        // A skipped item also has a success HRESULT. It has no destination item.
+        if result.is_ok() && result != COPYENGINE_S_USER_IGNORED && output.as_ref().is_some() {
+            if let Some(moved) = &self.moved {
+                moved.store(true, Ordering::Relaxed);
+            }
+        }
         self.completed(result, source, output);
         Ok(())
     }
@@ -656,6 +836,32 @@ impl ClipboardWriteReceipt {
             }))),
         }
     }
+
+    pub fn cancel_pending(&self) {
+        let mut state = self.state.lock().unwrap();
+        if matches!(*state, ClipboardWriteState::Queued(_)) {
+            *state = ClipboardWriteState::Failed;
+        }
+    }
+
+    pub fn is_current(&self) -> bool {
+        match *self.state.lock().unwrap() {
+            ClipboardWriteState::Queued(_) | ClipboardWriteState::Writing(_) => true,
+            ClipboardWriteState::Written { sequence, .. } => {
+                sequence != 0
+                    && sequence != RETIRED_CUT.load(Ordering::Relaxed)
+                    && sequence == unsafe { GetClipboardSequenceNumber() }
+            }
+            ClipboardWriteState::Failed => false,
+        }
+    }
+
+    fn written_sequence(&self) -> Option<u32> {
+        match *self.state.lock().unwrap() {
+            ClipboardWriteState::Written { sequence, .. } if sequence != 0 => Some(sequence),
+            _ => None,
+        }
+    }
 }
 
 pub struct ClipboardPasteReceipt {
@@ -714,17 +920,24 @@ impl ClipboardPasteReceipt {
 }
 
 const CLIPBOARD_CHANGED: &str = "The clipboard changed. Paste again to use its current contents.";
+static RETIRED_CUT: AtomicU32 = AtomicU32::new(0);
 
 struct Clipboard;
 impl Clipboard {
     fn open(owner: HWND) -> Result<Self, String> {
-        if unsafe { OpenClipboard(owner.0) } == 0 {
-            Err(format!(
-                "Can't open the clipboard: {}",
-                io::Error::last_os_error()
-            ))
-        } else {
-            Ok(Self)
+        let mut retries = 0..12;
+        loop {
+            if unsafe { OpenClipboard(owner.0) } != 0 {
+                return Ok(Self);
+            }
+            let error = io::Error::last_os_error();
+            let contention = error
+                .raw_os_error()
+                .is_some_and(|code| matches!(code as u32, ERROR_ACCESS_DENIED | ERROR_BUSY));
+            if !contention || retries.next().is_none() {
+                return Err(format!("Can't open the clipboard: {error}"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(4));
         }
     }
 }
@@ -763,7 +976,7 @@ fn put_files(
     paths: &[PathBuf],
     cut: bool,
     receipt: &ClipboardWriteReceipt,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let storage = file_drop_bytes(paths);
     let effect = (if cut { 2u32 } else { 1u32 }).to_le_bytes();
     write_clipboard(
@@ -777,7 +990,7 @@ fn write_clipboard(
     owner: HWND,
     items: &[(u32, &[u8])],
     receipt: Option<&ClipboardWriteReceipt>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let mut blocks = Vec::with_capacity(items.len());
     for &(format, bytes) in items {
         if format == 0 {
@@ -786,11 +999,17 @@ fn write_clipboard(
         blocks.push((format, GlobalBlock::from_bytes(bytes)?));
     }
     let _clipboard = Clipboard::open(owner)?;
-    let previous = receipt.map(|receipt| {
+    let previous = if let Some(receipt) = receipt {
+        let mut state = receipt.state.lock().unwrap();
+        if matches!(*state, ClipboardWriteState::Failed) {
+            return Ok(false);
+        }
         let previous = unsafe { GetClipboardSequenceNumber() };
-        *receipt.state.lock().unwrap() = ClipboardWriteState::Writing(previous);
-        previous
-    });
+        *state = ClipboardWriteState::Writing(previous);
+        Some(previous)
+    } else {
+        None
+    };
     if unsafe { EmptyClipboard() } == 0 {
         return Err(io::Error::last_os_error().to_string());
     }
@@ -808,7 +1027,7 @@ fn write_clipboard(
             sequence: unsafe { GetClipboardSequenceNumber() },
         };
     }
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) struct GlobalBlock(windows_sys::Win32::Foundation::HGLOBAL);
@@ -901,17 +1120,32 @@ fn read_clipboard(
         }
     };
     // Delayed rendering can advance the sequence while we read an external owner's formats.
-    Ok((paths, moving, unsafe { GetClipboardSequenceNumber() }))
+    let sequence = unsafe { GetClipboardSequenceNumber() };
+    if moving && sequence == RETIRED_CUT.load(Ordering::Relaxed) {
+        return Err(
+            "This cut has already been used. Cut the remaining items again before retrying.".into(),
+        );
+    }
+    Ok((paths, moving, sequence))
 }
 
-fn clear_clipboard_if_unchanged(owner: HWND, sequence: u32) {
-    if let Ok(_clipboard) = Clipboard::open(owner) {
-        unsafe {
-            if GetClipboardSequenceNumber() == sequence {
-                EmptyClipboard();
-            }
-        }
+fn retire_cut(owner: HWND, sequence: u32) -> Result<(), String> {
+    RETIRED_CUT.store(sequence, Ordering::Relaxed);
+    clear_clipboard_if_unchanged(owner, sequence)
+}
+
+fn clear_clipboard_if_unchanged(owner: HWND, sequence: u32) -> Result<(), String> {
+    if sequence != unsafe { GetClipboardSequenceNumber() } {
+        return Ok(());
     }
+    let _clipboard = Clipboard::open(owner)?;
+    if unsafe { GetClipboardSequenceNumber() == sequence && EmptyClipboard() == 0 } {
+        return Err(format!(
+            "Can't clear the cut selection: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -919,11 +1153,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_cut_retry_keeps_live_items_after_a_partial_move() {
+        let fixture = tempfile::tempdir().unwrap();
+        let available = fixture.path().join("still available.txt");
+        std::fs::write(&available, b"data").unwrap();
+        let mut paths = vec![fixture.path().join("already moved.txt"), available.clone()];
+        assert_eq!(discard_missing_cut_sources(&mut paths), 1);
+        assert_eq!(paths, [available]);
+    }
+
+    #[test]
     fn shell_records_an_ignored_move_even_when_the_batch_succeeds() {
         let recorded = Arc::new(Mutex::new(None));
         let sink: IFileOperationProgressSink = ResultSink {
             failure: Some(Arc::clone(&recorded)),
             capture: None,
+            moved: None,
         }
         .into();
         unsafe {

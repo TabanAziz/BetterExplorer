@@ -26,6 +26,7 @@ use windows::{
 };
 use windows_sys::Win32::{
     Foundation::{FILETIME, SYSTEMTIME},
+    Globalization::{CompareStringOrdinal, CSTR_EQUAL},
     Storage::FileSystem::{
         GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDriveStringsW, GetVolumeInformationW,
         FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_REPARSE_POINT,
@@ -434,7 +435,16 @@ fn drive_entry(path: PathBuf) -> Entry {
     entry
 }
 
-pub fn scan(request: Request, latest: &AtomicU64, mut publish: impl FnMut(ScanEvent)) {
+pub fn scan(request: Request, latest: &AtomicU64, publish: impl FnMut(ScanEvent)) {
+    scan_revealing(request, None, latest, publish);
+}
+
+fn scan_revealing(
+    request: Request,
+    reveal: Option<PathBuf>,
+    latest: &AtomicU64,
+    mut publish: impl FnMut(ScanEvent),
+) {
     let Request {
         id,
         location,
@@ -527,7 +537,10 @@ pub fn scan(request: Request, latest: &AtomicU64, mut publish: impl FnMut(ScanEv
                         enumerate(
                             drive,
                             Some(query.clone()),
-                            hidden,
+                            Visibility {
+                                hidden,
+                                reveal: None,
+                            },
                             &stale,
                             &mut entries,
                             &mut error,
@@ -576,10 +589,15 @@ pub fn scan(request: Request, latest: &AtomicU64, mut publish: impl FnMut(ScanEv
                 Location::Search { root, query } => (root, Some(query.to_lowercase())),
                 _ => unreachable!(),
             };
+            let reveal = reveal
+                .as_deref()
+                .filter(|path| query.is_none() && path.parent() == Some(root.as_path()))
+                .and_then(Path::file_name)
+                .map(wide);
             enumerate(
                 root,
                 query,
-                hidden,
+                Visibility { hidden, reveal },
                 &stale,
                 &mut entries,
                 &mut error,
@@ -600,10 +618,28 @@ pub fn scan(request: Request, latest: &AtomicU64, mut publish: impl FnMut(ScanEv
     }
 }
 
+struct Visibility {
+    hidden: bool,
+    reveal: Option<Vec<u16>>,
+}
+
+impl Visibility {
+    fn includes(&self, attributes: u32, name: &OsStr) -> bool {
+        self.hidden
+            || attributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) == 0
+            || self.reveal.as_ref().is_some_and(|target| {
+                let name = wide(name);
+                unsafe {
+                    CompareStringOrdinal(name.as_ptr(), -1, target.as_ptr(), -1, 1) == CSTR_EQUAL
+                }
+            })
+    }
+}
+
 fn enumerate(
     root: PathBuf,
     query: Option<String>,
-    hidden: bool,
+    visibility: Visibility,
     stale: &impl Fn() -> bool,
     entries: &mut Vec<Arc<Entry>>,
     error: &mut Option<String>,
@@ -641,11 +677,11 @@ fn enumerate(
                 continue;
             };
             let attributes = metadata.file_attributes();
-            if !hidden && attributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0 {
+            let name = item.file_name();
+            if !visibility.includes(attributes, &name) {
                 continue;
             }
             let directory = attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
-            let name = item.file_name();
             if query.is_some() && directory && attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
                 pending.push(item.path());
             }
@@ -687,7 +723,7 @@ fn enumerate(
     }
 }
 
-type Lane = Arc<(Mutex<Option<Request>>, Condvar)>;
+type Lane = Arc<(Mutex<Option<(Request, Option<PathBuf>)>>, Condvar)>;
 
 pub struct Scanner {
     latest: Arc<AtomicU64>,
@@ -711,9 +747,9 @@ impl Scanner {
                     let mut request = ready
                         .wait_while(lock.lock().unwrap(), |request| request.is_none())
                         .unwrap();
-                    let work = request.take().unwrap();
+                    let (work, reveal) = request.take().unwrap();
                     drop(request);
-                    scan(work, &latest, |event| publish(event));
+                    scan_revealing(work, reveal, &latest, |event| publish(event));
                 })
                 .expect("start directory worker");
             mailbox
@@ -730,6 +766,10 @@ impl Scanner {
     }
 
     pub fn request(&self, request: Request) {
+        self.request_revealing(request, None);
+    }
+
+    pub fn request_revealing(&self, request: Request, reveal: Option<PathBuf>) {
         self.cancel(request.id);
         let lane = if matches!(
             request.location,
@@ -743,7 +783,7 @@ impl Scanner {
         } else {
             &self.local
         };
-        *lane.0.lock().unwrap() = Some(request);
+        *lane.0.lock().unwrap() = Some((request, reveal));
         lane.1.notify_one();
     }
 }
