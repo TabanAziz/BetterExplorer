@@ -707,7 +707,16 @@ impl Writer {
                     .map_err(|err| err.to_string())?;
             }
             Self::Tar(writer) => {
-                let mut header = tar::Header::new_gnu();
+                let mut header = tar::Header::new_ustar();
+                let name = if name.is_ascii() && header.set_path(name).is_ok() {
+                    name
+                } else {
+                    // PAX paths declare UTF-8, which preserves names in Windows tar.
+                    writer
+                        .append_pax_extensions([("path", name.as_bytes())])
+                        .map_err(|err| err.to_string())?;
+                    "PaxItem"
+                };
                 if directory {
                     header.set_mode(0o755);
                     header.set_size(0);

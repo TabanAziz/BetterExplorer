@@ -64,6 +64,7 @@ const BENCH_PRESENT: u32 = WM_APP + 7;
 const BENCH_STARTED: u32 = WM_APP + 8;
 const START_FILE_DRAG: u32 = WM_APP + 9;
 const REVEAL_SETTING: u32 = WM_APP + 10;
+const REGISTER_FILE_DROP: u32 = WM_APP + 11;
 const REFRESH_TIMER: usize = 1;
 const SETTINGS_TIMER: usize = 2;
 const GROUP_TIMER: usize = 3;
@@ -6214,6 +6215,10 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
         cell.borrow_mut().bench = bench;
         return 0;
     }
+    if message == REGISTER_FILE_DROP {
+        register_file_drop_target(window, cell);
+        return 0;
+    }
     if message == BENCH_PRESENT {
         let should_paint = cell
             .try_borrow()
@@ -7010,7 +7015,6 @@ pub fn run(path: Option<PathBuf>, selection: Option<PathBuf>) -> Result<(), std:
                 SetWindowSubclass(button, Some(button_proc), 1, 0);
             }
         }
-        register_file_drop_target(window, &app);
         let without_activation = std::env::var_os("BETTEREXPLORER_BENCH_NOACTIVATE").is_some();
         ShowWindow(
             window,
@@ -7031,6 +7035,10 @@ pub fn run(path: Option<PathBuf>, selection: Option<PathBuf>) -> Result<(), std:
             PostMessageW(window, BENCH_STARTED, 0, 0);
         }
         app.borrow_mut().start();
+        // Let the first frame paint before Windows loads the native drop target machinery.
+        if PostMessageW(window, REGISTER_FILE_DROP, 0, 0) == 0 {
+            register_file_drop_target(window, &app);
+        }
         let mut message = zeroed();
         loop {
             let code = GetMessageW(&mut message, null_mut(), 0, 0);
@@ -7104,7 +7112,7 @@ mod group_tests {
                 GWLP_USERDATA,
                 (&*app as *const RefCell<App>) as isize,
             );
-            register_file_drop_target(window, &app);
+            procedure(window, REGISTER_FILE_DROP, 0, 0);
             {
                 let mut app = app.borrow_mut();
                 assert!(app.drop_target.is_some());

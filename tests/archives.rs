@@ -119,6 +119,23 @@ fn quick_formats_preserve_contents_and_pick_conflict_free_names() {
 }
 
 #[test]
+fn tar_records_unicode_paths_as_utf8_in_pax_metadata() {
+    let workspace = tempdir().unwrap();
+    let source = workspace.path().join("Überblick 📁.txt");
+    let output = workspace.path().join("fixture.tar");
+    fs::write(&source, b"text").unwrap();
+    compress(&[source], &output).unwrap();
+
+    let mut archive = tar::Archive::new(File::open(output).unwrap());
+    let mut entries = archive.entries().unwrap();
+    let mut entry = entries.next().unwrap().unwrap();
+    let metadata = entry.pax_extensions().unwrap().expect("UTF-8 PAX metadata");
+    assert!(metadata.filter_map(Result::ok).any(|field| {
+        field.key_bytes() == b"path" && field.value_bytes() == "Überblick 📁.txt".as_bytes()
+    }));
+}
+
+#[test]
 fn quick_archive_retries_a_destination_claimed_during_publication() {
     let workspace = tempdir().unwrap();
     let file = workspace.path().join("report.txt");
