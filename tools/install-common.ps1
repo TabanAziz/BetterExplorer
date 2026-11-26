@@ -257,12 +257,22 @@ function Clear-OwnedFolderManager {
 
     $root = if ($TestRoot) { 'Software\BetterExplorer.SetupTests\' + [IO.Path]::GetFileName($TestRoot) }
         else { 'Software\Classes' }
+    $serverClass = "$root\CLSID\{801e1d22-334a-4b1f-9f3b-a99dc4a38721}"
+    $repairMessage = 'The installed BetterExplorer executable is missing. Run the latest BetterExplorer setup to repair the installation, then try uninstalling again.'
+    $server = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($serverClass)
+    if ($server) {
+        try {
+            if ($server.GetValue('BetterExplorerExecutable') -ceq $Owner) { throw $repairMessage }
+        } finally {
+            $server.Dispose()
+        }
+    }
     foreach ($class in 'Directory', 'Drive') {
         $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("$root\$class\shell\BetterExplorer.Open")
         if ($null -eq $key) { continue }
         try {
             if ($key.GetValue('BetterExplorerExecutable') -ceq $Owner) {
-                throw 'The installed BetterExplorer executable is missing. Run the latest BetterExplorer setup to repair the installation, then try uninstalling again.'
+                throw $repairMessage
             }
         } finally {
             $key.Dispose()

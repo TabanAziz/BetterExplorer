@@ -11,6 +11,10 @@ mod file_icon_cache;
 #[cfg(windows)]
 mod file_icons;
 #[cfg(windows)]
+mod file_name_tip;
+#[cfg(windows)]
+mod folder_command;
+#[cfg(windows)]
 mod folder_manager;
 #[cfg(windows)]
 mod home_page;
@@ -31,6 +35,13 @@ mod window_geometry;
 fn main() {
     let mut args = std::env::args_os().skip(1);
     let first = args.next();
+    if first.as_deref() == Some(std::ffi::OsStr::new(folder_command::SERVER_ARG)) {
+        if let Err(error) = folder_command::run() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Some(exit) = first.as_deref().and_then(hotkey::cli) {
         std::process::exit(exit);
     }

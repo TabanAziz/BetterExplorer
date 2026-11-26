@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.9
+
+- Keep navigation inside a manually opened Windows File Explorer window when BetterExplorer is the default folder manager.
+- Show themed tooltips beside truncated file and folder names. Dismiss the tooltip when the pointer moves to another row or the view changes.
+
 ## 0.1.8
 
 - Added a standalone Windows installer alongside the portable ZIP.

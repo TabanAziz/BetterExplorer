@@ -4,7 +4,9 @@ use crate::{
     breadcrumb,
     chrome::*,
     file_icon_cache::{FileIconCache, GENERIC_FILE},
-    file_icons, folder_manager,
+    file_icons,
+    file_name_tip::FileNameTip,
+    folder_manager,
     home_page::{Activity, HomePage, Icon, Item},
     preview::{self, Content},
     settings_page::{
@@ -48,7 +50,9 @@ use windows_sys::Win32::{
     System::{
         DataExchange::{AddClipboardFormatListener, RemoveClipboardFormatListener},
         LibraryLoader::GetModuleHandleW,
-        SystemServices::SS_NOPREFIX,
+        SystemServices::{
+            MK_LBUTTON, MK_MBUTTON, MK_RBUTTON, MK_XBUTTON1, MK_XBUTTON2, SS_NOPREFIX,
+        },
         Threading::CreateMutexW,
     },
     UI::{
@@ -530,6 +534,7 @@ struct App {
     crumb_widths: Vec<i32>,
     editing_address: bool,
     header: HWND,
+    file_name_tip: FileNameTip,
     hover: HWND,
     bench: Option<Bench>,
     preview: Option<Content>,
@@ -702,6 +707,7 @@ impl App {
             crumb_widths: Vec::new(),
             editing_address: false,
             header: send(list, LVM_GETHEADER, 0, 0) as HWND,
+            file_name_tip: FileNameTip::new(list),
             hover: null_mut(),
             bench: Bench::configured(),
             preview: None,
@@ -744,8 +750,7 @@ impl App {
         }
         send(list, CCM_SETUNICODEFORMAT, 1, 0);
         send(list, LVM_SETCALLBACKMASK, LVIS_CUT as usize, 0);
-        let styles =
-            LVS_EX_DOUBLEBUFFER | LVS_EX_FULLROWSELECT | LVS_EX_HEADERDRAGDROP | LVS_EX_LABELTIP;
+        let styles = LVS_EX_DOUBLEBUFFER | LVS_EX_FULLROWSELECT | LVS_EX_HEADERDRAGDROP;
         send(
             list,
             LVM_SETEXTENDEDLISTVIEWSTYLE,
@@ -963,8 +968,10 @@ impl App {
     }
 
     fn apply_dpi(&mut self, dpi: u32) {
+        self.file_name_tip.clear();
         self.dpi = dpi;
         let old = std::mem::replace(&mut self.fonts, [font(dpi, false), font(dpi, true)]);
+        self.file_name_tip.set_font(self.fonts[0]);
         for (_, control) in self.buttons.iter().copied() {
             send(control, WM_SETFONT, self.fonts[0] as usize, 1);
         }
@@ -1069,6 +1076,7 @@ impl App {
     }
 
     fn update_theme_controls(&mut self) {
+        self.file_name_tip.clear();
         let surfaces = [
             ControlSurface::Chrome,
             ControlSurface::Content,
@@ -1454,6 +1462,7 @@ impl App {
     }
 
     fn layout(&mut self) {
+        self.file_name_tip.clear();
         let bounds = rect(self.window);
         let w = bounds.right;
         let h = bounds.bottom;
@@ -2605,6 +2614,7 @@ impl App {
     }
 
     fn apply_view(&mut self, view: u32) {
+        self.file_name_tip.clear();
         self.tab_mut().view = view;
         let side = match view {
             VIEW_SMALL => 30,
@@ -2742,6 +2752,7 @@ impl App {
     }
 
     fn set_count(&self) {
+        self.file_name_tip.clear();
         send(
             self.list,
             LVM_SETITEMCOUNT,
@@ -4397,6 +4408,7 @@ impl App {
 impl Drop for App {
     fn drop(&mut self) {
         self.drop_target.take();
+        self.file_name_tip.destroy();
         unsafe {
             for image in self.images {
                 if image != 0 {
@@ -6304,10 +6316,10 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
         return 0;
     }
     if message == WM_DESTROY {
-        let drop_target = cell
-            .try_borrow_mut()
-            .ok()
-            .and_then(|mut app| app.drop_target.take());
+        let drop_target = cell.try_borrow_mut().ok().and_then(|mut app| {
+            app.file_name_tip.destroy();
+            app.drop_target.take()
+        });
         drop(drop_target);
         unsafe {
             RemoveClipboardFormatListener(window);
@@ -6496,6 +6508,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
             0
         }
         WM_SIZE => {
+            app.file_name_tip.clear();
             if wp != SIZE_MINIMIZED as WPARAM {
                 app.normal_position = WindowPosition::normal(window).or(app.normal_position);
                 let slot = app.file_icon_slot();
@@ -6505,8 +6518,13 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
             0
         }
         WM_MOVE => {
+            app.file_name_tip.clear();
             app.normal_position = WindowPosition::normal(window).or(app.normal_position);
             0
+        }
+        WM_ACTIVATE if wp as u16 == WA_INACTIVE as u16 => {
+            app.file_name_tip.clear();
+            unsafe { DefWindowProcW(window, message, wp, lp) }
         }
         WM_THEMECHANGED | WM_SETTINGCHANGE | WM_SYSCOLORCHANGE => {
             let width = rect(window).right;
@@ -6854,6 +6872,18 @@ unsafe extern "system" fn group_list_proc(
     _: usize,
 ) -> LRESULT {
     unsafe {
+        match msg {
+            WM_MOUSEMOVE => {
+                let result = DefSubclassProc(window, msg, wp, lp);
+                file_list_hover(window, msg, wp, lp);
+                return result;
+            }
+            WM_MOUSEHOVER | WM_MOUSELEAVE | WM_MOUSEWHEEL | WM_MOUSEHWHEEL | WM_VSCROLL
+            | WM_HSCROLL | WM_KEYDOWN | WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN
+            | WM_MBUTTONDOWN | WM_XBUTTONDOWN | WM_CANCELMODE | WM_CAPTURECHANGED
+            | WM_KILLFOCUS | LVM_SCROLL | LVM_ENSUREVISIBLE => file_list_hover(window, msg, wp, lp),
+            _ => {}
+        }
         let key = wp as u16;
         let move_focus = msg == WM_KEYDOWN
             && matches!(key, VK_UP | VK_DOWN | VK_HOME | VK_END | VK_PRIOR | VK_NEXT);
@@ -6908,6 +6938,129 @@ unsafe extern "system" fn group_list_proc(
             }
         }
         result
+    }
+}
+
+fn file_list_hover(list: HWND, message: u32, wp: WPARAM, lp: LPARAM) {
+    let pointer =
+        unsafe { GetWindowLongPtrW(GetParent(list), GWLP_USERDATA) } as *const RefCell<App>;
+    if pointer.is_null() {
+        return;
+    }
+    let app = unsafe { &*pointer };
+    let buttons = MK_LBUTTON | MK_MBUTTON | MK_RBUTTON | MK_XBUTTON1 | MK_XBUTTON2;
+    if !matches!(message, WM_MOUSEMOVE | WM_MOUSEHOVER) || wp as u32 & buttons != 0 {
+        if let Ok(app) = app.try_borrow() {
+            app.file_name_tip.clear();
+        }
+        return;
+    }
+
+    // Hit testing the owner-data list can synchronously request text from the app.
+    let view = send(list, LVM_GETVIEW, 0, 0) as u32;
+    let mut hit = LVHITTESTINFO {
+        pt: POINT {
+            x: lp as i16 as i32,
+            y: (lp >> 16) as i16 as i32,
+        },
+        ..unsafe { zeroed() }
+    };
+    let details = view == LV_VIEW_DETAILS;
+    let hit_message = if details {
+        LVM_SUBITEMHITTEST
+    } else {
+        LVM_HITTEST
+    };
+    let row = send(list, hit_message, 0, &mut hit as *mut _ as LPARAM);
+    let row = usize::try_from(row).ok().filter(|_| {
+        hit.flags & (LVHT_ONITEMICON | LVHT_ONITEMLABEL) != 0 && (!details || hit.iSubItem == 0)
+    });
+    if message == WM_MOUSEMOVE {
+        if let Ok(app) = app.try_borrow() {
+            app.file_name_tip
+                .hover(row.filter(|&row| app.entry(row).is_some()));
+        }
+    } else if let Some(row) = row.filter(|&row| {
+        app.try_borrow()
+            .is_ok_and(|app| app.file_name_tip.row() == Some(row))
+    }) {
+        let item_rect = |part| {
+            let mut bounds = RECT {
+                left: part as i32,
+                ..unsafe { zeroed() }
+            };
+            (send(list, LVM_GETITEMRECT, row, &mut bounds as *mut _ as LPARAM) != 0)
+                .then_some(bounds)
+        };
+        if let (Some(label), Some(icon), Ok(app)) = (
+            item_rect(LVIR_LABEL),
+            item_rect(LVIR_ICON),
+            app.try_borrow(),
+        ) {
+            if let Some(entry) = app.entry(row) {
+                let name = entry.display_name(app.settings.hide_extensions);
+                let icon_view = view == LV_VIEW_ICON;
+                if file_name_clipped(list, name, label, app.fonts[0], app.dpi, icon_view) {
+                    let left = if icon_view {
+                        label.left
+                    } else {
+                        icon.right + scale(8, app.dpi)
+                    };
+                    app.file_name_tip.show(
+                        name,
+                        RECT { left, ..label },
+                        hit.pt,
+                        app.fonts[0],
+                        &app.colors,
+                        app.dpi,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn file_name_clipped(
+    list: HWND,
+    name: &[u16],
+    label: RECT,
+    font: HFONT,
+    dpi: u32,
+    icon_view: bool,
+) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let right = label.right.min(rect(list).right);
+    if label.left < 0 {
+        return true;
+    }
+    unsafe {
+        let dc = GetDC(list);
+        if dc.is_null() {
+            return false;
+        }
+        let old = SelectObject(dc, font);
+        let width = (right - label.left - scale(4, dpi)).max(1);
+        let mut measured = RECT {
+            right: width,
+            ..zeroed()
+        };
+        let flags = if icon_view {
+            DT_WORDBREAK
+        } else {
+            DT_SINGLELINE
+        };
+        DrawTextW(
+            dc,
+            name.as_ptr(),
+            name.len() as i32,
+            &mut measured,
+            DT_CALCRECT | DT_NOPREFIX | flags,
+        );
+        SelectObject(dc, old);
+        ReleaseDC(list, dc);
+        measured.right > width || (icon_view && measured.bottom > label.bottom - label.top)
     }
 }
 
@@ -7118,8 +7271,284 @@ pub fn run(path: Option<PathBuf>, selection: Option<PathBuf>) -> Result<(), std:
 mod group_tests {
     use super::*;
     use windows_sys::Win32::{
-        Foundation::FILETIME, System::SystemInformation::GetSystemTimeAsFileTime,
+        Foundation::FILETIME,
+        System::{SystemInformation::GetSystemTimeAsFileTime, Threading::GetCurrentThreadId},
     };
+
+    #[test]
+    fn file_list_does_not_enable_the_native_label_overlay() {
+        unsafe {
+            let controls = INITCOMMONCONTROLSEX {
+                dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
+                dwICC: ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES,
+            };
+            assert_ne!(InitCommonControlsEx(&controls), 0);
+            let window = CreateWindowExW(
+                WS_EX_NOACTIVATE,
+                wide("Static").as_ptr(),
+                null(),
+                WS_POPUP,
+                0,
+                0,
+                900,
+                700,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null(),
+            );
+            assert!(!window.is_null());
+            let app = App::create(window, None, false, Settings::default());
+            let styles = send(app.list, LVM_GETEXTENDEDLISTVIEWSTYLE, 0, 0) as u32;
+            DestroyWindow(window);
+            assert_eq!(
+                styles & LVS_EX_LABELTIP,
+                0,
+                "the list paints its own overlay"
+            );
+        }
+    }
+
+    #[test]
+    fn file_name_tip_follows_visible_entries_and_dismisses_on_navigation() {
+        let root = tempfile::tempdir().unwrap();
+        let first = "First & überlong report with a name that does not fit in the Name column.txt";
+        let second =
+            "Second regular file with another name too long for the narrow Name column.pdf";
+        let folder = "A folder with a name long enough to require its own new hint when hovered";
+        let unbroken = format!("{}🧪.txt", "W".repeat(140));
+        unsafe {
+            let controls = INITCOMMONCONTROLSEX {
+                dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
+                dwICC: ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES,
+            };
+            assert_ne!(InitCommonControlsEx(&controls), 0);
+            let window = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                wide("Static").as_ptr(),
+                null(),
+                WS_POPUP | WS_VISIBLE,
+                -20_000,
+                -20_000,
+                900,
+                700,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null(),
+            );
+            assert!(!window.is_null());
+            let app = Box::new(RefCell::new(App::create(
+                window,
+                Some(root.path().to_path_buf()),
+                false,
+                Settings {
+                    theme: ThemePreference::DeepSpace,
+                    ..Settings::default()
+                },
+            )));
+            SetWindowLongPtrW(
+                window,
+                GWLP_USERDATA,
+                (&*app as *const RefCell<App>) as isize,
+            );
+            assert_ne!(
+                SetWindowSubclass(window, Some(file_list_fixture_proc), 1, 0),
+                0
+            );
+            let list = {
+                let mut app = app.borrow_mut();
+                app.rows = [first, "Folder", second, folder, &unbroken]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, name)| {
+                        Arc::new(Entry {
+                            path: root.path().join(name),
+                            name: wide(name),
+                            extension: Vec::new(),
+                            directory: index == 1 || index == 3,
+                            size: 0,
+                            modified: 0,
+                            location: false,
+                            capacity: None,
+                            shell_item: None,
+                        })
+                    })
+                    .collect();
+                app.visible = vec![usize::MAX, 0, 1, 2, 3, 4];
+                app.group_headers = vec![(0, DateGroup::Today)];
+                app.set_count();
+                app.list
+            };
+            assert_ne!(SetWindowSubclass(list, Some(group_list_proc), 2, 0), 0);
+            send(list, LVM_SETCOLUMNWIDTH, 0, 120);
+
+            let move_to_row = |row| {
+                let mut icon = RECT {
+                    left: LVIR_ICON as i32,
+                    ..zeroed()
+                };
+                assert_ne!(
+                    send(list, LVM_GETITEMRECT, row, &mut icon as *mut _ as LPARAM),
+                    0
+                );
+                let x = (icon.left + icon.right) / 2;
+                let y = (icon.top + icon.bottom) / 2;
+                let point = ((y as u16 as u32) << 16 | x as u16 as u32) as LPARAM;
+                send(list, WM_MOUSEMOVE, 0, point);
+                (icon, point)
+            };
+            let hover = |row| {
+                let (icon, point) = move_to_row(row);
+                send(list, WM_MOUSEHOVER, 0, point);
+                icon
+            };
+            let caption = |tip| {
+                let mut name = [0u16; 512];
+                let tool = TTTOOLINFOW {
+                    cbSize: size_of::<TTTOOLINFOW>() as u32,
+                    hwnd: list,
+                    uId: list as usize,
+                    lpszText: name.as_mut_ptr(),
+                    ..zeroed()
+                };
+                send(tip, TTM_GETTEXTW, name.len(), &tool as *const _ as LPARAM);
+                from_wide(&name)
+            };
+
+            let icon = hover(1);
+            let tip = visible_fixture_tooltip(window);
+            assert!(
+                !tip.is_null(),
+                "first long file should produce a visible hint"
+            );
+            assert_eq!(caption(tip), first);
+            assert_eq!(send(tip, WM_NCHITTEST, 0, 0), HTTRANSPARENT as isize);
+            assert_eq!(
+                send(tip, TTM_GETTIPBKCOLOR, 0, 0) as u32,
+                app.borrow().colors.field
+            );
+            assert_eq!(
+                send(tip, TTM_GETTIPTEXTCOLOR, 0, 0) as u32,
+                app.borrow().colors.text
+            );
+            let mut tip_bounds = zeroed();
+            let mut icon_right = POINT {
+                x: icon.right,
+                y: icon.bottom,
+            };
+            assert_ne!(ClientToScreen(list, &mut icon_right), 0);
+            assert_ne!(GetWindowRect(tip, &mut tip_bounds), 0);
+            assert!(tip_bounds.left >= icon_right.x + scale(8, app.borrow().dpi));
+            assert!(tip_bounds.top > icon_right.y);
+            let dc = CreateCompatibleDC(null_mut());
+            let bitmap = CreateBitmap(8, 8, 1, 32, null());
+            assert!(!dc.is_null() && !bitmap.is_null());
+            let old = SelectObject(dc, bitmap);
+            send(tip, WM_PRINT, dc as WPARAM, PRF_CLIENT as LPARAM);
+            let fill = GetPixel(dc, 4, 4);
+            SelectObject(dc, old);
+            DeleteObject(bitmap);
+            DeleteDC(dc);
+            assert_eq!(fill, app.borrow().colors.field, "painted hint background");
+
+            let (_, short_folder) = move_to_row(2);
+            assert_eq!(
+                IsWindowVisible(tip),
+                0,
+                "moving to a folder should immediately dismiss the old hint"
+            );
+            send(list, WM_MOUSEHOVER, 0, short_folder);
+            assert_eq!(
+                IsWindowVisible(tip),
+                0,
+                "a fully visible name needs no hint"
+            );
+
+            hover(3);
+            assert_ne!(IsWindowVisible(tip), 0);
+            assert_eq!(caption(tip), second);
+            hover(4);
+            assert_eq!(caption(tip), folder);
+            hover(5);
+            let wrapped = caption(tip).into_string().unwrap();
+            assert!(wrapped.contains("\r\n"));
+            assert_eq!(wrapped.replace("\r\n", ""), unbroken);
+            hover(0);
+            assert_eq!(IsWindowVisible(tip), 0, "a date heading has no file name");
+
+            hover(1);
+            assert_ne!(IsWindowVisible(tip), 0);
+            send(list, WM_MOUSELEAVE, 0, 0);
+            assert_eq!(IsWindowVisible(tip), 0);
+            hover(1);
+            assert_ne!(IsWindowVisible(tip), 0);
+            send(list, WM_MOUSEWHEEL, (120 << 16) as WPARAM, 0);
+            assert_eq!(IsWindowVisible(tip), 0);
+            {
+                let mut app = app.borrow_mut();
+                app.group_headers.clear();
+                app.visible = vec![0, 1, 2, 3, 4];
+                app.set_count();
+            }
+            for view in [LV_VIEW_LIST, LV_VIEW_ICON] {
+                app.borrow_mut().apply_view(view);
+                hover(4);
+                assert_ne!(IsWindowVisible(tip), 0, "long name in view {view}");
+                assert_eq!(caption(tip).to_string_lossy().replace("\r\n", ""), unbroken);
+                hover(1);
+                assert_eq!(IsWindowVisible(tip), 0, "short name in view {view}");
+            }
+            hover(4);
+            assert_ne!(IsWindowVisible(tip), 0);
+            app.borrow_mut()
+                .go(Location::Folder(root.path().join("Folder")));
+            assert_eq!(IsWindowVisible(tip), 0);
+            app.borrow().file_name_tip.destroy();
+            DestroyWindow(window);
+        }
+    }
+
+    unsafe extern "system" fn file_list_fixture_proc(
+        window: HWND,
+        message: u32,
+        wp: WPARAM,
+        lp: LPARAM,
+        _: usize,
+        _: usize,
+    ) -> LRESULT {
+        if message == WM_NOTIFY {
+            return unsafe { procedure(window, message, wp, lp) };
+        }
+        unsafe { DefSubclassProc(window, message, wp, lp) }
+    }
+
+    unsafe fn visible_fixture_tooltip(owner: HWND) -> HWND {
+        unsafe extern "system" fn visitor(window: HWND, data: LPARAM) -> i32 {
+            unsafe {
+                let (owner, result) = &mut *(data as *mut (HWND, HWND));
+                let mut class = [0u16; 32];
+                if IsWindowVisible(window) != 0
+                    && GetWindow(window, GW_OWNER) == *owner
+                    && GetClassNameW(window, class.as_mut_ptr(), class.len() as i32) > 0
+                    && from_wide(&class) == "tooltips_class32"
+                {
+                    *result = window;
+                    return 0;
+                }
+            }
+            1
+        }
+        let mut result = (owner, null_mut());
+        unsafe {
+            EnumThreadWindows(
+                GetCurrentThreadId(),
+                Some(visitor),
+                (&mut result as *mut _) as LPARAM,
+            )
+        };
+        result.1
+    }
 
     #[test]
     fn native_button_backgrounds_use_the_theme_before_owner_draw() {

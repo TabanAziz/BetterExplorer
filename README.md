@@ -59,7 +59,7 @@ BetterExplorer is a preview for **Windows 11 x64**. Download the Setup EXE or po
 
 Open **Settings** or press **Ctrl+,** to choose what **Win+E** opens. Selecting BetterExplorer starts a small helper for your Windows session and configures it to run at sign-in. Choose **File Explorer** in Settings before moving or removing a portable copy that manages the shortcut.
 
-**Default folder manager** is a separate option in Setup and Settings. Enable it to open folders and drives in BetterExplorer when apps use the Windows shell's default folder command. Choose **Windows default** to restore the previous folder handler before moving or removing a portable copy. Apps that launch `explorer.exe` directly continue to open File Explorer.
+**Default folder manager** is a separate option in Setup and Settings. Enable it to open folders and drives in BetterExplorer when apps use the Windows shell's default folder command. Folders opened inside File Explorer follow its folder options. Apps that launch `explorer.exe` directly continue to open File Explorer. Choose **Windows default** to restore the previous folder handler before moving or removing a portable copy. When updating a portable copy from 0.1.8 in place, select **Windows default** and then **BetterExplorer** again to update an existing registration.
 
 Use `BetterExplorer.exe --select "C:\path\to\file.txt"` to open the containing folder and select a file or subfolder.
 

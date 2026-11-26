@@ -1,3 +1,4 @@
+use crate::folder_command;
 use better_explorer::model::wide;
 use std::{
     ffi::{OsStr, OsString},
@@ -25,7 +26,10 @@ use windows_sys::Win32::{
 const VERB: &str = "BetterExplorer.Open";
 const OWNER: &str = "BetterExplorerExecutable";
 const PREVIOUS: &str = "BetterExplorerPreviousDefault";
-const LABEL: &str = "Open in BetterExplorer";
+const LABEL: &str = "Open folder";
+const LEGACY_LABEL: &str = "Open in BetterExplorer";
+const DELEGATE: &str = "DelegateExecute";
+const MULTI_SELECT: &str = "MultiSelectModel";
 const CLASSES: [&str; 2] = [r"Directory\shell", r"Drive\shell"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,13 +45,19 @@ pub fn status() -> io::Result<Status> {
 }
 
 pub fn set_enabled(enabled: bool) -> io::Result<()> {
-    Registration::new(&Scope::live(), &std::env::current_exe()?)?.change(enabled)
+    let operation = if enabled {
+        Change::Enable
+    } else {
+        Change::Disable
+    };
+    Registration::new(&Scope::live(), &std::env::current_exe()?)?.change(operation)
 }
 
 pub fn cli(arg: &OsStr, args: impl Iterator<Item = OsString>) -> Option<i32> {
-    let enabled = match arg.to_str()? {
-        "--folder-manager-on" => Some(true),
-        "--folder-manager-off" => Some(false),
+    let operation = match arg.to_str()? {
+        "--folder-manager-on" => Some(Change::Enable),
+        "--folder-manager-off" => Some(Change::Disable),
+        "--folder-manager-upgrade" => Some(Change::Upgrade),
         "--folder-manager-state" => None,
         _ => return None,
     };
@@ -64,15 +74,17 @@ pub fn cli(arg: &OsStr, args: impl Iterator<Item = OsString>) -> Option<i32> {
             }
         }
         let registration = Registration::new(&scope, &owner)?;
-        if let Some(enabled) = enabled {
-            registration.change(enabled)?;
-            return Ok(0);
-        }
-        Ok(match registration.status()? {
-            Status::Active => 0,
-            Status::Inactive => 2,
-            Status::Partial => 3,
-            Status::Conflict => 4,
+        Ok(match operation {
+            Some(operation) => {
+                registration.change(operation)?;
+                0
+            }
+            None => match registration.status()? {
+                Status::Active => 0,
+                Status::Inactive => 2,
+                Status::Partial => 3,
+                Status::Conflict => 4,
+            },
         })
     };
     Some(match run() {
@@ -125,6 +137,14 @@ struct Registration<'a> {
     keys: [String; 2],
     owner: Value,
     command: Value,
+    server: ServerRegistration,
+}
+
+#[derive(Clone, Copy)]
+enum Change {
+    Enable,
+    Disable,
+    Upgrade,
 }
 
 impl<'a> Registration<'a> {
@@ -132,15 +152,28 @@ impl<'a> Registration<'a> {
         if !owner.is_absolute() || owner.as_os_str().encode_wide().any(|c| c == b'"' as u16) {
             return Err(invalid_options());
         }
-        let mut command = OsString::from("\"");
-        command.push(owner.as_os_str());
+        let mut executable = OsString::from("\"");
+        executable.push(owner.as_os_str());
+        executable.push("\"");
         // The suffix keeps a drive root's backslash away from the closing quote.
-        command.push(r#"" --open-folder "%1\.""#);
+        let mut command = executable.clone();
+        command.push(r#" --open-folder "%1\.""#);
+        let mut server_command = executable;
+        server_command.push(" ");
+        server_command.push(folder_command::SERVER_ARG);
+        let class_id = format!("{{{:?}}}", folder_command::CLSID);
+        let class = format!(r"{}\CLSID\{class_id}", scope.root);
         Ok(Self {
             scope,
             keys: CLASSES.map(|class| format!(r"{}\{class}", scope.root)),
             owner: Value::text(owner),
             command: Value::text(command),
+            server: ServerRegistration {
+                delegate: Value::text(class_id),
+                command_key: format!(r"{class}\LocalServer32"),
+                class,
+                command: Value::text(server_command),
+            },
         })
     }
 
@@ -156,21 +189,39 @@ impl<'a> Registration<'a> {
         let owner = read(&verb, OWNER)?;
         let label = read(&verb, "")?;
         let previous = read(&verb, PREVIOUS)?;
+        let multi_select = read(&verb, MULTI_SELECT)?;
         let command = read(&command_key, "")?;
+        let delegate = read(&command_key, DELEGATE)?;
         let active = default.as_ref().is_some_and(|value| value.text_eq(VERB));
         let verb_counts = counts(&verb)?;
         let command_counts = counts(&command_key)?;
         let machine_verb = !self.scope.testing && counts_in(HKEY_LOCAL_MACHINE, &verb)?.is_some();
         let owned = owner.as_ref() == Some(&self.owner)
-            && label.as_ref().is_none_or(|value| value.text_eq(LABEL))
+            && label
+                .as_ref()
+                .is_none_or(|value| value.text_eq(LABEL) || value.text_eq(LEGACY_LABEL))
+            && multi_select
+                .as_ref()
+                .is_none_or(|value| value.text_eq("Document"))
             && command.as_ref().is_none_or(|value| value == &self.command)
+            && delegate
+                .as_ref()
+                .is_none_or(|value| value == &self.server.delegate)
             && previous.as_ref().map_or(!active, Value::valid_backup)
             && verb_counts
                 == Some((
                     u32::from(command_counts.is_some()),
-                    1 + u32::from(previous.is_some()) + u32::from(label.is_some()),
+                    1 + u32::from(previous.is_some())
+                        + u32::from(label.is_some())
+                        + u32::from(multi_select.is_some()),
                 ))
-            && command_counts.is_none_or(|value| value == (0, u32::from(command.is_some())));
+            && command_counts.is_none_or(|value| {
+                value
+                    == (
+                        0,
+                        u32::from(command.is_some()) + u32::from(delegate.is_some()),
+                    )
+            });
         let foreign = !owned
             && (verb_counts.is_some_and(|counts| counts != (0, 0)) || active || machine_verb);
         Ok(Snapshot {
@@ -179,7 +230,9 @@ impl<'a> Registration<'a> {
             owner,
             label,
             previous,
+            multi_select,
             command,
+            delegate,
             owned,
             active,
             foreign,
@@ -189,15 +242,15 @@ impl<'a> Registration<'a> {
     fn status(&self) -> io::Result<Status> {
         let _lock = Lock::acquire()?;
         let states = self.snapshots()?;
+        let server = self.server.snapshot(self.scope, &self.owner)?;
+        let legacy = states.iter().all(|state| state.delegate.is_none());
+        let current = server.command.is_some() && states.iter().all(Snapshot::current_command);
         Ok(
-            if states
-                .iter()
-                .all(|state| state.owned && state.active && state.command.is_some())
-            {
-                Status::Active
-            } else if states.iter().any(|state| state.foreign) {
+            if server.foreign || states.iter().any(|state| state.foreign) {
                 Status::Conflict
-            } else if states.iter().any(|state| state.owned) {
+            } else if states.iter().all(Snapshot::active_command) && (legacy || current) {
+                Status::Active
+            } else if server.owned || states.iter().any(|state| state.owned) {
                 Status::Partial
             } else {
                 Status::Inactive
@@ -205,65 +258,91 @@ impl<'a> Registration<'a> {
         )
     }
 
-    fn change(&self, enabled: bool) -> io::Result<()> {
+    fn change(&self, operation: Change) -> io::Result<()> {
         let _lock = Lock::acquire()?;
         let old = self.snapshots()?;
-        if enabled && old.iter().any(|state| state.foreign) {
+        let server = self.server.snapshot(self.scope, &self.owner)?;
+        if matches!(operation, Change::Upgrade)
+            && (server.foreign
+                || !old.iter().all(Snapshot::active_command)
+                || (server.command.is_some() && old.iter().all(Snapshot::current_command)))
+        {
+            return Ok(());
+        }
+        let enabled = !matches!(operation, Change::Disable);
+        if enabled && (server.foreign || old.iter().any(|state| state.foreign)) {
             return Err(io::Error::other(
                 "Another BetterExplorer copy or an existing shell registration uses this folder command.",
             ));
         }
         if !enabled
-            && old.iter().any(|state| {
-                state.foreign && state.active && state.owner.as_ref() == Some(&self.owner)
-            })
+            && ((server.foreign && server.command.as_ref() == Some(&self.server.command))
+                || old.iter().any(|state| {
+                    state.foreign && state.active && state.owner.as_ref() == Some(&self.owner)
+                        || server.owned
+                            && !state.owned
+                            && state.delegate.as_ref() == Some(&self.server.delegate)
+                }))
         {
             return Err(io::Error::other(
                 "The BetterExplorer folder command was changed outside the app and needs to be restored before it can be removed.",
             ));
         }
-        if !enabled && !old.iter().any(|state| state.owned) {
+        let change_server = enabled || server.owned;
+        if !change_server && !old.iter().any(|state| state.owned) {
             return Ok(());
         }
-        let mut changed = false;
-        for (index, (key, state)) in self.keys.iter().zip(&old).enumerate() {
-            let result = if enabled {
-                let previous = if state.owned && state.active {
-                    state.previous.clone().unwrap()
-                } else {
-                    let container = state
-                        .previous
-                        .as_ref()
-                        .map_or(state.container, Value::container);
-                    Value::backup(state.default.as_ref(), container)
-                };
-                changed = true;
-                self.install(key, &previous)
-            } else if state.owned {
-                changed = true;
-                self.remove(key, state)
-            } else {
-                continue;
-            };
-            if let Err(error) = result {
-                let mut recovery = Ok(());
-                for (key, state) in self.keys[..=index].iter().zip(&old[..=index]).rev() {
-                    if (enabled || state.owned) && !state.foreign {
-                        if let Err(error) = state.restore(key) {
-                            recovery = Err(error);
-                        }
-                    }
-                }
-                self.notify();
-                return Err(match recovery {
-                    Ok(()) => error,
-                    Err(recovery) => io::Error::other(format!("{error} Rollback: {recovery}")),
-                });
+        let mut tried_server = false;
+        let mut tried_verbs = 0;
+        let mut apply = || -> io::Result<()> {
+            if enabled {
+                tried_server = true;
+                self.server.install(&self.owner)?;
             }
-        }
-        if changed {
+            for (index, (key, state)) in self.keys.iter().zip(&old).enumerate() {
+                tried_verbs = index + 1;
+                if enabled {
+                    let previous = if state.owned && state.active {
+                        state.previous.clone().unwrap()
+                    } else {
+                        let container = state
+                            .previous
+                            .as_ref()
+                            .map_or(state.container, Value::container);
+                        Value::backup(state.default.as_ref(), container)
+                    };
+                    self.install(key, &previous)?;
+                } else if state.owned {
+                    self.remove(key, state)?;
+                }
+            }
+            if !enabled && change_server {
+                tried_server = true;
+                self.server.clear()?;
+            }
+            Ok(())
+        };
+        let result = apply();
+        if let Err(error) = result {
+            let mut recovery = Ok(());
+            if tried_server && !enabled {
+                recovery = self.server.restore(&server);
+            }
+            for (key, state) in self.keys[..tried_verbs].iter().zip(&old).rev() {
+                if (enabled || state.owned) && !state.foreign {
+                    recovery = recovery.and(state.restore(key));
+                }
+            }
+            if tried_server && enabled {
+                recovery = recovery.and(self.server.restore(&server));
+            }
             self.notify();
+            return Err(match recovery {
+                Ok(()) => error,
+                Err(recovery) => io::Error::other(format!("{error} Rollback: {recovery}")),
+            });
         }
+        self.notify();
         Ok(())
     }
 
@@ -272,7 +351,10 @@ impl<'a> Registration<'a> {
         write(&verb, OWNER, Some(&self.owner))?;
         write(&verb, PREVIOUS, Some(previous))?;
         write(&verb, "", Some(&Value::text(LABEL)))?;
-        write(&command_key(key), "", Some(&self.command))?;
+        write(&verb, MULTI_SELECT, Some(&Value::text("Document")))?;
+        let command = command_key(key);
+        write(&command, "", Some(&self.command))?;
+        write(&command, DELEGATE, Some(&self.server.delegate))?;
         write(key, "", Some(&Value::text(VERB)))
     }
 
@@ -302,6 +384,68 @@ impl<'a> Registration<'a> {
     }
 }
 
+struct ServerRegistration {
+    class: String,
+    command_key: String,
+    command: Value,
+    delegate: Value,
+}
+
+impl ServerRegistration {
+    fn snapshot(&self, scope: &Scope, expected_owner: &Value) -> io::Result<ServerSnapshot> {
+        let class_counts = counts(&self.class)?;
+        let server_counts = counts(&self.command_key)?;
+        let owner = read(&self.class, OWNER)?;
+        let command = read(&self.command_key, "")?;
+        let owned = owner.as_ref() == Some(expected_owner)
+            && class_counts == Some((u32::from(server_counts.is_some()), 1))
+            && server_counts.is_none_or(|counts| counts == (0, u32::from(command.is_some())))
+            && command.as_ref().is_none_or(|value| value == &self.command);
+        let machine_class = !scope.testing && counts_in(HKEY_LOCAL_MACHINE, &self.class)?.is_some();
+        Ok(ServerSnapshot {
+            owner,
+            command,
+            has_server_key: server_counts.is_some(),
+            owned,
+            foreign: machine_class || (!owned && class_counts.is_some()),
+        })
+    }
+
+    fn install(&self, owner: &Value) -> io::Result<()> {
+        write(&self.class, OWNER, Some(owner))?;
+        write(&self.command_key, "", Some(&self.command))
+    }
+
+    fn clear(&self) -> io::Result<()> {
+        write(&self.command_key, "", None)?;
+        delete_empty_key(&self.command_key)?;
+        write(&self.class, OWNER, None)?;
+        delete_empty_key(&self.class)
+    }
+
+    fn restore(&self, snapshot: &ServerSnapshot) -> io::Result<()> {
+        if !snapshot.owned {
+            return self.clear();
+        }
+        write(&self.class, OWNER, snapshot.owner.as_ref())?;
+        write(&self.command_key, "", snapshot.command.as_ref())?;
+        if snapshot.has_server_key {
+            create_for_write(&self.command_key)?;
+        } else {
+            delete_empty_key(&self.command_key)?;
+        }
+        Ok(())
+    }
+}
+
+struct ServerSnapshot {
+    owner: Option<Value>,
+    command: Option<Value>,
+    has_server_key: bool,
+    owned: bool,
+    foreign: bool,
+}
+
 fn verb_key(key: &str) -> String {
     format!(r"{key}\{VERB}")
 }
@@ -314,8 +458,9 @@ fn clear_verb(key: &str) -> io::Result<()> {
     let command = command_key(key);
     let verb = verb_key(key);
     write(&command, "", None)?;
+    write(&command, DELEGATE, None)?;
     delete_empty_key(&command)?;
-    for name in ["", PREVIOUS, OWNER] {
+    for name in ["", PREVIOUS, OWNER, MULTI_SELECT] {
         write(&verb, name, None)?;
     }
     delete_empty_key(&verb)
@@ -327,13 +472,23 @@ struct Snapshot {
     owner: Option<Value>,
     label: Option<Value>,
     previous: Option<Value>,
+    multi_select: Option<Value>,
     command: Option<Value>,
+    delegate: Option<Value>,
     owned: bool,
     active: bool,
     foreign: bool,
 }
 
 impl Snapshot {
+    fn active_command(&self) -> bool {
+        self.owned && self.active && self.command.is_some()
+    }
+
+    fn current_command(&self) -> bool {
+        self.delegate.is_some() && self.multi_select.is_some()
+    }
+
     fn restore(&self, key: &str) -> io::Result<()> {
         if !self.owned {
             write(key, "", self.default.as_ref())?;
@@ -344,7 +499,10 @@ impl Snapshot {
         write(&verb, PREVIOUS, self.previous.as_ref())?;
         write(&verb, OWNER, self.owner.as_ref())?;
         write(&verb, "", self.label.as_ref())?;
-        write(&command_key(key), "", self.command.as_ref())?;
+        write(&verb, MULTI_SELECT, self.multi_select.as_ref())?;
+        let command = command_key(key);
+        write(&command, "", self.command.as_ref())?;
+        write(&command, DELEGATE, self.delegate.as_ref())?;
         write(key, "", self.default.as_ref())
     }
 }
@@ -499,21 +657,7 @@ fn read(path: &str, name: &str) -> io::Result<Option<Value>> {
 fn write(path: &str, name: &str, value: Option<&Value>) -> io::Result<()> {
     let name = wide(name);
     if let Some(value) = value {
-        let mut key = null_mut();
-        result(unsafe {
-            RegCreateKeyExW(
-                HKEY_CURRENT_USER,
-                wide(path).as_ptr(),
-                0,
-                null(),
-                0,
-                KEY_SET_VALUE,
-                null(),
-                &mut key,
-                null_mut(),
-            )
-        })?;
-        let key = Key(key);
+        let key = create_for_write(path)?;
         result(unsafe {
             RegSetValueExW(
                 key.0,
@@ -532,6 +676,24 @@ fn write(path: &str, name: &str, value: Option<&Value>) -> io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+fn create_for_write(path: &str) -> io::Result<Key> {
+    let mut key = null_mut();
+    result(unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            wide(path).as_ptr(),
+            0,
+            null(),
+            0,
+            KEY_SET_VALUE,
+            null(),
+            &mut key,
+            null_mut(),
+        )
+    })?;
+    Ok(Key(key))
 }
 
 fn counts(path: &str) -> io::Result<Option<(u32, u32)>> {
@@ -628,6 +790,60 @@ mod tests {
     }
 
     #[test]
+    fn upgrades_an_active_legacy_registration_without_changing_its_backups() -> io::Result<()> {
+        let test_root = tempfile::tempdir()?;
+        let scope = TestScope::new(test_root.path())?;
+        let path = test_root.path().join("BetterExplorer.exe");
+        let registration = Registration::new(&scope.0, &path)?;
+        registration.change(Change::Upgrade)?;
+        assert_eq!(registration.status()?, Status::Inactive);
+        let legacy_label = Value::text("Open in BetterExplorer");
+        let previous = Value::text("OtherFolderManager");
+        let directory = &registration.keys[0];
+        write(directory, "", Some(&previous))?;
+        for key in &registration.keys {
+            let backup = Value::backup(read(key, "")?.as_ref(), Container::read(key)?);
+            let verb = verb_key(key);
+            write(&verb, OWNER, Some(&registration.owner))?;
+            write(&verb, PREVIOUS, Some(&backup))?;
+            write(&verb, "", Some(&legacy_label))?;
+            write(&command_key(key), "", Some(&registration.command))?;
+            write(key, "", Some(&Value::text(VERB)))?;
+        }
+        assert_eq!(registration.status()?, Status::Active);
+
+        registration.change(Change::Upgrade)?;
+
+        let clsid = "{801E1D22-334A-4B1F-9F3B-A99DC4A38721}";
+        let class = format!(r"{}\CLSID\{clsid}", scope.0.root);
+        let server = format!(r"{class}\LocalServer32");
+        assert_eq!(
+            read(&server, "")?,
+            Some(Value::text(format!(
+                r#""{}" --folder-command-server"#,
+                path.display()
+            )))
+        );
+        for key in &registration.keys {
+            assert!(read(&command_key(key), "DelegateExecute")?
+                .is_some_and(|value| value.text_eq(clsid)));
+            assert_eq!(
+                read(&verb_key(key), MULTI_SELECT)?,
+                Some(Value::text("Document"))
+            );
+        }
+        assert_eq!(registration.status()?, Status::Active);
+        registration.change(Change::Upgrade)?;
+
+        registration.change(Change::Disable)?;
+        assert_eq!(read(directory, "")?, Some(previous));
+        assert_eq!(read(&registration.keys[1], "")?, None);
+        assert_eq!(counts(&class)?, None);
+        assert_eq!(registration.status()?, Status::Inactive);
+        Ok(())
+    }
+
+    #[test]
     fn restores_previous_defaults_and_preserves_third_party_changes() -> io::Result<()> {
         let test_root = tempfile::tempdir()?;
         let scope = TestScope::new(test_root.path())?;
@@ -642,15 +858,17 @@ mod tests {
         write(directory, "", Some(&previous))?;
 
         assert_eq!(registration.status()?, Status::Inactive);
-        registration.change(true)?;
+        registration.change(Change::Enable)?;
         assert_eq!(registration.status()?, Status::Active);
-        registration.change(true)?;
+        registration.change(Change::Enable)?;
         assert_eq!(read(directory, "")?, Some(Value::text(VERB)));
 
         let newer = Value::text("OtherDriveManager");
         write(drive, "", Some(&newer))?;
         assert_eq!(registration.status()?, Status::Partial);
-        registration.change(false)?;
+        registration.change(Change::Upgrade)?;
+        assert_eq!(read(drive, "")?, Some(newer.clone()));
+        registration.change(Change::Disable)?;
         assert_eq!(read(directory, "")?, Some(previous));
         assert_eq!(read(drive, "")?, Some(newer));
         assert_eq!(read(&verb_key(directory), OWNER)?, None);
@@ -667,12 +885,12 @@ mod tests {
         let second_path = test_root.path().join("Second.exe");
         let first = Registration::new(&scope.0, &first_path)?;
         let second = Registration::new(&scope.0, &second_path)?;
-        first.change(true)?;
+        first.change(Change::Enable)?;
         assert_eq!(second.status()?, Status::Conflict);
-        assert!(second.change(true).is_err());
-        second.change(false)?;
+        assert!(second.change(Change::Enable).is_err());
+        second.change(Change::Disable)?;
         assert_eq!(first.status()?, Status::Active);
-        first.change(false)?;
+        first.change(Change::Disable)?;
         assert_eq!(first.status()?, Status::Inactive);
         Ok(())
     }
@@ -683,21 +901,45 @@ mod tests {
         let scope = TestScope::new(test_root.path())?;
         let path = test_root.path().join("BetterExplorer.exe");
         let registration = Registration::new(&scope.0, &path)?;
-        registration.change(true)?;
+        registration.change(Change::Enable)?;
 
         let key = &registration.keys[0];
         let command = Value::text(format!(r#""{}" "%1""#, path.display()));
         write(&command_key(key), "", Some(&command))?;
-        let result = registration.change(false);
+        let result = registration.change(Change::Disable);
         let default_after_attempt = read(key, "")?;
         let command_after_attempt = read(&command_key(key), "")?;
         write(&command_key(key), "", Some(&registration.command))?;
-        registration.change(false)?;
+        registration.change(Change::Disable)?;
 
         assert!(result.is_err());
         assert_eq!(default_after_attempt, Some(Value::text(VERB)));
         assert_eq!(command_after_attempt, Some(command));
         assert_eq!(registration.status()?, Status::Inactive);
+        Ok(())
+    }
+
+    #[test]
+    fn preserves_a_modified_server_registration_and_refuses_to_uninstall_its_executable(
+    ) -> io::Result<()> {
+        let test_root = tempfile::tempdir()?;
+        let scope = TestScope::new(test_root.path())?;
+        let registration =
+            Registration::new(&scope.0, &test_root.path().join("BetterExplorer.exe"))?;
+        registration.change(Change::Enable)?;
+        let extra = Value::text("Other configuration");
+        write(&registration.server.class, "Extra", Some(&extra))?;
+
+        assert_eq!(registration.status()?, Status::Conflict);
+        assert!(registration.change(Change::Disable).is_err());
+        assert_eq!(read(&registration.server.class, "Extra")?, Some(extra));
+        assert_eq!(
+            read(&registration.server.command_key, "")?,
+            Some(registration.server.command.clone())
+        );
+        for key in &registration.keys {
+            assert_eq!(read(key, "")?, Some(Value::text(VERB)));
+        }
         Ok(())
     }
 }

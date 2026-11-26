@@ -113,9 +113,12 @@ $install = {
             [IO.File]::Move($shortcutStage, $paths.Shortcut)
             $shortcutMoved = $true
         }
-        if ($FolderManager) {
-            $command = if ($FolderManager -eq 'BetterExplorer') { '--folder-manager-on' }
-                else { '--folder-manager-off' }
+        if ($FolderManager -or $previous) {
+            $command = switch ($FolderManager) {
+                'BetterExplorer' { '--folder-manager-on' }
+                'WindowsExplorer' { '--folder-manager-off' }
+                default { '--folder-manager-upgrade' }
+            }
             $null = Invoke-FolderManagerControl $executable $executable $command $lockRoot
         }
         $completed = $true
