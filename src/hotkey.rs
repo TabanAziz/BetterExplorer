@@ -99,6 +99,30 @@ pub fn set_enabled(enabled: bool) -> io::Result<()> {
     }
 }
 
+pub fn resume_on_launch() {
+    if env::var_os("BETTEREXPLORER_EPHEMERAL").is_some() {
+        return;
+    }
+    let _ = thread::Builder::new().spawn(|| {
+        if let Ok(exe) = env::current_exe() {
+            if startup_state(&exe).ok() == Some(StartupState::Ours)
+                && matches!(find_listener(&exe), Listener::Missing)
+            {
+                let _ = resume_configured_listener();
+            }
+        }
+    });
+}
+
+fn resume_configured_listener() -> io::Result<()> {
+    with_settings_lock(|exe| {
+        if startup_state(exe)? == StartupState::Ours {
+            start_listener(exe)?;
+        }
+        Ok(())
+    })
+}
+
 pub fn cli(arg: &OsStr) -> Option<i32> {
     let result = match arg.to_str()? {
         "--win-e-enabled" => {
@@ -113,12 +137,7 @@ pub fn cli(arg: &OsStr) -> Option<i32> {
         "--win-e-on" => set_enabled(true),
         "--win-e-off" => set_enabled(false),
         "--win-e-pause" => with_settings_lock(stop_listener),
-        "--win-e-resume" => with_settings_lock(|exe| {
-            if startup_state(exe)? == StartupState::Ours {
-                start_listener(exe)?;
-            }
-            Ok(())
-        }),
+        "--win-e-resume" => resume_configured_listener(),
         LISTENER_ARG => env::current_exe().and_then(run_listener),
         _ => return None,
     };

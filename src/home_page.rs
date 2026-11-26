@@ -955,6 +955,16 @@ unsafe extern "system" fn page_proc(window: HWND, message: u32, wp: WPARAM, lp: 
             0
         },
         WM_ERASEBKGND => 1,
+        WM_CTLCOLORBTN => unsafe {
+            let colors = state.colors.get();
+            let background = if state.tabs.contains(&(lp as HWND)) {
+                colors.tile
+            } else {
+                colors.content
+            };
+            SetDCBrushColor(wp as HDC, background);
+            GetStockObject(DC_BRUSH) as LRESULT
+        },
         WM_DRAWITEM if lp != 0 => unsafe {
             state.draw_button(&*(lp as *const DRAWITEMSTRUCT));
             1

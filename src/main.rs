@@ -41,6 +41,7 @@ fn main() {
         std::process::exit(exit);
     }
     let (path, selection) = launch_paths(first.into_iter().chain(args));
+    hotkey::resume_on_launch();
     if let Err(error) = ui::run(path, selection) {
         let error =
             better_explorer::model::wide(format!("BetterExplorer could not start.\n\n{error}"));

@@ -52,7 +52,10 @@ The executable is **1.79 MiB**. One 30-second idle sample recorded 0 ms of app C
 
 ## Install
 
-BetterExplorer is a preview for **Windows 11 x64**. Download the portable ZIP from the [latest release](https://github.com/TabanAziz/BetterExplorer/releases/latest), extract it, and run `BetterExplorer.exe`. The release includes SHA-256 checksums. The executable is unsigned.
+BetterExplorer is a preview for **Windows 11 x64**. Download the Setup EXE or portable ZIP from the [latest release](https://github.com/TabanAziz/BetterExplorer/releases/latest). The release includes SHA-256 checksums. The executables are unsigned.
+
+- **Setup EXE** installs BetterExplorer for your Windows account. Choose whether to use Win+E and folder integration, and whether to create a Start menu shortcut. Run the new Setup EXE to update. To uninstall, open **Settings > Apps > Installed apps** and select BetterExplorer.
+- **Portable ZIP** can be extracted to a folder of your choice. Open `BetterExplorer.exe` to start.
 
 Open **Settings** or press **Ctrl+,** to choose what **Win+E** opens. Selecting BetterExplorer starts a small helper for your Windows session and configures it to run at sign-in. Choose **File Explorer** in Settings before moving or removing a portable copy that manages the shortcut.
 
@@ -81,9 +84,9 @@ Use Rust stable, the x64 MSVC tools, and the Windows SDK.
 
     cargo build --release --locked
     cargo test --locked
-    powershell -NoProfile -File tools\release.ps1 -PortableOnly
+    powershell -NoProfile -File tools\release.ps1
 
-Cargo writes the executable to `target\release\BetterExplorer.exe`. The packaging command writes the portable ZIP and checksums under `dist\`.
+Cargo writes the executable to `target\release\BetterExplorer.exe`. Install Inno Setup 6.6 or later to package the Setup EXE. The packaging command writes Setup, the portable ZIP and their checksums under `dist\`. Use `-PortableOnly` to package just the ZIP.
 
 - [Contributing](CONTRIBUTING.md)
 - [Architecture](docs/architecture.md)

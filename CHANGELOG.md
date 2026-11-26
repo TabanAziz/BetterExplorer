@@ -1,7 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.1.8
 
+- Added a standalone Windows installer alongside the portable ZIP.
+- Restore the Win+E listener on launch when this copy is already configured for the shortcut.
+- Paint the first frame with the selected theme before revealing the window.
 - Reduced work during file selection and dimmed cut items until the clipboard changes or the cut is completed.
 - Added folder drop targets, standard drag modifiers, faster same-volume moves, and clearer errors for unavailable paste sources.
 - Expanded the New menu with document and archive formats.

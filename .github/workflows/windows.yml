@@ -31,3 +31,46 @@ jobs:
         run: cargo +stable test --locked
       - name: Release build
         run: cargo +stable build --release --locked
+      - name: Verify opted-in Win+E recovers on app launch
+        if: runner.environment == 'github-hosted'
+        shell: powershell
+        run: |
+          $exe = (Resolve-Path -LiteralPath 'target/release/BetterExplorer.exe').Path
+          $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+          if (Get-ItemProperty -LiteralPath $runKey -Name BetterExplorerWinE -ErrorAction SilentlyContinue) {
+            throw 'This check requires a clean Windows test account.'
+          }
+          Add-Type -TypeDefinition @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class WinEListener {
+              [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+              private static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string name, string caption);
+              public static bool IsReady(string exe) {
+                  return FindWindowEx(new IntPtr(-3), IntPtr.Zero, "BetterExplorerWinEListener", exe) != IntPtr.Zero;
+              }
+          }
+          '@
+          function Set-ListenerState([string] $command) {
+            $control = Start-Process -FilePath $exe -ArgumentList $command -WindowStyle Hidden -PassThru
+            if (-not $control.WaitForExit(6000) -or $control.ExitCode -ne 0) { throw "$command failed." }
+          }
+          $app = $null
+          try {
+            Set-ListenerState '--win-e-on'
+            Set-ListenerState '--win-e-pause'
+            if ([WinEListener]::IsReady($exe)) { throw 'The test listener did not pause.' }
+            $env:BETTEREXPLORER_BENCH_NOACTIVATE = '1'
+            $app = Start-Process -FilePath $exe -PassThru
+            $wait = [Diagnostics.Stopwatch]::StartNew()
+            while (-not [WinEListener]::IsReady($exe)) {
+              if ($app.HasExited -or $wait.ElapsedMilliseconds -ge 6000) {
+                throw 'BetterExplorer did not restore the enrolled Win+E listener on normal launch.'
+              }
+              Start-Sleep -Milliseconds 25
+            }
+            Write-Host "Win+E listener restored in $($wait.ElapsedMilliseconds) ms after app launch."
+          } finally {
+            if ($app -and -not $app.HasExited) { $null = $app.CloseMainWindow() }
+            Set-ListenerState '--win-e-off'
+          }

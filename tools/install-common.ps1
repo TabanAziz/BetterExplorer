@@ -262,7 +262,7 @@ function Clear-OwnedFolderManager {
         if ($null -eq $key) { continue }
         try {
             if ($key.GetValue('BetterExplorerExecutable') -ceq $Owner) {
-                throw 'The installed BetterExplorer executable is missing. Extract a fresh install bundle, then run Setup.exe --uninstall or uninstall.ps1 from that bundle.'
+                throw 'The installed BetterExplorer executable is missing. Run the latest BetterExplorer setup to repair the installation, then try uninstalling again.'
             }
         } finally {
             $key.Dispose()

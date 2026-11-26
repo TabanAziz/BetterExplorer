@@ -211,13 +211,13 @@ try {
     }
 
     $windows = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
-    $processor = Get-ItemProperty -LiteralPath 'HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor\0'
+    $processor = Get-ItemPropertyValue -LiteralPath 'HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor\0' -Name ProcessorNameString
     $summary = [ordered] @{
         started_utc = $startedAt.ToString('O')
         environment = [ordered] @{
             windows_version = $windows.DisplayVersion
             windows_build = "$($windows.CurrentBuildNumber).$($windows.UBR)"
-            processor = $processor.ProcessorNameString.Trim()
+            processor = $processor.Trim()
             logical_processors = [Environment]::ProcessorCount
             ui_culture = [Globalization.CultureInfo]::CurrentUICulture.Name
             powershell = $PSVersionTable.PSVersion.ToString()

@@ -41,7 +41,10 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
-    Graphics::Gdi::*,
+    Graphics::{
+        Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK},
+        Gdi::*,
+    },
     System::{
         DataExchange::{AddClipboardFormatListener, RemoveClipboardFormatListener},
         LibraryLoader::GetModuleHandleW,
@@ -71,11 +74,32 @@ const GROUP_TIMER: usize = 3;
 const RESIZE_EDGE: i32 = 7;
 
 #[derive(Clone, Copy)]
+enum ControlSurface {
+    Chrome,
+    Content,
+    Sidebar,
+    Field,
+    Title,
+}
+
+impl ControlSurface {
+    fn color(self, palette: &Palette) -> u32 {
+        match self {
+            Self::Chrome => palette.chrome,
+            Self::Content => palette.content,
+            Self::Sidebar => palette.sidebar,
+            Self::Field => palette.field,
+            Self::Title => palette.title,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 struct ControlColors {
     text: u32,
     muted: u32,
-    surfaces: [u32; 4],
-    brushes: [HBRUSH; 4],
+    surfaces: [u32; 5],
+    brushes: [HBRUSH; 5],
 }
 
 thread_local! {
@@ -486,7 +510,7 @@ struct App {
     icon_size: i32,
     fitted_columns: Option<[i32; 4]>,
     fonts: [HFONT; 2],
-    brushes: [HBRUSH; 4],
+    brushes: [HBRUSH; 5],
     dpi: u32,
     colors: Palette,
     tabs: Vec<Tab>,
@@ -658,7 +682,7 @@ impl App {
             icon_size: 52,
             fitted_columns: None,
             fonts: [null_mut(); 2],
-            brushes: [null_mut(); 4],
+            brushes: [null_mut(); 5],
             dpi,
             colors,
             tabs,
@@ -1045,23 +1069,22 @@ impl App {
     }
 
     fn update_theme_controls(&mut self) {
-        let old = std::mem::replace(&mut self.brushes, unsafe {
-            [
-                CreateSolidBrush(self.colors.chrome),
-                CreateSolidBrush(self.colors.content),
-                CreateSolidBrush(self.colors.sidebar),
-                CreateSolidBrush(self.colors.field),
-            ]
-        });
+        let surfaces = [
+            ControlSurface::Chrome,
+            ControlSurface::Content,
+            ControlSurface::Sidebar,
+            ControlSurface::Field,
+            ControlSurface::Title,
+        ]
+        .map(|surface| surface.color(&self.colors));
+        let old = std::mem::replace(
+            &mut self.brushes,
+            surfaces.map(|color| unsafe { CreateSolidBrush(color) }),
+        );
         CONTROL_COLORS.set(Some(ControlColors {
             text: self.colors.text,
             muted: self.colors.muted,
-            surfaces: [
-                self.colors.chrome,
-                self.colors.content,
-                self.colors.sidebar,
-                self.colors.field,
-            ],
+            surfaces,
             brushes: self.brushes,
         }));
         set_theme(self.window, self.list, &self.colors);
@@ -4862,26 +4885,6 @@ impl App {
             ),
             _ => None,
         };
-        let title = tab
-            || matches!(
-                id,
-                NEW_TAB
-                    | CLOSE_TAB
-                    | FRAME_MIN
-                    | FRAME_MAX
-                    | FRAME_CLOSE
-                    | BACK
-                    | FORWARD
-                    | UP
-                    | REFRESH
-            );
-        let surface = if title {
-            self.colors.title
-        } else if crumb || id == PATH {
-            self.colors.field
-        } else {
-            self.colors.chrome
-        };
         let accent = tab || matches!(id, SORT | VIEW | FILTER | NEW);
         let icon_color = if accent {
             self.colors.accent
@@ -4891,7 +4894,7 @@ impl App {
         ButtonStyle {
             glyph,
             icon_color,
-            surface,
+            surface: button_surface(id).color(&self.colors),
             label: (id != DETAILS || !self.compact_toolbar(rect(self.window).right))
                 && (crumb
                     || (tab && rect(control).right >= scale(48, self.dpi))
@@ -6107,7 +6110,9 @@ unsafe extern "system" fn settings_viewport_proc(
     unsafe {
         let parent = GetParent(window);
         match message {
-            WM_COMMAND | WM_DRAWITEM | WM_CTLCOLORSTATIC => SendMessageW(parent, message, wp, lp),
+            WM_COMMAND | WM_DRAWITEM | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
+                SendMessageW(parent, message, wp, lp)
+            }
             WM_ERASEBKGND => 1,
             WM_PAINT | WM_PRINTCLIENT | WM_VSCROLL | WM_MOUSEWHEEL => {
                 let pointer = GetWindowLongPtrW(parent, GWLP_USERDATA) as *const RefCell<App>;
@@ -6130,7 +6135,11 @@ unsafe extern "system" fn settings_viewport_proc(
                             if let Some((app, page)) = app.as_ref().zip(page) {
                                 page.paint(dc, &update, &app.colors);
                             } else if let Some(colors) = CONTROL_COLORS.get() {
-                                FillRect(dc, &update, colors.brushes[1]);
+                                FillRect(
+                                    dc,
+                                    &update,
+                                    colors.brushes[ControlSurface::Content as usize],
+                                );
                             }
                         }
                         if message == WM_PAINT {
@@ -6156,6 +6165,23 @@ unsafe extern "system" fn settings_viewport_proc(
     }
 }
 
+fn button_surface(id: u16) -> ControlSurface {
+    use ControlSurface::*;
+    match id {
+        NEW_TAB | CLOSE_TAB | FRAME_MIN | FRAME_MAX | FRAME_CLOSE | BACK | FORWARD | UP
+        | REFRESH => Title,
+        id if (TAB_START..TAB_START + TAB_LIMIT as u16).contains(&id) => Title,
+        PATH => Field,
+        id if (CRUMB_START..CRUMB_START + CRUMB_LIMIT as u16).contains(&id) => Field,
+        id if settings_page::is_button(id)
+            || (DRIVE_START..DRIVE_START + DRIVE_LIMIT as u16).contains(&id) =>
+        {
+            Content
+        }
+        _ => Chrome,
+    }
+}
+
 // GWLP_USERDATA borrows the RefCell owned by run(). It outlives the message pump.
 unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if matches!(message, WM_NCCALCSIZE | WM_NCPAINT) {
@@ -6169,16 +6195,17 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
     }
     if matches!(
         message,
-        WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX
+        WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORBTN
     ) {
         if let Some(colors) = CONTROL_COLORS.get() {
             let id = unsafe { GetDlgCtrlID(lp as HWND) } as u16;
-            let surface = match id {
-                STATUS => 0,
-                NAVIGATION => 2,
-                ADDRESS | SEARCH => 3,
-                _ => 1,
-            };
+            let surface = match (message, id) {
+                (WM_CTLCOLORBTN, _) => button_surface(id),
+                (_, STATUS) => ControlSurface::Chrome,
+                (_, NAVIGATION) => ControlSurface::Sidebar,
+                (_, ADDRESS | SEARCH) => ControlSurface::Field,
+                _ => ControlSurface::Content,
+            } as usize;
             unsafe {
                 SetTextColor(
                     wp as HDC,
@@ -6681,7 +6708,7 @@ fn set_composition(window: HWND, enabled: bool) {
     unsafe {
         let style = GetWindowLongPtrW(window, GWL_EXSTYLE);
         let composited = WS_EX_COMPOSITED as isize;
-        // Present the parent and native children together when the window first appears or resizes.
+        // Present the parent and native children together during a live resize.
         let style = if enabled {
             style | composited
         } else {
@@ -6960,7 +6987,7 @@ pub fn run(path: Option<PathBuf>, selection: Option<PathBuf>) -> Result<(), std:
         let (work_area, position) = window_geometry::startup_work_area(WindowPosition::load());
         let center = window_geometry::center(work_area);
         let window = CreateWindowExW(
-            WS_EX_APPWINDOW | WS_EX_COMPOSITED,
+            WS_EX_APPWINDOW,
             class.as_ptr(),
             wide("BetterExplorer").as_ptr(),
             WS_POPUP
@@ -7016,6 +7043,16 @@ pub fn run(path: Option<PathBuf>, selection: Option<PathBuf>) -> Result<(), std:
             }
         }
         let without_activation = std::env::var_os("BETTEREXPLORER_BENCH_NOACTIVATE").is_some();
+        let set_cloak = |cloak: i32| {
+            DwmSetWindowAttribute(
+                window,
+                DWMWA_CLOAK as u32,
+                (&cloak as *const i32).cast(),
+                size_of::<i32>() as u32,
+            )
+        };
+        // Let DWM compose the initial native controls before exposing the window.
+        let cloaked = set_cloak(1) >= 0;
         ShowWindow(
             window,
             if without_activation {
@@ -7030,7 +7067,16 @@ pub fn run(path: Option<PathBuf>, selection: Option<PathBuf>) -> Result<(), std:
             null_mut(),
             RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW,
         );
-        set_composition(window, false);
+        if cloaked {
+            GdiFlush();
+            let result = set_cloak(0);
+            if result < 0 {
+                DestroyWindow(window);
+                return Err(std::io::Error::other(format!(
+                    "Windows could not reveal the window (0x{result:08X})."
+                )));
+            }
+        }
         if app.borrow().bench.is_some() {
             PostMessageW(window, BENCH_STARTED, 0, 0);
         }
@@ -7074,6 +7120,79 @@ mod group_tests {
     use windows_sys::Win32::{
         Foundation::FILETIME, System::SystemInformation::GetSystemTimeAsFileTime,
     };
+
+    #[test]
+    fn native_button_backgrounds_use_the_theme_before_owner_draw() {
+        unsafe {
+            let controls = INITCOMMONCONTROLSEX {
+                dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
+                dwICC: ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES,
+            };
+            assert_ne!(InitCommonControlsEx(&controls), 0);
+            let window = CreateWindowExW(
+                0,
+                wide("Static").as_ptr(),
+                null(),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                900,
+                700,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null(),
+            );
+            assert!(!window.is_null());
+            let app = App::create(
+                window,
+                None,
+                false,
+                Settings {
+                    theme: ThemePreference::DeepSpace,
+                    ..Settings::default()
+                },
+            );
+            let home = FindWindowExW(
+                window,
+                null_mut(),
+                wide("BetterExplorerHome").as_ptr(),
+                null(),
+            );
+            let dc = CreateCompatibleDC(null_mut());
+            let bitmap = CreateBitmap(1, 1, 1, 32, null());
+            assert!(!dc.is_null() && !bitmap.is_null() && !home.is_null());
+            let old = SelectObject(dc, bitmap);
+            let pixel = RECT {
+                right: 1,
+                bottom: 1,
+                ..zeroed()
+            };
+            let mut actual = Vec::new();
+            for (parent, id, expected) in [
+                (window, TAB_START, app.colors.title),
+                (window, CRUMB_START, app.colors.field),
+                (home, HOME_RECENT, app.colors.sidebar),
+            ] {
+                let control = GetDlgItem(parent, i32::from(id));
+                assert!(!control.is_null());
+                let brush = if parent == window {
+                    procedure(window, WM_CTLCOLORBTN, dc as usize, control as isize)
+                } else {
+                    send(parent, WM_CTLCOLORBTN, dc as usize, control as isize)
+                };
+                FillRect(dc, &pixel, brush as HBRUSH);
+                actual.push((id, GetPixel(dc, 0, 0), expected));
+            }
+            SelectObject(dc, old);
+            DeleteObject(bitmap);
+            DeleteDC(dc);
+            DestroyWindow(window);
+            for (id, painted, expected) in actual {
+                assert_eq!(painted, expected, "button {id} background");
+            }
+        }
+    }
 
     #[test]
     fn browse_drop_target_uses_the_folder_row_and_icon_under_the_cursor() {

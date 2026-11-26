@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 
 [CmdletBinding()]
-param([switch] $SkipBuild, [switch] $PortableOnly)
+param([switch] $SkipBuild, [switch] $PortableOnly, [string] $InnoCompiler)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -23,44 +23,20 @@ function Assert-X64Executable {
     }
 }
 
-function Build-SetupLauncher {
-    param([string] $Repo, [string] $Work, [string] $Destination)
-
-    $compiler = Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
-    $automation = Join-Path $env:SystemRoot 'Microsoft.NET\assembly\GAC_MSIL\System.Management.Automation\v4.0_3.0.0.0__31bf3856ad364e35\System.Management.Automation.dll'
-    foreach ($dependency in @($compiler, $automation)) {
-        if (-not [IO.File]::Exists($dependency)) { throw "Required Windows setup build dependency is missing: $dependency" }
+function Find-InnoCompiler {
+    if ($InnoCompiler) {
+        return (Get-Item -LiteralPath $InnoCompiler -ErrorAction Stop).FullName
     }
-
-    $common = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'install-common.ps1'))
-    $import = '. (Join-Path $PSScriptRoot ''install-common.ps1'')'
-    $resources = foreach ($scriptName in @('Install', 'Uninstall')) {
-        $source = [IO.File]::ReadAllText((Join-Path $PSScriptRoot ($scriptName.ToLowerInvariant() + '.ps1')))
-        if ([regex]::Matches($source, [regex]::Escape($import)).Count -ne 1) {
-            throw "Expected one common-script import in $scriptName.ps1."
+    $command = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+    if ($command) { return $command.Source }
+    foreach ($parent in @("$env:LOCALAPPDATA\Programs", ${env:ProgramFiles(x86)}, $env:ProgramFiles)) {
+        foreach ($folder in 'Inno Setup 7', 'Inno Setup 6') {
+            if (-not $parent) { continue }
+            $candidate = Join-Path $parent "$folder\ISCC.exe"
+            if ([IO.File]::Exists($candidate)) { return $candidate }
         }
-        $embedded = $source.Replace($import, $common).Replace('$PSScriptRoot', '$BetterExplorerBundleRoot')
-        $tokens = $null
-        $parseErrors = $null
-        $null = [System.Management.Automation.Language.Parser]::ParseInput($embedded, [ref] $tokens, [ref] $parseErrors)
-        if ($parseErrors.Count) {
-            throw "The embedded $scriptName script has syntax errors: $($parseErrors.Message -join ' ')"
-        }
-        $resourcePath = Join-Path $Work "$scriptName.embedded.ps1"
-        [IO.File]::WriteAllText($resourcePath, $embedded)
-        "/resource:$resourcePath,BetterExplorer.$scriptName.ps1"
     }
-
-    $setup = Join-Path $Destination 'Setup.exe'
-    $icon = Join-Path $Repo 'assets/bex.ico'
-    $source = Join-Path $PSScriptRoot 'SetupLauncher.cs'
-    $compilerOptions = @(
-        '/nologo', '/target:winexe', '/platform:x64', '/optimize+',
-        "/out:$setup", "/win32icon:$icon", "/reference:$automation", '/reference:System.Windows.Forms.dll'
-    )
-    & $compiler @compilerOptions @resources $source
-    if ($LASTEXITCODE -ne 0) { throw 'Setup.exe compilation failed.' }
-    Assert-X64Executable $setup
+    throw 'Install Inno Setup 6.6 or newer, or pass -InnoCompiler with the path to ISCC.exe.'
 }
 
 $repo = Split-Path -Parent $PSScriptRoot
@@ -103,34 +79,33 @@ $destination = Join-Path $dist "$prefix-$timestamp"
 
 $null = New-Item -ItemType Directory -Path $work
 try {
-    $packageRoots = @($portable)
-    if (-not $PortableOnly) { $packageRoots += $install }
     $null = [IO.Directory]::CreateDirectory($output)
-    foreach ($packageRoot in $packageRoots) {
-        $null = [IO.Directory]::CreateDirectory($packageRoot)
-        [IO.File]::Copy($binary, (Join-Path $packageRoot 'BetterExplorer.exe'))
-        foreach ($name in $documents) {
-            [IO.File]::Copy((Join-Path $repo $name), (Join-Path $packageRoot $name))
-        }
-        $assetDirectory = Join-Path $packageRoot 'assets'
-        $null = [IO.Directory]::CreateDirectory($assetDirectory)
-        [IO.File]::Copy((Join-Path $repo 'assets/bex.png'), (Join-Path $assetDirectory 'bex.png'))
-        $screenshots = Join-Path $repo 'assets/screenshots'
-        if (Test-Path -LiteralPath $screenshots -PathType Container) {
-            Copy-Item -LiteralPath $screenshots -Destination $assetDirectory -Recurse
-        }
-        Copy-Item -LiteralPath (Join-Path $repo 'docs') -Destination $packageRoot -Recurse
+    $null = [IO.Directory]::CreateDirectory($portable)
+    [IO.File]::Copy($binary, (Join-Path $portable 'BetterExplorer.exe'))
+    foreach ($name in $documents) {
+        [IO.File]::Copy((Join-Path $repo $name), (Join-Path $portable $name))
     }
+    $assetDirectory = Join-Path $portable 'assets'
+    $null = [IO.Directory]::CreateDirectory($assetDirectory)
+    [IO.File]::Copy((Join-Path $repo 'assets/bex.png'), (Join-Path $assetDirectory 'bex.png'))
+    $screenshots = Join-Path $repo 'assets/screenshots'
+    if (Test-Path -LiteralPath $screenshots -PathType Container) {
+        Copy-Item -LiteralPath $screenshots -Destination $assetDirectory -Recurse
+    }
+    Copy-Item -LiteralPath (Join-Path $repo 'docs') -Destination $portable -Recurse
 
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $portableZip = "$prefix-portable.zip"
     [IO.Compression.ZipFile]::CreateFromDirectory($portable, (Join-Path $output $portableZip))
     $archives = @($portableZip)
     if (-not $PortableOnly) {
+        $null = [IO.Directory]::CreateDirectory($install)
+        foreach ($name in @('BetterExplorer.exe', 'README.md', 'LICENSE', 'THIRD-PARTY-LICENSES')) {
+            [IO.File]::Copy((Join-Path $portable $name), (Join-Path $install $name))
+        }
         foreach ($name in @('install.ps1', 'uninstall.ps1', 'install-common.ps1')) {
             [IO.File]::Copy((Join-Path $PSScriptRoot $name), (Join-Path $install $name))
         }
-        Build-SetupLauncher -Repo $repo -Work $work -Destination $install
 
         $checksums = [ordered] @{}
         foreach ($name in $script:BetterExplorerPayload) {
@@ -144,9 +119,19 @@ try {
             shortcut_sha256 = $null
         }
         Write-PayloadManifest $manifest (Join-Path $install 'bundle-manifest.json')
-        $installZip = "$prefix-install.zip"
-        [IO.Compression.ZipFile]::CreateFromDirectory($install, (Join-Path $output $installZip))
-        $archives += $installZip
+        $setupBaseName = "$prefix-setup"
+        $compiler = Find-InnoCompiler
+        # The compiler transcript goes to the host and leaves the destination as the only output value.
+        $compilerArguments = @(
+            '/Qp', "/DAppVersion=$version", "/DPayloadDir=$install",
+            "/DOutputBaseName=$setupBaseName", "/O$output", (Join-Path $PSScriptRoot 'setup.iss')
+        )
+        & $compiler @compilerArguments | Out-Host
+        $setup = "$setupBaseName.exe"
+        if ($LASTEXITCODE -ne 0 -or -not [IO.File]::Exists((Join-Path $output $setup))) {
+            throw 'BetterExplorer Setup compilation failed.'
+        }
+        $archives += $setup
     }
     $sumLines = foreach ($name in $archives) {
         $hash = Get-OwnedFileHash (Join-Path $output $name)
