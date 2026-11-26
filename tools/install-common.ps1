@@ -184,9 +184,11 @@ function Set-LegacyWinERegistration {
 }
 
 function Invoke-WinEControl {
-    param([string] $Executable, [string] $Command)
+    param([string] $Executable, [string] $Command, [string] $Owner)
 
-    $process = Start-Process -FilePath $Executable -ArgumentList $Command -PassThru -ErrorAction Stop
+    $arguments = @($Command)
+    if ($Owner) { $arguments += ('"{0}"' -f $Owner) }
+    $process = Start-Process -FilePath $Executable -ArgumentList $arguments -PassThru -ErrorAction Stop
     try {
         # The control process can start a listener that stays running after setup exits.
         if (-not $process.WaitForExit(30000)) {

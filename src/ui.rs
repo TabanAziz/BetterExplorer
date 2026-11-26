@@ -1386,11 +1386,14 @@ impl App {
                 (_, Some(status)) if status.another_copy => {
                     "Another BetterExplorer copy manages this shortcut.".into()
                 }
-                (_, Some(status)) if status.configured && status.running => {
-                    "Helper running. See Windows Startup Apps for sign-in.".into()
+                (_, Some(status)) if status.scheduled && status.running => {
+                    "Win+E is ready. The helper starts when you sign in.".into()
+                }
+                (_, Some(status)) if status.scheduled => {
+                    "Starts at sign-in. Select BetterExplorer to start now.".into()
                 }
                 (_, Some(status)) if status.configured => {
-                    "Starts at sign-in. Select BetterExplorer to start now.".into()
+                    "Select BetterExplorer to repair Win+E startup at sign-in.".into()
                 }
                 (_, Some(status)) if status.running => "Helper running for this session.".into(),
                 (_, Some(_)) => {

@@ -29,6 +29,8 @@ mod theme_visuals;
 #[cfg(windows)]
 mod ui;
 #[cfg(windows)]
+mod win_e_task;
+#[cfg(windows)]
 mod window_geometry;
 
 #[cfg(windows)]
@@ -42,7 +44,7 @@ fn main() {
         }
         return;
     }
-    if let Some(exit) = first.as_deref().and_then(hotkey::cli) {
+    if let Some(exit) = first.as_deref().and_then(|arg| hotkey::cli(arg, &mut args)) {
         std::process::exit(exit);
     }
     if let Some(exit) = first

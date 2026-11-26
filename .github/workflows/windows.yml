@@ -31,13 +31,18 @@ jobs:
         run: cargo +stable test --locked
       - name: Release build
         run: cargo +stable build --release --locked
-      - name: Verify opted-in Win+E recovers on app launch
+      - name: Verify Win+E sign-in task and app recovery
         if: runner.environment == 'github-hosted'
         shell: powershell
         run: |
           $exe = (Resolve-Path -LiteralPath 'target/release/BetterExplorer.exe').Path
           $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-          if (Get-ItemProperty -LiteralPath $runKey -Name BetterExplorerWinE -ErrorAction SilentlyContinue) {
+          $approvalKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
+          $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          $taskName = "BetterExplorer Win+E Logon $sid"
+          if ((Get-ItemProperty -LiteralPath $runKey -Name BetterExplorerWinE -ErrorAction SilentlyContinue) -or
+              (Get-ItemProperty -LiteralPath $approvalKey -Name BetterExplorerWinE -ErrorAction SilentlyContinue) -or
+              (Get-ScheduledTask -TaskPath '\' -TaskName $taskName -ErrorAction SilentlyContinue)) {
             throw 'This check requires a clean Windows test account.'
           }
           Add-Type -TypeDefinition @'
@@ -57,7 +62,35 @@ jobs:
           }
           $app = $null
           try {
-            Set-ListenerState '--win-e-on'
+            Set-ListenerState '--win-e-on-setup'
+            if (-not (Test-Path -LiteralPath $approvalKey)) { $null = New-Item -Path $approvalKey -Force }
+            $null = New-ItemProperty -LiteralPath $approvalKey -Name BetterExplorerWinE -PropertyType Binary -Value ([byte[]](3,0,0,0,0,0,0,0,0,0,0,0))
+            try {
+              Set-ListenerState '--win-e-logon-upgrade'
+              if (Get-ScheduledTask -TaskPath '\' -TaskName $taskName -ErrorAction SilentlyContinue) {
+                throw 'The upgrade overrode an existing Windows Startup Apps choice.'
+              }
+            } finally {
+              Remove-ItemProperty -LiteralPath $approvalKey -Name BetterExplorerWinE
+            }
+            Set-ListenerState '--win-e-logon-upgrade'
+            $task = Get-ScheduledTask -TaskPath '\' -TaskName $taskName
+            if ($task.Actions.Count -ne 1 -or $task.Actions[0].Execute.Trim('"') -ne $exe -or
+                $task.Actions[0].Arguments -ne '--win-e-listener' -or
+                $task.Principal.LogonType -ne 'Interactive' -or $task.Principal.RunLevel -ne 'Limited' -or
+                $task.Triggers.Count -ne 1 -or $task.Triggers[0].CimClass.CimClassName -ne 'MSFT_TaskLogonTrigger' -or
+                ($task.Triggers[0].Delay -and $task.Triggers[0].Delay -ne 'PT0S')) {
+              throw 'Expected one immediate per-user sign-in action running without elevation.'
+            }
+            Set-ListenerState '--win-e-pause'
+            if ([WinEListener]::IsReady($exe)) { throw 'The test listener did not pause.' }
+            $wait = [Diagnostics.Stopwatch]::StartNew()
+            Start-ScheduledTask -InputObject $task
+            while (-not [WinEListener]::IsReady($exe)) {
+              if ($wait.ElapsedMilliseconds -ge 6000) { throw 'The sign-in task did not start the shortcut helper.' }
+              Start-Sleep -Milliseconds 25
+            }
+            Write-Host "Scheduled task made Win+E ready in $($wait.ElapsedMilliseconds) ms on demand."
             Set-ListenerState '--win-e-pause'
             if ([WinEListener]::IsReady($exe)) { throw 'The test listener did not pause.' }
             $env:BETTEREXPLORER_BENCH_NOACTIVATE = '1'
@@ -73,4 +106,7 @@ jobs:
           } finally {
             if ($app -and -not $app.HasExited) { $null = $app.CloseMainWindow() }
             Set-ListenerState '--win-e-off'
+            if (Get-ScheduledTask -TaskPath '\' -TaskName $taskName -ErrorAction SilentlyContinue) {
+              throw 'The sign-in task remained registered after opting out.'
+            }
           }

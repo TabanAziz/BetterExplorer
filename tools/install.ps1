@@ -105,7 +105,7 @@ $install = {
         if (-not $TestRoot -and ($enableWinE -or $previousWinE.Enabled)) {
             $command = if (-not $enableWinE) { '--win-e-off' }
                 elseif ($winEPauseAttempted -and -not $WinE) { '--win-e-resume' }
-                else { '--win-e-on' }
+                else { '--win-e-on-setup' }
             $winEChangeAttempted = $true
             $null = Invoke-WinEControl $executable $command
         }
@@ -156,6 +156,15 @@ $install = {
         if ($shortcutStage -and [IO.File]::Exists($shortcutStage)) { [IO.File]::Delete($shortcutStage) }
     }
 
+    if (-not $TestRoot -and $enableWinE) {
+        try {
+            $logonCommand = if ($WinE -eq 'BetterExplorer') { '--win-e-logon' }
+                else { '--win-e-logon-upgrade' }
+            $null = Invoke-WinEControl $executable $logonCommand
+        } catch {
+            Write-Warning 'Could not register the Win+E sign-in task. Open BetterExplorer Settings and select BetterExplorer to retry.'
+        }
+    }
     Write-Host "Installed BetterExplorer $($bundle.version) in $($paths.Application)."
 }
 

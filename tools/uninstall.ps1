@@ -15,6 +15,9 @@ Invoke-InstallLock -TestRoot $lockRoot -Action {
     if ($bundleExecutable -ieq $executable) { $bundleExecutable = $null }
     if (-not (Test-Path -LiteralPath $paths.Application)) {
         Clear-OwnedFolderManager $executable $bundleExecutable $lockRoot
+        if (-not $TestRoot -and $bundleExecutable -and [IO.File]::Exists($bundleExecutable)) {
+            $null = Invoke-WinEControl $bundleExecutable '--win-e-remove-logon-for' $executable
+        }
         if (-not $TestRoot -and (Test-OwnedWinERegistration $executable)) {
             Set-LegacyWinERegistration $executable $false
         }
@@ -41,6 +44,10 @@ Invoke-InstallLock -TestRoot $lockRoot -Action {
             } else {
                 Set-LegacyWinERegistration $executable $false
             }
+        }
+        if (-not $TestRoot -and -not ($previousWinE.Enabled -and $previousWinE.CanControl) -and
+            $bundleExecutable -and [IO.File]::Exists($bundleExecutable)) {
+            $null = Invoke-WinEControl $bundleExecutable '--win-e-remove-logon-for' $executable
         }
         foreach ($name in $script:BetterExplorerPayload + $script:BetterExplorerInstallManifest) {
             $file = Join-Path $paths.Application $name

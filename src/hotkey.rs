@@ -1,3 +1,4 @@
+use crate::win_e_task;
 use std::{
     cell::{Cell, RefCell},
     env,
@@ -47,6 +48,10 @@ use windows_sys::Win32::{
 };
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const APPROVAL_KEYS: [&str; 2] = [
+    r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run",
+    r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32",
+];
 const RUN_VALUE: &str = "BetterExplorerWinE";
 const LISTENER_ARG: &str = "--win-e-listener";
 const LISTENER_MUTEX: &str = r"Local\BetterExplorer.WinE.Listener.1";
@@ -58,6 +63,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 pub struct Status {
     pub configured: bool,
     pub running: bool,
+    pub scheduled: bool,
     pub another_copy: bool,
 }
 
@@ -68,34 +74,44 @@ pub fn status() -> io::Result<Status> {
     Ok(Status {
         configured: startup == StartupState::Ours,
         running: matches!(listener, Listener::Ours { .. }),
+        scheduled: startup == StartupState::Ours && win_e_task::scheduled(&exe).unwrap_or(false),
         another_copy: startup == StartupState::Other || matches!(listener, Listener::Other),
     })
 }
 
 pub fn set_enabled(enabled: bool) -> io::Result<()> {
-    let exe = env::current_exe()?;
-    let _settings = settings_lock()?;
-    let startup = startup_state(&exe)?;
+    with_settings_lock(|exe| {
+        set_listener_enabled(exe, enabled)?;
+        if enabled {
+            win_e_task::ensure(exe)
+        } else {
+            win_e_task::remove(exe)
+        }
+    })
+}
+
+fn set_listener_enabled(exe: &Path, enabled: bool) -> io::Result<()> {
+    let startup = startup_state(exe)?;
     if startup == StartupState::Other {
         return Err(other_copy());
     }
     if enabled {
-        if matches!(find_listener(&exe), Listener::Other) {
+        if matches!(find_listener(exe), Listener::Other) {
             return Err(other_copy());
         }
         if startup == StartupState::Missing {
-            write_startup(&exe)?;
+            write_startup(exe)?;
         }
-        if let Err(error) = start_listener(&exe) {
+        if let Err(error) = start_listener(exe) {
             if startup == StartupState::Missing {
-                remove_own_startup(&exe)?;
+                remove_own_startup(exe)?;
             }
             return Err(error);
         }
         Ok(())
     } else {
-        remove_own_startup(&exe)?;
-        stop_listener(&exe)
+        remove_own_startup(exe)?;
+        stop_listener(exe)
     }
 }
 
@@ -123,7 +139,7 @@ fn resume_configured_listener() -> io::Result<()> {
     })
 }
 
-pub fn cli(arg: &OsStr) -> Option<i32> {
+pub fn cli(arg: &OsStr, args: &mut impl Iterator<Item = OsString>) -> Option<i32> {
     let result = match arg.to_str()? {
         "--win-e-enabled" => {
             return Some(
@@ -135,9 +151,35 @@ pub fn cli(arg: &OsStr) -> Option<i32> {
             );
         }
         "--win-e-on" => set_enabled(true),
+        "--win-e-on-setup" => with_settings_lock(|exe| set_listener_enabled(exe, true)),
         "--win-e-off" => set_enabled(false),
         "--win-e-pause" => with_settings_lock(stop_listener),
         "--win-e-resume" => resume_configured_listener(),
+        "--win-e-logon" => with_settings_lock(|exe| match startup_state(exe)? {
+            StartupState::Ours => win_e_task::ensure(exe),
+            StartupState::Missing => Ok(()),
+            StartupState::Other => Err(other_copy()),
+        }),
+        "--win-e-logon-upgrade" => with_settings_lock(|exe| match startup_state(exe)? {
+            StartupState::Ours if !has_startup_approval_record()? => {
+                win_e_task::ensure_for_update(exe)
+            }
+            StartupState::Other => Err(other_copy()),
+            _ => Ok(()),
+        }),
+        "--win-e-remove-logon-for" => with_settings_lock(|_| {
+            let owner = args
+                .next()
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute());
+            match owner {
+                Some(owner) if args.next().is_none() => win_e_task::remove(&owner),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Expected the full path of the BetterExplorer installation.",
+                )),
+            }
+        }),
         LISTENER_ARG => env::current_exe().and_then(run_listener),
         _ => return None,
     };
@@ -211,13 +253,43 @@ impl Drop for RunKey {
 }
 
 fn open_run_key(access: u32) -> io::Result<Option<RunKey>> {
+    open_registration_key(RUN_KEY, access)
+}
+
+fn open_registration_key(path: &str, access: u32) -> io::Result<Option<RunKey>> {
     let mut key = null_mut();
-    let path = wide(RUN_KEY);
+    let path = wide(path);
     match unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, path.as_ptr(), 0, access, &mut key) } {
         ERROR_SUCCESS => Ok(Some(RunKey(key))),
         ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => Ok(None),
         error => Err(io::Error::from_raw_os_error(error as i32)),
     }
+}
+
+fn has_startup_approval_record() -> io::Result<bool> {
+    // Preserve any explicit Windows Startup Apps choice on automatic upgrades.
+    let name = wide(RUN_VALUE);
+    for path in APPROVAL_KEYS {
+        let Some(key) = open_registration_key(path, KEY_QUERY_VALUE)? else {
+            continue;
+        };
+        let mut size = 0;
+        match unsafe {
+            RegQueryValueExW(
+                key.0,
+                name.as_ptr(),
+                null(),
+                null_mut(),
+                null_mut(),
+                &mut size,
+            )
+        } {
+            ERROR_SUCCESS => return Ok(true),
+            ERROR_FILE_NOT_FOUND => {}
+            error => return Err(io::Error::from_raw_os_error(error as i32)),
+        }
+    }
+    Ok(false)
 }
 
 fn startup_state(exe: &Path) -> io::Result<StartupState> {

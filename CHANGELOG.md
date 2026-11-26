@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.10
+
+- Start the opted-in Win+E helper through a per-user sign-in task so it can run without waiting for delayed Startup Apps.
+- Keep a single shortcut helper per Windows session.
+
 ## 0.1.9
 
 - Keep navigation inside a manually opened Windows File Explorer window when BetterExplorer is the default folder manager.
