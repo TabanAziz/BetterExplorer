@@ -23,12 +23,12 @@ use windows::{
         },
         UI::Shell::{
             IExecuteCommand, IExecuteCommand_Impl, IObjectWithSelection, IObjectWithSelection_Impl,
-            IShellBrowser, IShellItem, IShellItemArray, SHGetIDListFromObject, SID_SInPlaceBrowser,
-            SBSP_ABSOLUTE, SBSP_DEFBROWSER, SBSP_NEWBROWSER, SIGDN_FILESYSPATH,
+            IShellBrowser, IShellItem, IShellItemArray, SHGetIDListFromObject, SID_SCommDlgBrowser,
+            SID_SInPlaceBrowser, SBSP_ABSOLUTE, SBSP_DEFBROWSER, SBSP_NEWBROWSER,
+            SIGDN_FILESYSPATH,
         },
     },
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{GetAncestor, GetClassNameW, GA_ROOT};
 
 pub const CLSID: GUID = GUID::from_u128(0x801e1d22_334a_4b1f_9f3b_a99dc4a38721);
 pub const SERVER_ARG: &str = "--folder-command-server";
@@ -259,18 +259,13 @@ impl IExecuteCommand_Impl for FolderCommand_Impl {
 
 fn explorer_browser(site: &IUnknown) -> Option<IShellBrowser> {
     let services = site.cast::<IServiceProvider>().ok()?;
-    let browser: IShellBrowser = unsafe { services.QueryService(&SID_SInPlaceBrowser).ok()? };
-    // The desktop and other hosts can also contain a Shell view. Use the window from
-    // this invocation's browser to distinguish a File Explorer folder window.
-    let window = unsafe { browser.GetWindow().ok()? };
-    let root = unsafe { GetAncestor(window.0, GA_ROOT) };
-    let mut name = [0u16; 32];
-    let length = unsafe { GetClassNameW(root, name.as_mut_ptr(), name.len() as i32) };
-    matches!(
-        from_wide(&name[..length as usize]).to_str(),
-        Some("CabinetWClass" | "ExploreWClass")
-    )
-    .then_some(browser)
+    let browser = unsafe { services.QueryService(&SID_SInPlaceBrowser).ok()? };
+    // Query the invocation site directly. Browser window lookups can fail during an
+    // input-synchronous call from File Explorer.
+    if unsafe { services.QueryService::<IShellBrowser>(&SID_SCommDlgBrowser) }.is_ok() {
+        return None;
+    }
+    Some(browser)
 }
 
 fn browse(browser: &IShellBrowser, item: &IShellItem, mode: u32) -> Result<()> {
