@@ -190,13 +190,15 @@ try {
 
     if ($CompareEnumeration) {
         $env:BETTEREXPLORER_BENCH_PROBE = '1'
-        $arms = @{ bulk = @(); standard = @() }
-        $order = @('bulk', 'standard', 'standard', 'bulk', 'bulk', 'standard')
+        $arms = @{ bulk = @(); standard = @(); native = @() }
+        $order = @('native', 'bulk', 'standard', 'standard', 'native', 'bulk', 'bulk', 'standard', 'native')
         try {
             for ($i = 0; $i -lt $order.Count; $i++) {
                 $arm = $order[$i]
                 if ($arm -eq 'standard') { $env:BETTEREXPLORER_BENCH_STANDARD = '1' }
                 else { Remove-Item Env:BETTEREXPLORER_BENCH_STANDARD -ErrorAction SilentlyContinue }
+                if ($arm -eq 'native') { $env:BETTEREXPLORER_BENCH_NATIVE_DEFAULT = '1' }
+                else { Remove-Item Env:BETTEREXPLORER_BENCH_NATIVE_DEFAULT -ErrorAction SilentlyContinue }
                 $report = Invoke-AppReport -Name "probe-$i-$arm" -Runs $NavigationRuns -TargetPath $largePath
                 foreach ($sample in $report.navigation) {
                     if ($sample.rows -ne $Entries) { throw "Wrong row count for $arm." }
@@ -226,10 +228,11 @@ try {
             }
         } finally {
             Remove-Item Env:BETTEREXPLORER_BENCH_PROBE -ErrorAction SilentlyContinue
+            Remove-Item Env:BETTEREXPLORER_BENCH_NATIVE_DEFAULT -ErrorAction SilentlyContinue
             Remove-Item Env:BETTEREXPLORER_BENCH_STANDARD -ErrorAction SilentlyContinue
         }
         $comparison = [ordered] @{ entries = $Entries; order = $order; method = 'Shared warm fixture, three processes per arm, one warm-up navigation per process.' }
-        foreach ($arm in @('bulk', 'standard')) {
+        foreach ($arm in @('bulk', 'standard', 'native')) {
             $comparison[$arm] = [ordered] @{}
             foreach ($metric in $arms[$arm][0].PSObject.Properties.Name) {
                 $comparison[$arm][$metric] = Get-Percentiles -Values ($arms[$arm] | ForEach-Object { $_.$metric })

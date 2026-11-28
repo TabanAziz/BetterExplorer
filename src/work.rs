@@ -658,7 +658,7 @@ struct BulkDirectory {
 }
 
 impl BulkDirectory {
-    fn open(folder: &Path) -> Option<Self> {
+    fn open(folder: &Path, large_fetch: bool) -> Option<Self> {
         // Keep Windows' standard path semantics. The standard-library path remains
         // available for UNC, extended paths, long paths and drivers rejecting bulk fetch.
         if !matches!(folder.components().next(), Some(std::path::Component::Prefix(prefix))
@@ -680,7 +680,11 @@ impl BulkDirectory {
                 (&mut data as *mut WIN32_FIND_DATAW).cast(),
                 FindExSearchNameMatch,
                 std::ptr::null(),
-                FIND_FIRST_EX_LARGE_FETCH,
+                if large_fetch {
+                    FIND_FIRST_EX_LARGE_FETCH
+                } else {
+                    0
+                },
             )
         };
         (handle != INVALID_HANDLE_VALUE).then_some(Self {
@@ -739,9 +743,9 @@ enum DirectoryRows {
 }
 
 impl DirectoryRows {
-    fn open(folder: &Path, bulk: bool) -> io::Result<Self> {
+    fn open(folder: &Path, bulk: bool, large_fetch: bool) -> io::Result<Self> {
         if bulk {
-            if let Some(read) = BulkDirectory::open(folder) {
+            if let Some(read) = BulkDirectory::open(folder, large_fetch) {
                 return Ok(Self::Bulk(read));
             }
         }
@@ -775,7 +779,7 @@ fn native_listing_matches_standard_unicode_metadata() -> io::Result<()> {
     fs::write(root.path().join("Größe 10.txt"), b"content")?;
     fs::create_dir(root.path().join("Ordner 2"))?;
     let entries = |bulk| -> io::Result<Vec<_>> {
-        let mut rows = DirectoryRows::open(root.path(), bulk)?
+        let mut rows = DirectoryRows::open(root.path(), bulk, true)?
             .map(|row| row.map(|row| (row.name, row.attributes, row.size, row.modified)))
             .collect::<io::Result<Vec<_>>>()?;
         rows.sort();
@@ -797,6 +801,7 @@ fn enumerate(
     let probe = query.is_none() && std::env::var_os("BETTEREXPLORER_BENCH_PROBE").is_some();
     let bulk =
         query.is_none() && !(probe && std::env::var_os("BETTEREXPLORER_BENCH_STANDARD").is_some());
+    let large_fetch = !(probe && std::env::var_os("BETTEREXPLORER_BENCH_NATIVE_DEFAULT").is_some());
     let mut pending = vec![root.clone()];
     let mut delivered = entries.len();
     let mut last_batch = Instant::now();
@@ -806,7 +811,7 @@ fn enumerate(
             return;
         }
         let opening = probe.then(Instant::now);
-        let read = match DirectoryRows::open(&folder, bulk) {
+        let read = match DirectoryRows::open(&folder, bulk, large_fetch) {
             Ok(read) => read,
             Err(failure) => {
                 if folder == root {
