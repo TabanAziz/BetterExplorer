@@ -42,9 +42,10 @@ use windows_sys::Win32::{
             FindWindowExW, GetForegroundWindow, GetMessageW, GetWindowTextW,
             GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindowVisible, PostMessageW,
             PostQuitMessage, RegisterClassW, SetForegroundWindow, SetWindowsHookExW,
-            UnhookWindowsHookEx, HC_ACTION, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_ALTDOWN,
-            LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED, MSG, WH_KEYBOARD_LL, WM_CLOSE, WM_DESTROY,
-            WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW,
+            ShowWindowAsync, UnhookWindowsHookEx, HC_ACTION, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT,
+            LLKHF_ALTDOWN, LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED, MSG, SW_RESTORE,
+            WH_KEYBOARD_LL, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+            WNDCLASSW,
         },
     },
 };
@@ -776,22 +777,34 @@ fn open_requested_window(
     }
 }
 
+fn activate_candidate(
+    minimized: bool,
+    restore: impl FnOnce() -> bool,
+    foreground: impl FnOnce() -> bool,
+) -> bool {
+    if minimized {
+        restore()
+    } else {
+        foreground()
+    }
+}
+
 fn foreground_running_window(exe: &Path) -> bool {
     let class = wide(EXPLORER_WINDOW_CLASS);
     let expected = wide(exe);
     let mut image = vec![0u16; expected.len()];
     let mut window = null_mut();
+    let mut minimized: HWND = null_mut();
     loop {
         window = unsafe { FindWindowExW(null_mut(), window, class.as_ptr(), null()) };
         if window.is_null() {
-            return false;
+            break;
         }
-        // Do not wait for UI-thread messages. Ignore hidden, disabled, stalled, and minimized
-        // candidates so a failed warm activation still takes the normal launch path.
+        // Never wait for the target window's message loop, and never reuse a hidden
+        // window, a window behind a modal dialog, or a window on another desktop.
         if unsafe {
             IsWindowVisible(window) == 0
                 || IsWindowEnabled(window) == 0
-                || IsIconic(window) != 0
                 || IsHungAppWindow(window) != 0
         } {
             continue;
@@ -808,10 +821,30 @@ fn foreground_running_window(exe: &Path) -> bool {
         if result < 0 || cloaked != 0 || !window_belongs_to(window, &expected, &mut image) {
             continue;
         }
-        // Windows is free to decline a focus transfer. Don't swallow the shortcut
-        // if that happens, and don't move focus to a different desktop or install.
-        return unsafe { GetForegroundWindow() == window || SetForegroundWindow(window) != 0 };
+        if unsafe { IsIconic(window) != 0 } {
+            if minimized.is_null() {
+                minimized = window;
+            }
+            continue;
+        }
+        if activate_candidate(
+            false,
+            || false,
+            || unsafe { GetForegroundWindow() == window || SetForegroundWindow(window) != 0 },
+        ) {
+            return true;
+        }
     }
+    // Prefer a visible window. If there is none that can be raised, reuse a
+    // minimized window rather than loading a second process and its tabs.
+    !minimized.is_null()
+        && unsafe { IsIconic(minimized) != 0 && IsWindowEnabled(minimized) != 0 }
+        && window_belongs_to(minimized, &expected, &mut image)
+        && activate_candidate(
+            true,
+            || unsafe { ShowWindowAsync(minimized, SW_RESTORE) != 0 },
+            || false,
+        )
 }
 
 fn window_belongs_to(window: HWND, expected: &[u16], image: &mut [u16]) -> bool {
@@ -886,6 +919,40 @@ mod tests {
             },
         );
         assert!(result.is_ok() && launched.get());
+    }
+
+    #[test]
+    fn reuses_a_minimized_window_without_starting_a_second_process() {
+        let restored = Cell::new(false);
+        let result = open_requested_window(
+            || {
+                activate_candidate(
+                    true,
+                    || {
+                        restored.set(true);
+                        true
+                    },
+                    || false,
+                )
+            },
+            || panic!("an accepted restore must not start another Explorer process"),
+        );
+        assert!(result.is_ok() && restored.get());
+    }
+
+    #[test]
+    fn a_rejected_restore_allows_the_normal_launch_fallback() {
+        assert!(!activate_candidate(true, || false, || true));
+        assert!(activate_candidate(
+            false,
+            || panic!("visible window was restored"),
+            || true
+        ));
+        assert!(!activate_candidate(
+            false,
+            || panic!("visible window was restored"),
+            || false
+        ));
     }
 
     #[test]
