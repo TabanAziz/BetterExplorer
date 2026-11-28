@@ -7,7 +7,8 @@ param(
     [ValidateRange(1, 100000)] [int] $Entries = 100000,
     [ValidateRange(0, 3600)] [int] $IdleSeconds = 0,
     [ValidateRange(5, 86400)] [int] $TimeoutSeconds = 180,
-    [string] $BinaryPath
+    [string] $BinaryPath,
+    [switch] $CompareEnumeration
 )
 
 Set-StrictMode -Version Latest
@@ -186,6 +187,59 @@ try {
     Write-Host "Creating $Entries benchmark files on $($fixtureDrive.Name)..."
     [BetterExplorerBenchmarkFixture]::Create($smallPath, 16)
     [BetterExplorerBenchmarkFixture]::Create($largePath, $Entries)
+
+    if ($CompareEnumeration) {
+        $env:BETTEREXPLORER_BENCH_PROBE = '1'
+        $arms = @{ bulk = @(); standard = @() }
+        $order = @('bulk', 'standard', 'standard', 'bulk', 'bulk', 'standard')
+        try {
+            for ($i = 0; $i -lt $order.Count; $i++) {
+                $arm = $order[$i]
+                if ($arm -eq 'standard') { $env:BETTEREXPLORER_BENCH_STANDARD = '1' }
+                else { Remove-Item Env:BETTEREXPLORER_BENCH_STANDARD -ErrorAction SilentlyContinue }
+                $report = Invoke-AppReport -Name "probe-$i-$arm" -Runs $NavigationRuns -TargetPath $largePath
+                foreach ($sample in $report.navigation) {
+                    if ($sample.rows -ne $Entries) { throw "Wrong row count for $arm." }
+                    $stages = @($sample.first_row_stages_ms)
+                    $points = @(
+                        (Read-Milliseconds $stages[0] 'open called')
+                        (Read-Milliseconds $stages[1] 'open returned')
+                        (Read-Milliseconds $stages[2] 'first match')
+                        (Read-Milliseconds $stages[3] 'first batch post')
+                        (Read-Milliseconds $stages[4] 'first batch delivered')
+                        (Read-Milliseconds $sample.first_ms 'first paint')
+                        (Read-Milliseconds $sample.complete_ms 'complete paint')
+                    )
+                    for ($j = 1; $j -lt $points.Count; $j++) {
+                        if ($points[$j] -lt $points[$j-1]) { throw "Out-of-order stage timings for $arm." }
+                    }
+                    $arms[$arm] += [pscustomobject] @{
+                        open_ms = $points[1] - $points[0]
+                        next_match_ms = $points[2] - $points[1]
+                        row_build_ms = $points[3] - $points[2]
+                        delivery_ms = $points[4] - $points[3]
+                        delivery_to_paint_ms = $points[5] - $points[4]
+                        first_ms = $points[5]
+                        complete_ms = $points[6]
+                    }
+                }
+            }
+        } finally {
+            Remove-Item Env:BETTEREXPLORER_BENCH_PROBE -ErrorAction SilentlyContinue
+            Remove-Item Env:BETTEREXPLORER_BENCH_STANDARD -ErrorAction SilentlyContinue
+        }
+        $comparison = [ordered] @{ entries = $Entries; order = $order; method = 'Shared warm fixture, three processes per arm, one warm-up navigation per process.' }
+        foreach ($arm in @('bulk', 'standard')) {
+            $comparison[$arm] = [ordered] @{}
+            foreach ($metric in $arms[$arm][0].PSObject.Properties.Name) {
+                $comparison[$arm][$metric] = Get-Percentiles -Values ($arms[$arm] | ForEach-Object { $_.$metric })
+            }
+        }
+        $json = $comparison | ConvertTo-Json -Depth 6
+        [IO.File]::WriteAllText((Join-Path $outputPath 'enumeration.json'), $json)
+        Write-Output $json
+        return
+    }
 
     Write-Host "Measuring $StartupRuns warm launches after one unmeasured launch..."
     $warmup = Invoke-AppReport -Name 'startup-warmup' -Runs 0

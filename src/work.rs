@@ -304,6 +304,7 @@ pub struct Request {
 
 pub enum ScanEvent {
     Batch(u64, Vec<Arc<Entry>>),
+    FirstRowTiming(u64, [Instant; 4]),
     Done(u64, Vec<Arc<Entry>>, Option<String>),
 }
 
@@ -545,7 +546,7 @@ fn scan_revealing(
                             &stale,
                             &mut entries,
                             &mut error,
-                            |rows| publish(ScanEvent::Batch(id, rows)),
+                            |rows, _| publish(ScanEvent::Batch(id, rows)),
                         );
                     }
                 }
@@ -602,7 +603,12 @@ fn scan_revealing(
                 &stale,
                 &mut entries,
                 &mut error,
-                |rows| publish(ScanEvent::Batch(id, rows)),
+                |rows, timing| {
+                    if let Some(timing) = timing {
+                        publish(ScanEvent::FirstRowTiming(id, timing));
+                    }
+                    publish(ScanEvent::Batch(id, rows));
+                },
             );
         }
     }
@@ -786,8 +792,11 @@ fn enumerate(
     stale: &impl Fn() -> bool,
     entries: &mut Vec<Arc<Entry>>,
     error: &mut Option<String>,
-    mut batch: impl FnMut(Vec<Arc<Entry>>),
+    mut batch: impl FnMut(Vec<Arc<Entry>>, Option<[Instant; 4]>),
 ) {
+    let probe = query.is_none() && std::env::var_os("BETTEREXPLORER_BENCH_PROBE").is_some();
+    let bulk =
+        query.is_none() && !(probe && std::env::var_os("BETTEREXPLORER_BENCH_STANDARD").is_some());
     let mut pending = vec![root.clone()];
     let mut delivered = entries.len();
     let mut last_batch = Instant::now();
@@ -796,7 +805,8 @@ fn enumerate(
         if stale() {
             return;
         }
-        let read = match DirectoryRows::open(&folder, query.is_none()) {
+        let opening = probe.then(Instant::now);
+        let read = match DirectoryRows::open(&folder, bulk) {
             Ok(read) => read,
             Err(failure) => {
                 if folder == root {
@@ -807,6 +817,7 @@ fn enumerate(
                 continue;
             }
         };
+        let opened = probe.then(Instant::now);
         for item in read {
             if stale() {
                 return;
@@ -820,6 +831,7 @@ fn enumerate(
             if !visibility.includes(attributes, &name) {
                 continue;
             }
+            let matched = (probe && delivered == 0).then(Instant::now);
             let directory = attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
             if query.is_some() && directory && attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
                 pending.push(folder.join(&name));
@@ -852,7 +864,11 @@ fn enumerate(
                         && last_batch.elapsed() >= Duration::from_millis(45)))
             {
                 let cutoff = entries.len();
-                batch(entries[delivered..cutoff].to_vec());
+                let rows = entries[delivered..cutoff].to_vec();
+                let timing = matched
+                    .zip(opening.zip(opened))
+                    .map(|(matched, (opening, opened))| [opening, opened, matched, Instant::now()]);
+                batch(rows, timing);
                 delivered = cutoff;
                 last_batch = Instant::now();
             }

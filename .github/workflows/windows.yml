@@ -132,8 +132,12 @@ jobs:
           ./tools/bench.ps1 -BinaryPath "$previous/BetterExplorer.exe" -StartupRuns 10 -NavigationRuns 10 -Entries 50000
           Write-Host 'Release candidate on the same Windows runner'
           ./tools/bench.ps1 -StartupRuns 10 -NavigationRuns 10 -Entries 50000
+      - name: Isolate first-row latency on a shared local fixture
+        if: github.ref == 'refs/heads/diagnostics/first-row-latency'
+        shell: powershell
+        run: ./tools/bench.ps1 -CompareEnumeration -NavigationRuns 8 -Entries 50000
       - name: Upload benchmark results
-        if: github.ref == 'refs/heads/fix/first-launch-performance'
+        if: github.ref == 'refs/heads/fix/first-launch-performance' || github.ref == 'refs/heads/diagnostics/first-row-latency'
         uses: actions/upload-artifact@v7
         with:
           name: explorer-performance-comparison

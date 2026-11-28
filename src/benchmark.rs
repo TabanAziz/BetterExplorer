@@ -54,6 +54,7 @@ struct Sample {
     complete_ms: f64,
     rows: usize,
     max_dispatch_ms: f64,
+    first_row_stages_ms: Option<[f64; 5]>,
 }
 
 #[derive(Serialize)]
@@ -66,6 +67,7 @@ struct Running {
     started: Instant,
     first_ms: Option<f64>,
     max_dispatch_ms: f64,
+    first_row_stages_ms: Option<[f64; 5]>,
 }
 
 pub struct Bench {
@@ -120,6 +122,7 @@ impl Bench {
             started: Instant::now(),
             first_ms: None,
             max_dispatch_ms: 0.0,
+            first_row_stages_ms: None,
         });
         Some(target)
     }
@@ -132,6 +135,20 @@ impl Bench {
         self.running
             .as_ref()
             .is_some_and(|running| running.first_ms.is_none())
+    }
+
+    pub fn note_scan(&mut self, stages: [Instant; 4]) {
+        if let Some(running) = &mut self.running {
+            let elapsed =
+                |now: Instant| now.duration_since(running.started).as_secs_f64() * 1_000.0;
+            running.first_row_stages_ms = Some([
+                elapsed(stages[0]),
+                elapsed(stages[1]),
+                elapsed(stages[2]),
+                elapsed(stages[3]),
+                elapsed(Instant::now()),
+            ]);
+        }
     }
 
     pub fn dispatch_elapsed(&mut self, began: Instant) {
@@ -158,6 +175,7 @@ impl Bench {
             complete_ms: elapsed,
             rows,
             max_dispatch_ms: running.max_dispatch_ms,
+            first_row_stages_ms: running.first_row_stages_ms,
         };
         self.running = None;
         if self.warmup_finished {

@@ -2995,6 +2995,11 @@ impl App {
                     redraw_icons |= self.file_icons.apply(result, &self.images) && active;
                     redraw_icons |= self.file_icons.needs_retry(slot);
                 }
+                Event::Scan(ScanEvent::FirstRowTiming(id, timing)) if id == self.id => {
+                    if let Some(bench) = &mut self.bench {
+                        bench.note_scan(timing);
+                    }
+                }
                 Event::Scan(ScanEvent::Batch(id, rows)) if id == self.id && !self.keep_rows => {
                     let filter = self.tab().filter;
                     for row in rows {
