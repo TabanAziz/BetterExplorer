@@ -110,3 +110,19 @@ jobs:
               throw 'The sign-in task remained registered after opting out.'
             }
           }
+      - name: Install Inno Setup
+        shell: powershell
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe") -and -not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 7\ISCC.exe")) {
+            choco install innosetup --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Package Setup and portable ZIP
+        shell: powershell
+        run: ./tools/release.ps1 -SkipBuild
+      - name: Upload packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: better-explorer-windows
+          path: dist/*/*
+          if-no-files-found: error
