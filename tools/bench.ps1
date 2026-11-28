@@ -7,7 +7,8 @@ param(
     [ValidateRange(1, 100000)] [int] $Entries = 100000,
     [ValidateRange(0, 3600)] [int] $IdleSeconds = 0,
     [ValidateRange(5, 86400)] [int] $TimeoutSeconds = 180,
-    [string] $BinaryPath
+    [string] $BinaryPath,
+    [string] $CompareBinaryPath
 )
 
 Set-StrictMode -Version Latest
@@ -146,6 +147,9 @@ $repo = Split-Path -Parent $PSScriptRoot
 $binary = if ($BinaryPath) { $BinaryPath } else { Join-Path $repo 'target/release/BetterExplorer.exe' }
 if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) { throw 'Build the release or pass an existing BetterExplorer.exe with -BinaryPath.' }
 $binary = (Resolve-Path -LiteralPath $binary).ProviderPath
+$baseline = if ($CompareBinaryPath) {
+    (Resolve-Path -LiteralPath $CompareBinaryPath).ProviderPath
+}
 
 $runId = [guid]::NewGuid().ToString('N')
 $startedAt = [DateTime]::UtcNow
@@ -186,6 +190,52 @@ try {
     Write-Host "Creating $Entries benchmark files on $($fixtureDrive.Name)..."
     [BetterExplorerBenchmarkFixture]::Create($smallPath, 16)
     [BetterExplorerBenchmarkFixture]::Create($largePath, $Entries)
+
+    if ($baseline) {
+        $binaries = [ordered] @{ baseline = $baseline; candidate = $binary }
+        $starts = @{ baseline = @(); candidate = @() }
+        $nav = @{ baseline = @(); candidate = @() }
+        foreach ($arm in $binaries.Keys) {
+            $binary = $binaries[$arm]
+            $null = Invoke-AppReport -Name "$arm-startup-warmup" -Runs 0
+        }
+        for ($i = 0; $i -lt $StartupRuns; $i++) {
+            $order = if ($i % 2 -eq 0) { @('baseline', 'candidate') } else { @('candidate', 'baseline') }
+            foreach ($arm in $order) {
+                $binary = $binaries[$arm]
+                $report = Invoke-AppReport -Name "$arm-startup-$i" -Runs 0
+                $starts[$arm] += Read-Milliseconds $report.startup_ms "$arm startup"
+            }
+        }
+        foreach ($i in 0..3) {
+            $arm = @('baseline', 'candidate', 'candidate', 'baseline')[$i]
+            $binary = $binaries[$arm]
+            $report = Invoke-AppReport -Name "$arm-navigation-$i" -Runs $NavigationRuns -TargetPath $largePath
+            foreach ($sample in $report.navigation) {
+                if ($sample.rows -ne $Entries) { throw "Wrong row count for $arm." }
+                $nav[$arm] += $sample
+            }
+        }
+        $comparison = [ordered] @{
+            entries = $Entries
+            method = 'One shared warmed fixture. Launch order alternates. Two navigation processes per arm, one warm-up navigation in each. No physical input or reboot.'
+        }
+        foreach ($arm in $binaries.Keys) {
+            $comparison[$arm] = [ordered] @{
+                binary_sha256 = (Get-FileHash -LiteralPath $binaries[$arm] -Algorithm SHA256).Hash
+                startup_ms = Get-Percentiles -Values $starts[$arm]
+            }
+            foreach ($metric in @('first_ms', 'complete_ms', 'max_dispatch_ms')) {
+                $comparison[$arm][$metric] = Get-Percentiles -Values @(
+                    $nav[$arm] | ForEach-Object { Read-Milliseconds $_.$metric "$arm $metric" }
+                )
+            }
+        }
+        $json = $comparison | ConvertTo-Json -Depth 6
+        [IO.File]::WriteAllText((Join-Path $outputPath 'comparison.json'), $json)
+        Write-Output $json
+        return
+    }
 
     Write-Host "Measuring $StartupRuns warm launches after one unmeasured launch..."
     $warmup = Invoke-AppReport -Name 'startup-warmup' -Runs 0

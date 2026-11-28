@@ -360,6 +360,11 @@ fn folder_snapshot_is_only_used_with_matching_settings_and_while_fresh() {
     assert!(!snapshot.matches(&path.join("Other"), Sort::default(), false, at));
 }
 
+fn scan_completion_needs_layout(location: &Location, drive_cards: bool) -> bool {
+    // Only search actions and drive cards change their geometry on completion.
+    location.is_search() || drive_cards
+}
+
 struct ListSelection {
     paths: HashSet<PathBuf>,
     focused: Option<PathBuf>,
@@ -3020,7 +3025,9 @@ impl App {
                     self.apply_launch_selection();
                     self.update_preview();
                     self.status();
-                    self.layout();
+                    if scan_completion_needs_layout(self.location(), self.drive_cards()) {
+                        self.layout();
+                    }
                 }
                 Event::Scan(_) => (),
                 Event::Preview(id, content) if id == self.preview_id => {
@@ -7619,6 +7626,23 @@ mod group_tests {
         Foundation::FILETIME,
         System::{SystemInformation::GetSystemTimeAsFileTime, Threading::GetCurrentThreadId},
     };
+
+    #[test]
+    fn completion_layout_is_only_needed_for_search_and_drive_cards() {
+        assert!(!scan_completion_needs_layout(
+            &Location::Folder(PathBuf::from(r"C:\Work")),
+            false
+        ));
+        assert!(scan_completion_needs_layout(
+            &Location::Search {
+                root: PathBuf::from(r"C:\Work"),
+                query: "test".into(),
+            },
+            false
+        ));
+        assert!(scan_completion_needs_layout(&Location::Computer, true));
+        assert!(!scan_completion_needs_layout(&Location::Computer, false));
+    }
 
     #[test]
     fn file_list_does_not_enable_the_native_label_overlay() {

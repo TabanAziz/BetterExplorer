@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   check:
@@ -132,8 +133,24 @@ jobs:
           ./tools/bench.ps1 -BinaryPath "$previous/BetterExplorer.exe" -StartupRuns 10 -NavigationRuns 10 -Entries 50000
           Write-Host 'Release candidate on the same Windows runner'
           ./tools/bench.ps1 -StartupRuns 10 -NavigationRuns 10 -Entries 50000
+      - name: Compare with the previous candidate on the same folder
+        if: github.ref == 'refs/heads/diagnostics/folder-completion-layout'
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $package = Join-Path $env:RUNNER_TEMP 'previous-candidate'
+          $binary = Join-Path $env:RUNNER_TEMP 'previous-portable'
+          gh run download 46111626911 --repo TabanAziz/BetterExplorer --name better-explorer-windows --dir $package
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot download previous candidate.' }
+          $zip = @(Get-ChildItem -Path $package -Recurse -File -Filter '*portable.zip')
+          if ($zip.Count -ne 1 -or (Get-FileHash -LiteralPath $zip[0].FullName -Algorithm SHA256).Hash -ne '89aaf2963e0bd793d91eb81947dad2f6c0ce52f5d0148a3fdfe21aac15961783') {
+            throw 'Previous candidate did not match the recorded digest.'
+          }
+          Expand-Archive -LiteralPath $zip[0].FullName -DestinationPath $binary
+          ./tools/bench.ps1 -CompareBinaryPath (Join-Path $binary 'BetterExplorer.exe') -StartupRuns 24 -NavigationRuns 12 -Entries 50000
       - name: Upload benchmark results
-        if: github.ref == 'refs/heads/fix/first-launch-performance'
+        if: github.ref == 'refs/heads/fix/first-launch-performance' || github.ref == 'refs/heads/diagnostics/folder-completion-layout'
         uses: actions/upload-artifact@v7
         with:
           name: explorer-performance-comparison
