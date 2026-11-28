@@ -69,10 +69,10 @@ function Stop-BenchmarkApp {
 }
 
 function Invoke-AppReport {
-    param([string] $Name, [int] $Runs, [string] $TargetPath = '', [switch] $Home)
+    param([string] $Name, [int] $Runs, [string] $TargetPath = '', [switch] $LaunchHome)
 
     $reportPath = Join-Path $outputPath "$Name.json"
-    $initial = if ($Home) { '' } else { $smallPath }
+    $initial = if ($LaunchHome) { '' } else { $smallPath }
     $app = Start-BenchmarkApp -InitialPath $initial -ReportPath $reportPath -TargetPath $TargetPath -Runs $Runs
     try {
         if (-not $app.WaitForExit($TimeoutSeconds * 1000)) { throw "$Name timed out after $TimeoutSeconds seconds." }
@@ -204,7 +204,7 @@ try {
         foreach ($arm in $binaries.Keys) {
             $binary = $binaries[$arm]
             $null = Invoke-AppReport -Name "$arm-startup-warmup" -Runs 0
-            $null = Invoke-AppReport -Name "$arm-home-warmup" -Runs 0 -Home
+            $null = Invoke-AppReport -Name "$arm-home-warmup" -Runs 0 -LaunchHome
         }
         for ($i = 0; $i -lt $StartupRuns; $i++) {
             $order = if ($i % 2 -eq 0) { @('baseline', 'candidate') } else { @('candidate', 'baseline') }
@@ -212,7 +212,7 @@ try {
                 $binary = $binaries[$arm]
                 $report = Invoke-AppReport -Name "$arm-startup-$i" -Runs 0
                 $starts[$arm] += Read-Milliseconds $report.startup_ms "$arm startup"
-                $report = Invoke-AppReport -Name "$arm-home-$i" -Runs 0 -Home
+                $report = Invoke-AppReport -Name "$arm-home-$i" -Runs 0 -LaunchHome
                 $homeStarts[$arm] += Read-Milliseconds $report.startup_ms "$arm Home startup"
             }
         }
