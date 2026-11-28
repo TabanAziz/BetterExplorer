@@ -29,7 +29,11 @@ mod theme_visuals;
 #[cfg(windows)]
 mod ui;
 #[cfg(windows)]
+mod win_e_decision;
+#[cfg(windows)]
 mod win_e_task;
+#[cfg(all(windows, feature = "win-e-trace"))]
+mod win_e_trace;
 #[cfg(windows)]
 mod window_geometry;
 

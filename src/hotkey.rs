@@ -1,4 +1,6 @@
-use crate::win_e_task;
+#[cfg(feature = "win-e-trace")]
+use crate::win_e_trace as trace;
+use crate::{win_e_decision::dispatch, win_e_task};
 use std::{
     cell::{Cell, RefCell},
     env,
@@ -588,11 +590,18 @@ impl Chord {
     }
 }
 
+#[cfg(feature = "win-e-trace")]
+type OpenRequest = i64;
+#[cfg(not(feature = "win-e-trace"))]
+type OpenRequest = ();
+
 thread_local! {
+    #[cfg(feature = "win-e-trace")]
+    static TRACE_SENDER: RefCell<Option<trace::Sender>> = const { RefCell::new(None) };
     static CHORD: Cell<Chord> = const {
         Cell::new(Chord { modifiers: 0, e_down: false, suppress_e: false })
     };
-    static OPEN_REQUESTS: RefCell<Option<SyncSender<()>>> = const { RefCell::new(None) };
+    static OPEN_REQUESTS: RefCell<Option<SyncSender<OpenRequest>>> = const { RefCell::new(None) };
 }
 
 unsafe extern "system" fn keyboard(code: i32, message: WPARAM, detail: LPARAM) -> LRESULT {
@@ -642,9 +651,17 @@ unsafe extern "system" fn keyboard(code: i32, message: WPARAM, detail: LPARAM) -
 }
 
 fn request_open() -> bool {
+    #[cfg(feature = "win-e-trace")]
+    let request = trace::stamp();
+    #[cfg(not(feature = "win-e-trace"))]
+    let request = ();
+    #[cfg(feature = "win-e-trace")]
+    hook_mark(request, "hook_recognized", 0);
     OPEN_REQUESTS.with(|requests| {
         let requests = requests.borrow();
         let Some(sender) = requests.as_ref() else {
+            #[cfg(feature = "win-e-trace")]
+            hook_mark(request, "no_worker", 0);
             return false;
         };
         // Explorer otherwise sees a bare Windows-key press and can open Start on release.
@@ -672,8 +689,28 @@ fn request_open() -> bool {
         if sent == 1 {
             unsafe { SendInput(1, &inputs[1], size_of::<INPUT>() as i32) };
         }
-        sent == inputs.len() as u32 && sender.try_send(()).is_ok()
+        #[cfg(feature = "win-e-trace")]
+        hook_mark(request, "mask_sent", i64::from(sent));
+        dispatch(sent, || {
+            let accepted = sender.try_send(request);
+            #[cfg(feature = "win-e-trace")]
+            hook_mark(
+                request,
+                "queue",
+                match &accepted {
+                    Ok(()) => 1,
+                    Err(mpsc::TrySendError::Full(_)) => 0,
+                    Err(mpsc::TrySendError::Disconnected(_)) => -1,
+                },
+            );
+            accepted.is_ok()
+        })
     })
+}
+
+#[cfg(feature = "win-e-trace")]
+fn hook_mark(request: OpenRequest, phase: &'static str, value: i64) {
+    TRACE_SENDER.with(|sender| trace::mark(sender.borrow().as_ref(), request, phase, value));
 }
 
 struct Hook(HHOOK);
@@ -844,17 +881,41 @@ fn run_listener(exe: PathBuf) -> io::Result<()> {
     }
     let (sender, receiver) = mpsc::sync_channel(1);
     let launch_exe = exe.clone();
+    #[cfg(feature = "win-e-trace")]
+    let worker_trace = {
+        let sender = trace::listener().ok();
+        TRACE_SENDER.with(|local| *local.borrow_mut() = sender.clone());
+        sender
+    };
     thread::Builder::new().spawn(move || {
-        while receiver.recv().is_ok() {
+        while let Ok(_request) = receiver.recv() {
+            #[cfg(feature = "win-e-trace")]
+            let mark = |phase, value| trace::mark(worker_trace.as_ref(), _request, phase, value);
+            #[cfg(feature = "win-e-trace")]
+            mark("worker_received", 0);
             let _ = open_requested_window(
-                || foreground_running_window(&launch_exe),
+                || {
+                    let reused = foreground_running_window(&launch_exe);
+                    #[cfg(feature = "win-e-trace")]
+                    mark("reuse", i64::from(reused));
+                    reused
+                },
                 // The shortcut is an interactive request, even when the Startup Apps
                 // fallback was launched at below-normal priority during sign-in.
                 || {
-                    Command::new(&launch_exe)
+                    #[cfg(feature = "win-e-trace")]
+                    mark("spawn_started", 0);
+                    let child = Command::new(&launch_exe)
                         .creation_flags(NORMAL_PRIORITY_CLASS)
-                        .spawn()
-                        .map(drop)
+                        .spawn();
+                    #[cfg(feature = "win-e-trace")]
+                    match &child {
+                        Ok(child) => mark("spawn_pid", i64::from(child.id())),
+                        Err(error) => {
+                            mark("spawn_error", i64::from(error.raw_os_error().unwrap_or(-1)))
+                        }
+                    }
+                    child.map(drop)
                 },
             );
         }
@@ -862,6 +923,8 @@ fn run_listener(exe: PathBuf) -> io::Result<()> {
     OPEN_REQUESTS.set(Some(sender));
     let _hook = Hook::install()?;
     make_message_window(LISTENER_CLASS, exe.as_os_str())?;
+    #[cfg(feature = "win-e-trace")]
+    hook_mark(0, "listener_ready", i64::from(std::process::id()));
     message_loop()
 }
 

@@ -155,3 +155,12 @@ jobs:
           name: better-explorer-windows
           path: dist/*/*
           if-no-files-found: error
+      - name: Verify opt-in Win+E trace markers
+        if: github.ref == 'refs/heads/diagnostics/win-e-phases' && runner.environment == 'github-hosted'
+        shell: powershell
+        run: |
+          cargo +stable test --locked --features win-e-trace
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +stable build --locked --release --features win-e-trace --target-dir target/win-e-trace
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./tools/test-win-e-trace.ps1 -BinaryPath target/win-e-trace/release/BetterExplorer.exe

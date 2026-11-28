@@ -7467,6 +7467,8 @@ impl Drop for SettingsLease {
 }
 
 pub fn run(path: Option<PathBuf>, selection: Option<PathBuf>) -> Result<(), std::io::Error> {
+    #[cfg(feature = "win-e-trace")]
+    let ui_start = crate::win_e_trace::Event::new(0, "ui_entered", 0);
     unsafe {
         let settings = SettingsLease::acquire();
         let controls = INITCOMMONCONTROLSEX {
@@ -7574,6 +7576,10 @@ pub fn run(path: Option<PathBuf>, selection: Option<PathBuf>) -> Result<(), std:
                 SW_SHOWNORMAL
             },
         );
+        #[cfg(feature = "win-e-trace")]
+        if IsWindowVisible(window) != 0 {
+            crate::win_e_trace::app_shown(ui_start);
+        }
         if app.borrow().bench.is_some() {
             PostMessageW(window, BENCH_STARTED, 0, 0);
         }
