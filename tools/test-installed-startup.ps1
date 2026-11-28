@@ -82,6 +82,11 @@ function Measure-Helper([int] $ExpectedPriority) {
     }
     Invoke-CheckedProcess $exe '--win-e-pause' 10000
     if ([InstalledExplorerProbe]::HelperReady($exe)) { throw 'Win+E helper did not pause.' }
+    $stopWait = [Diagnostics.Stopwatch]::StartNew()
+    while ((Get-ScheduledTask -TaskName $taskName).State -eq 'Running') {
+        if ($stopWait.ElapsedMilliseconds -ge 8000) { throw 'Previous task instance did not exit.' }
+        Start-Sleep -Milliseconds 50
+    }
     $clock = [Diagnostics.Stopwatch]::StartNew()
     Start-ScheduledTask -InputObject $task
     while (-not [InstalledExplorerProbe]::HelperReady($exe)) {
@@ -91,13 +96,13 @@ function Measure-Helper([int] $ExpectedPriority) {
     $clock.ElapsedMilliseconds
 }
 function Measure-Installed([string] $Version, [int] $Priority, [int] $FirstFolder) {
-    $helperTime = Measure-Helper $Priority
-    Write-Host "BEX_HELPER $Version ready=${helperTime}ms priority=$Priority"
-    $external = @(Measure-FolderLaunch $folders[$FirstFolder] $count; Measure-FolderLaunch $folders[($FirstFolder + 1)] $count)
-    & (Join-Path $PSScriptRoot 'bench.ps1') -BinaryPath $exe -StartupRuns 3 -NavigationRuns 3 -Entries $count | Out-Host
+    $helperTimes = @(1..5 | ForEach-Object { Measure-Helper $Priority })
+    Write-Host "BEX_HELPER $Version priority=$Priority samples_ms=$($helperTimes -join ',')"
+    # The default Details view inserts one date group header once the scan completes.
+    $external = @(0..3 | ForEach-Object { Measure-FolderLaunch $folders[($FirstFolder + $_)] ($count + 1) })
     [ordered]@{
         install = $Version; executable_sha256 = (Get-FileHash -LiteralPath $exe).Hash; task_priority = $Priority
-        helper_ready_ms = $helperTime; folder_launch = $external
+        helper_ready_ms = $helperTimes; folder_launch = $external
     }
 }
 function Measure-FolderLaunch([string] $Folder, [int] $ExpectedRows) {
@@ -117,14 +122,13 @@ function Measure-FolderLaunch([string] $Folder, [int] $ExpectedRows) {
             $highest = [Math]::Max($highest, $rows)
             $elapsed = $clock.ElapsedMilliseconds
             if ($null -eq $visible -and $rows -ge -1) { $visible = $elapsed }
-            if ($null -eq $first -and $rows -gt 0) { $first = $elapsed }
+            if ($null -eq $first -and $rows -gt 1) { $first = $elapsed }
             if ($rows -eq $ExpectedRows) {
                 return [ordered]@{ visible_window_ms = $visible; first_rows_ms = $first; full_rows_ms = $elapsed; rows = $rows }
             }
             Start-Sleep -Milliseconds 10
         }
-        Write-Warning "External list probe could not confirm $ExpectedRows rows (last=$last, max=$highest, title=$($process.MainWindowTitle))."
-        return [ordered]@{ visible_window_ms = $visible; first_rows_ms = $first; full_rows_ms = $null; rows = $highest }
+        throw "External list probe could not confirm $ExpectedRows rows (last=$last, max=$highest, title=$($process.MainWindowTitle))."
     } finally {
         if (-not $process.HasExited) {
             $null = $process.CloseMainWindow()
@@ -139,11 +143,14 @@ function Measure-FolderLaunch([string] $Folder, [int] $ExpectedRows) {
 }
 $fixture = Join-Path $env:RUNNER_TEMP ('bex-installed-' + [guid]::NewGuid().ToString('N'))
 $count = 2000
-$folders = foreach ($i in 1..4) {
+$modified = [DateTime]::UtcNow.Date.AddHours(-24)
+$folders = foreach ($i in 1..8) {
     $folder = Join-Path $fixture "folder $i"
     $null = [IO.Directory]::CreateDirectory($folder)
     for ($n = 0; $n -lt $count; $n++) {
-        [IO.File]::WriteAllText((Join-Path $folder ("item-{0:d5}.txt" -f $n)), 'fixture')
+        $file = Join-Path $folder ("item-{0:d5}.txt" -f $n)
+        [IO.File]::WriteAllText($file, 'fixture')
+        [IO.File]::SetLastWriteTimeUtc($file, $modified)
     }
     $folder
 }
@@ -160,9 +167,9 @@ try {
     $draftHash = (Get-FileHash -LiteralPath $exe).Hash
     if ($draftHash -eq $previousHash) { throw 'The installer did not replace the installed executable.' }
     Invoke-CheckedProcess $exe '--win-e-enabled' 10000
-    $candidate = Measure-Installed '0.1.11' 5 2
+    $candidate = Measure-Installed '0.1.11' 5 4
     Write-Host ('BEX_CANDIDATE ' + ($candidate | ConvertTo-Json -Depth 5 -Compress))
-    Write-Host 'Installed compare only: on-demand scheduled task, no sign-in/reboot or physical Win+E. Two ordinary launches and three instrumented samples each on Windows Server.'
+    Write-Host 'Installed compare only: on-demand scheduled task, no sign-in/reboot or physical Win+E. Four ordinary launches and five task samples each on Windows Server.'
 } finally {
     if (Test-Path -LiteralPath $uninstaller) {
         Invoke-CheckedProcess $uninstaller '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART' 90000
