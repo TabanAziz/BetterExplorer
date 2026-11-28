@@ -4,8 +4,8 @@ use crate::{
 };
 use std::{
     ffi::{OsStr, OsString},
-    fs, io,
-    os::windows::{ffi::OsStringExt, fs::MetadataExt},
+    fs,
+    os::windows::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -25,13 +25,12 @@ use windows::{
     },
 };
 use windows_sys::Win32::{
-    Foundation::{ERROR_NO_MORE_FILES, FILETIME, HANDLE, INVALID_HANDLE_VALUE, SYSTEMTIME},
+    Foundation::{FILETIME, SYSTEMTIME},
     Globalization::{CompareStringOrdinal, CSTR_EQUAL},
     Storage::FileSystem::{
-        FindClose, FindExInfoBasic, FindExSearchNameMatch, FindFirstFileExW, FindNextFileW,
         GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDriveStringsW, GetVolumeInformationW,
         FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_ATTRIBUTE_SYSTEM, FIND_FIRST_EX_LARGE_FETCH, WIN32_FIND_DATAW,
+        FILE_ATTRIBUTE_SYSTEM,
     },
     System::{
         SystemInformation::{GetLocalTime, GetSystemTimeAsFileTime},
@@ -637,145 +636,37 @@ impl Visibility {
     }
 }
 
-struct DirectoryRow {
-    name: OsString,
-    attributes: u32,
-    size: u64,
-    modified: u64,
-}
-
-struct BulkDirectory {
-    handle: HANDLE,
-    data: WIN32_FIND_DATAW,
-    first: bool,
-    done: bool,
-}
-
-impl BulkDirectory {
-    fn open(folder: &Path) -> Option<Self> {
-        // Keep Windows' standard path semantics. The standard-library path remains
-        // available for UNC, extended paths, long paths and drivers rejecting bulk fetch.
-        if !matches!(folder.components().next(), Some(std::path::Component::Prefix(prefix))
-            if matches!(prefix.kind(), std::path::Prefix::Disk(_)))
-            || !folder.is_absolute()
-            || network_path(folder)
-        {
-            return None;
-        }
-        let query = wide(folder.join("*"));
-        if query.len() >= 260 {
-            return None;
-        }
-        let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
-        let handle = unsafe {
-            FindFirstFileExW(
-                query.as_ptr(),
-                FindExInfoBasic,
-                (&mut data as *mut WIN32_FIND_DATAW).cast(),
-                FindExSearchNameMatch,
-                std::ptr::null(),
-                FIND_FIRST_EX_LARGE_FETCH,
-            )
-        };
-        (handle != INVALID_HANDLE_VALUE).then_some(Self {
-            handle,
-            data,
-            first: true,
-            done: false,
-        })
-    }
-}
-
-impl Drop for BulkDirectory {
-    fn drop(&mut self) {
-        if self.handle != INVALID_HANDLE_VALUE {
-            unsafe { FindClose(self.handle) };
-        }
-    }
-}
-
-impl Iterator for BulkDirectory {
-    type Item = io::Result<DirectoryRow>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        while !self.done {
-            if !std::mem::take(&mut self.first)
-                && unsafe { FindNextFileW(self.handle, &mut self.data) } == 0
-            {
-                self.done = true;
-                let e = io::Error::last_os_error();
-                return (e.raw_os_error() != Some(ERROR_NO_MORE_FILES as i32)).then_some(Err(e));
-            }
-            let data = &self.data;
-            let name = &data.cFileName[..data
-                .cFileName
-                .iter()
-                .position(|&unit| unit == 0)
-                .unwrap_or(data.cFileName.len())];
-            if matches!(name, [46] | [46, 46]) {
-                continue;
-            }
-            return Some(Ok(DirectoryRow {
-                name: OsString::from_wide(name),
-                attributes: data.dwFileAttributes,
-                size: (u64::from(data.nFileSizeHigh) << 32) | u64::from(data.nFileSizeLow),
-                modified: (u64::from(data.ftLastWriteTime.dwHighDateTime) << 32)
-                    | u64::from(data.ftLastWriteTime.dwLowDateTime),
-            }));
-        }
-        None
-    }
-}
-
-enum DirectoryRows {
-    Bulk(BulkDirectory),
-    Standard(fs::ReadDir),
-}
-
-impl DirectoryRows {
-    fn open(folder: &Path, bulk: bool) -> io::Result<Self> {
-        if bulk {
-            if let Some(read) = BulkDirectory::open(folder) {
-                return Ok(Self::Bulk(read));
-            }
-        }
-        fs::read_dir(folder).map(Self::Standard)
-    }
-}
-
-impl Iterator for DirectoryRows {
-    type Item = io::Result<DirectoryRow>;
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::Bulk(read) => read.next(),
-            Self::Standard(read) => read.next().map(|item| {
-                let item = item?;
-                let m = item.metadata()?;
-                Ok(DirectoryRow {
-                    name: item.file_name(),
-                    attributes: m.file_attributes(),
-                    size: m.file_size(),
-                    modified: m.last_write_time(),
-                })
-            }),
-        }
-    }
-}
-
 #[cfg(test)]
 #[test]
-fn native_listing_matches_standard_unicode_metadata() -> io::Result<()> {
+fn enumeration_delivers_first_row_with_windows_metadata() -> std::io::Result<()> {
     let root = tempfile::tempdir()?;
-    fs::write(root.path().join("Größe 10.txt"), b"content")?;
-    fs::create_dir(root.path().join("Ordner 2"))?;
-    let entries = |bulk| -> io::Result<Vec<_>> {
-        let mut rows = DirectoryRows::open(root.path(), bulk)?
-            .map(|row| row.map(|row| (row.name, row.attributes, row.size, row.modified)))
-            .collect::<io::Result<Vec<_>>>()?;
-        rows.sort();
-        Ok(rows)
-    };
-    assert_eq!(entries(false)?, entries(true)?);
+    let file = root.path().join("Größe 10.txt");
+    let folder = root.path().join("Ordner 2");
+    fs::write(&file, b"content")?;
+    fs::create_dir(&folder)?;
+    let mut batches = Vec::new();
+    let mut rows = Vec::new();
+    let mut error = None;
+    enumerate(
+        root.path().to_path_buf(),
+        None,
+        Visibility {
+            hidden: false,
+            reveal: None,
+        },
+        &|| false,
+        &mut rows,
+        &mut error,
+        |batch| batches.push(batch),
+    );
+    assert!(error.is_none());
+    assert_eq!(batches.first().map(Vec::len), Some(1));
+    assert_eq!(rows.len(), 2);
+    let entry = rows.iter().find(|row| row.path == file).unwrap();
+    assert!(!entry.directory);
+    assert_eq!(entry.size, 7);
+    assert_eq!(entry.modified, fs::metadata(file)?.last_write_time());
+    assert!(rows.iter().any(|row| row.directory && row.path == folder));
     Ok(())
 }
 
@@ -796,7 +687,8 @@ fn enumerate(
         if stale() {
             return;
         }
-        let read = match DirectoryRows::open(&folder, query.is_none()) {
+        // Large-fetch delayed the first usable entry on the Windows fixture.
+        let read = match fs::read_dir(&folder) {
             Ok(read) => read,
             Err(failure) => {
                 if folder == root {
@@ -815,8 +707,12 @@ fn enumerate(
                 unreadable += 1;
                 continue;
             };
-            let attributes = item.attributes;
-            let name = item.name;
+            let Ok(metadata) = item.metadata() else {
+                unreadable += 1;
+                continue;
+            };
+            let attributes = metadata.file_attributes();
+            let name = item.file_name();
             if !visibility.includes(attributes, &name) {
                 continue;
             }
@@ -838,8 +734,8 @@ fn enumerate(
                     name: wide(&name),
                     extension,
                     directory,
-                    size: item.size,
-                    modified: item.modified,
+                    size: metadata.file_size(),
+                    modified: metadata.last_write_time(),
                     location: false,
                     capacity: None,
                     shell_item: None,
