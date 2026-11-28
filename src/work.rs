@@ -738,8 +738,9 @@ fn enumerate(
             }
         }
     }
-    // Expose the tail before name sorting, but do not double-paint a single small listing.
-    if !stale() && delivered < entries.len() && entries.len() - initial >= 32 {
+    // Always publish progress before sorting, including short directory scans. UI dispatch
+    // coalesces this with the final result if both are waiting when it wakes.
+    if !stale() && delivered < entries.len() {
         batch(entries[delivered..].to_vec());
     }
     if unreadable != 0 && error.is_none() {
