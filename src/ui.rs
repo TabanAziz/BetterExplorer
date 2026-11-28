@@ -40,13 +40,11 @@ use std::{
         mpsc::{sync_channel, SyncSender},
         Arc, Mutex,
     },
+    time::{Duration, Instant},
 };
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
-    Graphics::{
-        Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK},
-        Gdi::*,
-    },
+    Graphics::Gdi::*,
     System::{
         DataExchange::{AddClipboardFormatListener, RemoveClipboardFormatListener},
         LibraryLoader::GetModuleHandleW,
@@ -71,10 +69,11 @@ const BENCH_PRESENT: u32 = WM_APP + 7;
 const BENCH_STARTED: u32 = WM_APP + 8;
 const START_FILE_DRAG: u32 = WM_APP + 9;
 const REVEAL_SETTING: u32 = WM_APP + 10;
-const REGISTER_FILE_DROP: u32 = WM_APP + 11;
+const QUICK_ACCESS_MENU: u32 = WM_APP + 11;
 const REFRESH_TIMER: usize = 1;
 const SETTINGS_TIMER: usize = 2;
 const GROUP_TIMER: usize = 3;
+const FILE_DROP_TIMER: usize = 4;
 const RESIZE_EDGE: i32 = 7;
 
 #[derive(Clone, Copy)]
@@ -177,6 +176,7 @@ const NEW_WINDOW: u16 = 160;
 const NEXT_TAB: u16 = 161;
 const PREVIOUS_TAB: u16 = 162;
 const CONTEXT: u16 = 163;
+const QUICK_CONTEXT: u16 = 219;
 const EDIT_ADDRESS: u16 = 164;
 const CARDS_VIEW: u16 = 184;
 const SMALL_ICONS: u16 = 185;
@@ -318,6 +318,46 @@ struct Tab {
     sort: Sort,
     filter: Filter,
     view: u32,
+}
+
+struct FolderSnapshot {
+    path: PathBuf,
+    sort: Sort,
+    hidden: bool,
+    at: Instant,
+    rows: Vec<Arc<Entry>>,
+}
+
+const SNAPSHOT_TTL: Duration = Duration::from_secs(5);
+const SNAPSHOT_FOLDERS: usize = 6;
+const SNAPSHOT_ROWS_PER_FOLDER: usize = 20_000;
+
+impl FolderSnapshot {
+    fn matches(&self, path: &Path, sort: Sort, hidden: bool, now: Instant) -> bool {
+        self.path == path
+            && self.sort == sort
+            && self.hidden == hidden
+            && now.saturating_duration_since(self.at) <= SNAPSHOT_TTL
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn folder_snapshot_is_only_used_with_matching_settings_and_while_fresh() {
+    let path = PathBuf::from(r"C:\Documents");
+    let at = Instant::now();
+    let snapshot = FolderSnapshot {
+        path: path.clone(),
+        sort: Sort::default(),
+        hidden: false,
+        at,
+        rows: vec![],
+    };
+    assert!(snapshot.matches(&path, Sort::default(), false, at + Duration::from_secs(1)));
+    assert!(!snapshot.matches(&path, Sort::default(), false, at + Duration::from_secs(6)));
+    assert!(!snapshot.matches(&path, Sort::NEWEST_FIRST, false, at));
+    assert!(!snapshot.matches(&path, Sort::default(), true, at));
+    assert!(!snapshot.matches(&path.join("Other"), Sort::default(), false, at));
 }
 
 struct ListSelection {
@@ -561,6 +601,7 @@ struct App {
     clipboard_write: Option<shell::ClipboardWriteReceipt>,
     cut: Option<CutSelection>,
     keep_rows: bool,
+    folder_snapshots: VecDeque<FolderSnapshot>,
     saved: Option<SyncSender<Settings>>,
     launch_selection: Option<PathBuf>,
     save_worker: Option<std::thread::JoinHandle<()>>,
@@ -734,6 +775,7 @@ impl App {
             clipboard_write: None,
             cut: None,
             keep_rows: false,
+            folder_snapshots: VecDeque::new(),
             saved: None,
             launch_selection: None,
             save_worker: None,
@@ -1500,7 +1542,7 @@ impl App {
                 } else {
                     0
                 };
-                pos(id, x, d(RESIZE_EDGE), slot_width - close, d(27));
+                pos(id, x, d(RESIZE_EDGE), (slot_width - close).max(0), d(27));
                 if close != 0 {
                     pos(
                         CLOSE_TAB,
@@ -1520,6 +1562,18 @@ impl App {
             d(RESIZE_EDGE)
         };
         for (index, id) in [FRAME_CLOSE, FRAME_MAX, FRAME_MIN].into_iter().enumerate() {
+            let button = self.button(id);
+            unsafe {
+                SetWindowPos(
+                    button,
+                    HWND_TOP,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
             pos(
                 id,
                 w - frame_inset - d(44 * (index as i32 + 1)),
@@ -1527,6 +1581,7 @@ impl App {
                 d(44),
                 d(35) - frame_inset,
             );
+            unsafe { InvalidateRect(button, null(), 0) };
         }
 
         x = margin;
@@ -2292,6 +2347,99 @@ impl App {
         }
     }
 
+    fn toggle_pin(&mut self, path: PathBuf) {
+        if let Some(index) = self.settings.pins.iter().position(|pin| *pin == path) {
+            self.settings.pins.remove(index);
+            self.note = Some("Folder unpinned from Quick access.".into());
+        } else if self.settings.pins.len() < 75 {
+            self.settings.pins.push(path);
+            self.note = Some("Folder pinned to Quick access.".into());
+        } else {
+            self.note = Some("75 folders are already pinned.".into());
+        }
+        self.update_sidebar();
+        self.update_home();
+        self.status();
+        self.schedule_save();
+    }
+
+    fn quick_access_target(&self, coordinates: LPARAM) -> Option<(PathBuf, POINT)> {
+        let nav = self.navigation;
+        let mut point = POINT {
+            x: coordinates as i16 as i32,
+            y: (coordinates >> 16) as i16 as i32,
+        };
+        let index = if coordinates == -1 {
+            usize::try_from(send(nav, LB_GETCARETINDEX, 0, 0)).ok()?
+        } else {
+            let mut local = point;
+            if unsafe { ScreenToClient(nav, &mut local) } == 0 {
+                return None;
+            }
+            let bounds = rect(nav);
+            if !(0..bounds.right).contains(&local.x) || !(0..bounds.bottom).contains(&local.y) {
+                return None;
+            }
+            let packed = pack_point(local);
+            let item = send(nav, LB_ITEMFROMPOINT, 0, packed) as usize;
+            if item >> 16 != 0 {
+                return None;
+            }
+            item & 0xffff
+        };
+        let mut bounds: RECT = unsafe { zeroed() };
+        if send(
+            nav,
+            LB_GETITEMRECT,
+            index,
+            (&mut bounds as *mut RECT) as LPARAM,
+        ) == LB_ERR as isize
+        {
+            return None;
+        }
+        if coordinates == -1 {
+            point = POINT {
+                x: bounds.left,
+                y: bounds.bottom,
+            };
+            unsafe { ClientToScreen(nav, &mut point) };
+        } else {
+            let mut local = point;
+            unsafe { ScreenToClient(nav, &mut local) };
+            if !(bounds.top..bounds.bottom).contains(&local.y) {
+                return None;
+            }
+        }
+        match self.nav_rows.get(index)?.target.as_ref()? {
+            Location::Folder(path) => Some((path.clone(), point)),
+            _ => None,
+        }
+    }
+
+    fn quick_access_command(&mut self, command: u16, path: PathBuf) {
+        match command {
+            OPEN | OPEN_TAB | OPEN_WINDOW | COPY_PATH | PROPERTIES | REVEAL => {
+                self.show_entry(command, path, true);
+            }
+            CUT | COPY => self.copy_files(vec![path], command == CUT),
+            OPEN_TERMINAL => {
+                self.operation(Operation::Terminal(path));
+            }
+            PASTE => {
+                let receipt = shell::ClipboardPasteReceipt::capture(
+                    self.window as usize,
+                    self.clipboard_write.clone(),
+                );
+                self.operation(Operation::Paste {
+                    target: path,
+                    receipt,
+                });
+            }
+            PIN => self.toggle_pin(path),
+            _ => (),
+        }
+    }
+
     fn measure_menu(&self, data: &mut MEASUREITEMSTRUCT) {
         let Some(item) = self.popup_items.get(data.itemData) else {
             return;
@@ -2682,7 +2830,7 @@ impl App {
     fn go(&mut self, location: Location) {
         self.tab_mut().history.open(location);
         self.update_view();
-        self.refresh();
+        self.reload_navigation();
         self.schedule_save();
     }
 
@@ -2690,7 +2838,15 @@ impl App {
         self.reload(false);
     }
 
+    fn reload_navigation(&mut self) {
+        self.reload_with_snapshot(false, true);
+    }
+
     fn reload(&mut self, keep_rows: bool) {
+        self.reload_with_snapshot(keep_rows, false);
+    }
+
+    fn reload_with_snapshot(&mut self, keep_rows: bool, allow_snapshot: bool) {
         if keep_rows && self.edit.is_some() {
             unsafe {
                 SetTimer(self.window, REFRESH_TIMER, 250, None);
@@ -2712,6 +2868,21 @@ impl App {
         self.error = None;
         self.note = None;
         let settings_tab = *self.location() == Location::Settings;
+        if allow_snapshot && self.bench.is_none() {
+            if let Location::Folder(path) = self.location() {
+                let now = Instant::now();
+                if let Some(snapshot) = self
+                    .folder_snapshots
+                    .iter()
+                    .find(|snapshot| snapshot.matches(path, self.sort(), self.settings.hidden, now))
+                {
+                    self.rows = snapshot.rows.clone();
+                    self.keep_rows = true;
+                    self.scanning = false;
+                    self.rebuild_visible();
+                }
+            }
+        }
         self.scanning = !settings_tab;
         if settings_tab {
             self.ensure_settings_controls();
@@ -2721,8 +2892,45 @@ impl App {
         self.request_scan();
     }
 
+    fn save_folder_snapshot(&mut self) {
+        let Location::Folder(path) = self.location() else {
+            return;
+        };
+        let path = path.clone();
+        self.folder_snapshots
+            .retain(|snapshot| snapshot.path != path);
+        if self.error.is_some()
+            || self.rows.len() > SNAPSHOT_ROWS_PER_FOLDER
+            || self.bench.is_some()
+            || work::network_path(&path)
+            || self.launch_selection.is_some()
+        {
+            return;
+        }
+        self.folder_snapshots.push_front(FolderSnapshot {
+            path,
+            sort: self.sort(),
+            hidden: self.settings.hidden,
+            at: Instant::now(),
+            rows: self.rows.clone(),
+        });
+        self.folder_snapshots.truncate(SNAPSHOT_FOLDERS);
+    }
+
     fn request_scan(&mut self) {
         self.id = self.id.wrapping_add(1);
+        if *self.location() == Location::Home && self.home.is_some() {
+            if let Some(scanner) = &self.scanner {
+                scanner.cancel(self.id);
+            }
+            if let Some(watcher) = &self.watcher {
+                watcher.watch(self.id, None);
+            }
+            unsafe { KillTimer(self.window, REFRESH_TIMER) };
+            self.scanning = false;
+            self.status();
+            return;
+        }
         if *self.location() == Location::Settings {
             if let Some(scanner) = &self.scanner {
                 scanner.cancel(self.id);
@@ -2807,6 +3015,7 @@ impl App {
                     self.clear_selection();
                     self.rows = rows;
                     self.error = error;
+                    self.save_folder_snapshot();
                     self.scanning = false;
                     self.keep_rows = false;
                     self.rebuild_visible();
@@ -2852,6 +3061,9 @@ impl App {
                     opened,
                     file_history,
                 } => {
+                    if refresh {
+                        self.folder_snapshots.clear();
+                    }
                     self.file_history = file_history;
                     if refresh {
                         self.file_history_revision = self.file_history_revision.wrapping_add(1);
@@ -3451,6 +3663,28 @@ impl App {
         }
     }
 
+    fn copy_files(&mut self, paths: Vec<PathBuf>, cut: bool) {
+        if paths.is_empty() {
+            return;
+        }
+        let receipt = shell::ClipboardWriteReceipt::capture();
+        let cut_selection = cut.then(|| CutSelection {
+            paths: paths.iter().cloned().collect(),
+            receipt: receipt.clone(),
+        });
+        if self.operation(Operation::Clipboard {
+            paths,
+            cut,
+            receipt: receipt.clone(),
+        }) {
+            self.clipboard_write = Some(receipt);
+            if let Some(cut) = cut_selection {
+                self.cut = Some(cut);
+                unsafe { InvalidateRect(self.list, null(), 0) };
+            }
+        }
+    }
+
     fn operation(&mut self, operation: Operation) -> bool {
         let Some(sender) = &self.operations else {
             return false;
@@ -3485,7 +3719,7 @@ impl App {
             } else {
                 self.apply_view(self.tab().view);
             }
-            self.refresh();
+            self.reload_navigation();
             self.schedule_save();
         }
     }
@@ -3834,7 +4068,7 @@ impl App {
                 .is_some()
                 {
                     self.update_view();
-                    self.refresh();
+                    self.reload_navigation();
                     self.schedule_save();
                 }
             }
@@ -3953,24 +4187,7 @@ impl App {
             }
             CUT | COPY => {
                 let paths = self.selected_paths();
-                if !paths.is_empty() {
-                    let receipt = shell::ClipboardWriteReceipt::capture();
-                    let cut = (id == CUT).then(|| CutSelection {
-                        paths: paths.iter().cloned().collect(),
-                        receipt: receipt.clone(),
-                    });
-                    if self.operation(Operation::Clipboard {
-                        paths,
-                        cut: id == CUT,
-                        receipt: receipt.clone(),
-                    }) {
-                        self.clipboard_write = Some(receipt);
-                        if let Some(cut) = cut {
-                            self.cut = Some(cut);
-                            unsafe { InvalidateRect(self.list, null(), 0) };
-                        }
-                    }
-                }
+                self.copy_files(paths, id == CUT);
             }
             PASTE => {
                 if let Some(target) = self.dest() {
@@ -4340,23 +4557,7 @@ impl App {
                     .map(|entry| entry.path.clone())
                     .or_else(|| self.dest());
                 if let Some(path) = path {
-                    if let Some(index) = self.settings.pins.iter().position(|pin| *pin == path) {
-                        self.settings.pins.remove(index);
-                        self.note = Some("Folder unpinned from Quick access.".into());
-                    } else if self.settings.pins.len() < 75 {
-                        self.settings.pins.push(path);
-                        self.note = Some("Folder pinned to Quick access.".into());
-                    } else {
-                        self.note = Some("75 folders are already pinned.".into());
-                    }
-                    let note = self.note.clone();
-                    self.update_sidebar();
-                    if matches!(self.location(), Location::Home) {
-                        self.refresh();
-                    }
-                    self.note = note;
-                    self.status();
-                    self.schedule_save();
+                    self.toggle_pin(path);
                 }
             }
             id if (TAB_START..TAB_START + TAB_LIMIT as u16).contains(&id) => {
@@ -5768,11 +5969,80 @@ mod context_menu_tests {
     }
 }
 
+fn pack_point(point: POINT) -> LPARAM {
+    (((point.y as u16 as usize) << 16) | point.x as u16 as usize) as LPARAM
+}
+
+fn quick_access_items(pinned: bool, can_paste: bool) -> Vec<MenuItem> {
+    let item = MenuItem::new;
+    let line = MenuItem::separator;
+    vec![
+        item(OPEN, "Open"),
+        item(OPEN_TAB, "Open in new tab"),
+        item(OPEN_WINDOW, "Open in new window"),
+        item(OPEN_TERMINAL, "Open in Terminal"),
+        line(),
+        item(CUT, "Cut"),
+        item(COPY, "Copy"),
+        item(PASTE, "Paste into folder").enabled(can_paste),
+        item(COPY_PATH, "Copy as path"),
+        line(),
+        item(
+            PIN,
+            if pinned {
+                "Unpin from Quick access"
+            } else {
+                "Pin to Quick access"
+            },
+        ),
+        item(REVEAL, "Show in Windows File Explorer"),
+        item(PROPERTIES, "Properties"),
+    ]
+}
+
+#[cfg(test)]
+#[test]
+fn quick_access_offers_folder_commands_and_copy_as_path() {
+    let menu = quick_access_items(true, false);
+    for id in [
+        OPEN,
+        OPEN_TAB,
+        OPEN_WINDOW,
+        OPEN_TERMINAL,
+        COPY,
+        CUT,
+        COPY_PATH,
+        REVEAL,
+        PROPERTIES,
+    ] {
+        assert!(menu.iter().any(|item| item.id == id && item.enabled));
+    }
+    assert!(menu
+        .iter()
+        .any(|item| item.id == PIN && item.label == "Unpin from Quick access"));
+    assert!(menu.iter().any(|item| item.id == PASTE && !item.enabled));
+}
+
 fn show_menu(app: &RefCell<App>, id: u16, coordinates: LPARAM) {
     let Ok(mut state) = app.try_borrow_mut() else {
         return;
     };
-    let items = state.menu(id);
+    let quick_target = if id == QUICK_CONTEXT {
+        let Some(target) = state.quick_access_target(coordinates) else {
+            return;
+        };
+        Some(target)
+    } else {
+        None
+    };
+    let items = if let Some((path, _)) = &quick_target {
+        quick_access_items(
+            state.settings.pins.contains(path),
+            shell::has_file_clipboard(),
+        )
+    } else {
+        state.menu(id)
+    };
     let painted = !state.colors.contrast;
     let menu_color = state.colors.chrome;
     let window = state.window;
@@ -5787,7 +6057,9 @@ fn show_menu(app: &RefCell<App>, id: u16, coordinates: LPARAM) {
     let target = (id == CONTEXT).then(|| (state.location().clone(), selected_targets(&state)));
     let mut anchor: POINT = unsafe { zeroed() };
     unsafe {
-        if id == CONTEXT {
+        if let Some((_, point)) = &quick_target {
+            anchor = *point;
+        } else if id == CONTEXT {
             if coordinates == -1 {
                 let mut box_: RECT = zeroed();
                 let row = send(
@@ -5875,7 +6147,15 @@ fn show_menu(app: &RefCell<App>, id: u16, coordinates: LPARAM) {
                 state.location() == &location && selected_targets(&state) == paths
             });
             let command = selected as u16;
-            if matches!(command, UNDO | REDO) {
+            if let Some((path, _)) = quick_target {
+                if state
+                    .nav_rows
+                    .iter()
+                    .any(|row| row.target.as_ref() == Some(&Location::Folder(path.clone())))
+                {
+                    state.quick_access_command(command, path);
+                }
+            } else if matches!(command, UNDO | REDO) {
                 if state.busy == 0 && state.file_history_revision == file_history_revision {
                     state.command(command);
                 } else {
@@ -5939,7 +6219,10 @@ fn browse_archive_folder(app: &RefCell<App>) {
 fn title_tab_widths(width: i32, count: i32, motif_width: i32, dpi: u32) -> (i32, i32) {
     let d = |value| scale(value, dpi);
     let tab_space = width - d(193) - motif_width;
-    let extra_close = if motif_width != 0 && tab_space / count - d(2) < d(51) {
+    let available = (width - d(RESIZE_EDGE) - d(132) - d(10) - d(4) - d(32)).max(0);
+    let extra_close = if available / count - d(2) < d(25)
+        || (motif_width != 0 && tab_space / count - d(2) < d(51))
+    {
         d(22)
     } else {
         0
@@ -5951,8 +6234,32 @@ fn title_tab_widths(width: i32, count: i32, motif_width: i32, dpi: u32) -> (i32,
     } else {
         d(32)
     };
-    let tab = ((tab_space - extra_close) / count - d(2)).clamp(minimum, d(221));
+    let cap = ((available - extra_close) / count - d(2)).max(0);
+    let tab = ((tab_space - extra_close) / count - d(2))
+        .clamp(minimum, d(221))
+        .min(cap);
     (tab, extra_close)
+}
+
+#[cfg(test)]
+#[test]
+fn title_tabs_do_not_enter_window_button_lane_on_narrow_displays() {
+    for dpi in [96, 120, 144, 192, 240] {
+        let d = |value| scale(value, dpi);
+        for width in [360, 400, 512, 552, 680, 760] {
+            for motif in [0, d(76), d(144)] {
+                let w = d(width);
+                let count = TAB_LIMIT as i32;
+                let (tab, close) = title_tab_widths(w, count, motif, dpi);
+                let end = d(10) + count * (tab + d(2)) + close + d(4) + d(32);
+                assert!(
+                    end <= w - d(RESIZE_EDGE) - d(132),
+                    "{width} DIP at {dpi} DPI"
+                );
+                assert!(tab + close >= d(25), "active-tab close must fit");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -6088,6 +6395,10 @@ fn key(app: &RefCell<App>, message: &MSG) -> bool {
         (VK_DELETE, false, false, true) if focus == app.list => PERMANENT,
         (VK_F2, false, false, _) if focus == app.list => RENAME,
         (VK_BACK, false, false, false) if focus == app.list => BACK,
+        (VK_APPS, false, false, _) | (VK_F10, false, false, true) if focus == app.navigation => {
+            unsafe { PostMessageW(app.window, QUICK_ACCESS_MENU, 0, -1) };
+            return true;
+        }
         (VK_APPS, false, false, _) | (VK_F10, false, false, true) if focus == app.list => {
             unsafe {
                 PostMessageW(app.window, SHOW_MENU, CONTEXT as usize, -1);
@@ -6257,8 +6568,13 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
         cell.borrow_mut().bench = bench;
         return 0;
     }
-    if message == REGISTER_FILE_DROP {
+    if message == WM_TIMER && wp == FILE_DROP_TIMER {
+        unsafe { KillTimer(window, FILE_DROP_TIMER) };
         register_file_drop_target(window, cell);
+        return 0;
+    }
+    if message == QUICK_ACCESS_MENU {
+        show_menu(cell, QUICK_CONTEXT, lp);
         return 0;
     }
     if message == BENCH_PRESENT {
@@ -6337,6 +6653,29 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
         return unsafe { DefWindowProcW(window, message, wp, lp) };
     }
     let Ok(mut app) = cell.try_borrow_mut() else {
+        if message == WM_DRAWITEM && lp != 0 {
+            let draw = unsafe { &*(lp as *const DRAWITEMSTRUCT) };
+            if draw.CtlType == ODT_BUTTON && draw.CtlID == FRAME_CLOSE as u32 {
+                if let Some(colors) = CONTROL_COLORS.get() {
+                    let bounds = draw.rcItem;
+                    let size = scale(16, unsafe { GetDpiForWindow(window) }.max(96));
+                    fill(
+                        draw.hDC,
+                        &bounds,
+                        colors.surfaces[ControlSurface::Title as usize],
+                    );
+                    draw_glyph(
+                        draw.hDC,
+                        Glyph::Close,
+                        (bounds.left + bounds.right - size) / 2,
+                        (bounds.top + bounds.bottom - size) / 2,
+                        size,
+                        colors.text,
+                    );
+                    return 1;
+                }
+            }
+        }
         return unsafe { DefWindowProcW(window, message, wp, lp) };
     };
     match message {
@@ -6458,6 +6797,10 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wp: WPARAM, lp: 
             0
         }
         WM_NCHITTEST => app.hit_test(lp),
+        WM_CONTEXTMENU if wp as HWND == app.navigation => {
+            unsafe { PostMessageW(window, QUICK_ACCESS_MENU, 0, lp) };
+            0
+        }
         WM_LBUTTONDOWN => {
             let x = lp as i16 as i32;
             let y = (lp >> 16) as i16 as i32;
@@ -6806,6 +7149,29 @@ unsafe extern "system" fn button_proc(
     }
 }
 
+unsafe extern "system" fn sidebar_proc(
+    window: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+    _: usize,
+    _: usize,
+) -> LRESULT {
+    unsafe {
+        if msg == WM_RBUTTONUP {
+            let mut point = POINT {
+                x: lp as i16 as i32,
+                y: (lp >> 16) as i16 as i32,
+            };
+            if ClientToScreen(window, &mut point) != 0 {
+                PostMessageW(GetParent(window), QUICK_ACCESS_MENU, 0, pack_point(point));
+            }
+            return 0;
+        }
+        DefSubclassProc(window, msg, wp, lp)
+    }
+}
+
 unsafe extern "system" fn search_cue_proc(
     window: HWND,
     msg: u32,
@@ -7109,7 +7475,7 @@ pub fn run(path: Option<PathBuf>, selection: Option<PathBuf>) -> Result<(), std:
         };
         InitCommonControlsEx(&controls);
         let module = GetModuleHandleW(null());
-        let class = wide("BetterExplorerWindow");
+        let class = wide(hotkey::EXPLORER_WINDOW_CLASS);
         let icon = LoadImageW(
             module,
             std::ptr::without_provenance(1),
@@ -7193,22 +7559,13 @@ pub fn run(path: Option<PathBuf>, selection: Option<PathBuf>) -> Result<(), std:
                 SetWindowSubclass(app.header, Some(header_proc), 1, 0);
             }
             SetWindowSubclass(app.list, Some(group_list_proc), 2, 0);
+            SetWindowSubclass(app.navigation, Some(sidebar_proc), 1, 0);
             SetWindowSubclass(app.search, Some(search_cue_proc), 1, 0);
             for &(_, button) in &app.buttons {
                 SetWindowSubclass(button, Some(button_proc), 1, 0);
             }
         }
         let without_activation = std::env::var_os("BETTEREXPLORER_BENCH_NOACTIVATE").is_some();
-        let set_cloak = |cloak: i32| {
-            DwmSetWindowAttribute(
-                window,
-                DWMWA_CLOAK as u32,
-                (&cloak as *const i32).cast(),
-                size_of::<i32>() as u32,
-            )
-        };
-        // Let DWM compose the initial native controls before exposing the window.
-        let cloaked = set_cloak(1) >= 0;
         ShowWindow(
             window,
             if without_activation {
@@ -7217,28 +7574,13 @@ pub fn run(path: Option<PathBuf>, selection: Option<PathBuf>) -> Result<(), std:
                 SW_SHOWNORMAL
             },
         );
-        RedrawWindow(
-            window,
-            null(),
-            null_mut(),
-            RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW,
-        );
-        if cloaked {
-            GdiFlush();
-            let result = set_cloak(0);
-            if result < 0 {
-                DestroyWindow(window);
-                return Err(std::io::Error::other(format!(
-                    "Windows could not reveal the window (0x{result:08X})."
-                )));
-            }
-        }
         if app.borrow().bench.is_some() {
             PostMessageW(window, BENCH_STARTED, 0, 0);
         }
         app.borrow_mut().start();
-        // Let the first frame paint before Windows loads the native drop target machinery.
-        if PostMessageW(window, REGISTER_FILE_DROP, 0, 0) == 0 {
+        // WM_TIMER is serviced below paint and input. Loading the native drag target
+        // must not sit in front of the first interactive frame.
+        if SetTimer(window, FILE_DROP_TIMER, 250, None) == 0 {
             register_file_drop_target(window, &app);
         }
         let mut message = zeroed();
@@ -7663,7 +8005,7 @@ mod group_tests {
                 GWLP_USERDATA,
                 (&*app as *const RefCell<App>) as isize,
             );
-            procedure(window, REGISTER_FILE_DROP, 0, 0);
+            procedure(window, WM_TIMER, FILE_DROP_TIMER, 0);
             {
                 let mut app = app.borrow_mut();
                 assert!(app.drop_target.is_some());

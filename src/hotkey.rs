@@ -18,6 +18,7 @@ use windows_sys::Win32::{
         CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS,
         HANDLE, HWND, LPARAM, LRESULT, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
     },
+    Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED},
     Storage::FileSystem::SYNCHRONIZE,
     System::{
         LibraryLoader::GetModuleHandleW,
@@ -32,17 +33,18 @@ use windows_sys::Win32::{
     },
     UI::{
         Input::KeyboardAndMouse::{
-            GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-            KEYEVENTF_KEYUP, VK_E, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_RCONTROL,
-            VK_RMENU, VK_RSHIFT, VK_RWIN,
+            GetAsyncKeyState, IsWindowEnabled, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD,
+            KEYBDINPUT, KEYEVENTF_KEYUP, VK_E, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN,
+            VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN,
         },
         WindowsAndMessaging::{
             CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-            FindWindowExW, GetMessageW, GetWindowTextW, GetWindowThreadProcessId, PostMessageW,
-            PostQuitMessage, RegisterClassW, SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION,
-            HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_ALTDOWN, LLKHF_INJECTED,
-            LLKHF_LOWER_IL_INJECTED, MSG, WH_KEYBOARD_LL, WM_CLOSE, WM_DESTROY, WM_KEYDOWN,
-            WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW,
+            FindWindowExW, GetForegroundWindow, GetMessageW, GetWindowTextW,
+            GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindowVisible, PostMessageW,
+            PostQuitMessage, RegisterClassW, SetForegroundWindow, SetWindowsHookExW,
+            UnhookWindowsHookEx, HC_ACTION, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_ALTDOWN,
+            LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED, MSG, WH_KEYBOARD_LL, WM_CLOSE, WM_DESTROY,
+            WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW,
         },
     },
 };
@@ -57,6 +59,7 @@ const LISTENER_ARG: &str = "--win-e-listener";
 const LISTENER_MUTEX: &str = r"Local\BetterExplorer.WinE.Listener.1";
 const SETTINGS_MUTEX: &str = r"Local\BetterExplorer.WinE.Settings.1";
 const LISTENER_CLASS: &str = "BetterExplorerWinEListener";
+pub const EXPLORER_WINDOW_CLASS: &str = "BetterExplorerWindow";
 const STARTUP_WAIT_MS: u32 = 4000;
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
@@ -762,6 +765,76 @@ fn message_loop() -> io::Result<()> {
     }
 }
 
+fn open_requested_window(
+    reuse: impl FnOnce() -> bool,
+    launch: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    if reuse() {
+        Ok(())
+    } else {
+        launch()
+    }
+}
+
+fn foreground_running_window(exe: &Path) -> bool {
+    let class = wide(EXPLORER_WINDOW_CLASS);
+    let expected = wide(exe);
+    let mut image = vec![0u16; expected.len()];
+    let mut window = null_mut();
+    loop {
+        window = unsafe { FindWindowExW(null_mut(), window, class.as_ptr(), null()) };
+        if window.is_null() {
+            return false;
+        }
+        // Do not wait for UI-thread messages. Ignore hidden, disabled, stalled, and minimized
+        // candidates so a failed warm activation still takes the normal launch path.
+        if unsafe {
+            IsWindowVisible(window) == 0
+                || IsWindowEnabled(window) == 0
+                || IsIconic(window) != 0
+                || IsHungAppWindow(window) != 0
+        } {
+            continue;
+        }
+        let mut cloaked = 0u32;
+        let result = unsafe {
+            DwmGetWindowAttribute(
+                window,
+                DWMWA_CLOAKED as u32,
+                (&mut cloaked as *mut u32).cast(),
+                size_of::<u32>() as u32,
+            )
+        };
+        if result < 0 || cloaked != 0 || !window_belongs_to(window, &expected, &mut image) {
+            continue;
+        }
+        // Windows is free to decline a focus transfer. Don't swallow the shortcut
+        // if that happens, and don't move focus to a different desktop or install.
+        return unsafe { GetForegroundWindow() == window || SetForegroundWindow(window) != 0 };
+    }
+}
+
+fn window_belongs_to(window: HWND, expected: &[u16], image: &mut [u16]) -> bool {
+    let mut pid = 0;
+    if unsafe { GetWindowThreadProcessId(window, &mut pid) } == 0 {
+        return false;
+    }
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return false;
+    }
+    let process = Handle(process);
+    let mut length = image.len() as u32;
+    let mut current_pid = 0;
+    unsafe {
+        QueryFullProcessImageNameW(process.0, 0, image.as_mut_ptr(), &mut length) != 0
+            && (length as usize + 1 == expected.len())
+            && image.get(..length as usize) == expected.get(..expected.len() - 1)
+            && GetWindowThreadProcessId(window, &mut current_pid) != 0
+            && pid == current_pid
+    }
+}
+
 fn run_listener(exe: PathBuf) -> io::Result<()> {
     let Some(_listener) = lock(LISTENER_MUTEX, 0)? else {
         return Ok(());
@@ -773,7 +846,10 @@ fn run_listener(exe: PathBuf) -> io::Result<()> {
     let launch_exe = exe.clone();
     thread::Builder::new().spawn(move || {
         while receiver.recv().is_ok() {
-            let _ = Command::new(&launch_exe).spawn();
+            let _ = open_requested_window(
+                || foreground_running_window(&launch_exe),
+                || Command::new(&launch_exe).spawn().map(drop),
+            );
         }
     })?;
     OPEN_REQUESTS.set(Some(sender));
@@ -786,6 +862,56 @@ fn run_listener(exe: PathBuf) -> io::Result<()> {
 mod tests {
     use super::*;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_R;
+
+    #[test]
+    fn shortcut_uses_a_ready_window_without_starting_a_second_process() {
+        assert!(open_requested_window(|| true, || panic!("unnecessary process launch")).is_ok());
+    }
+
+    #[test]
+    fn shortcut_still_launches_when_no_window_can_take_focus() {
+        let launched = Cell::new(false);
+        let result = open_requested_window(
+            || false,
+            || {
+                launched.set(true);
+                Ok(())
+            },
+        );
+        assert!(result.is_ok() && launched.get());
+    }
+
+    #[test]
+    fn candidate_must_belong_to_the_same_executable() -> io::Result<()> {
+        let exe = env::current_exe()?;
+        let window = unsafe {
+            CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                null(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            )
+        };
+        if window.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let expected = wide(&exe);
+        let mut image = vec![0; expected.len()];
+        let good = window_belongs_to(window, &expected, &mut image);
+        let wrong = wide(exe.with_file_name("another-copy.exe"));
+        let wrong_matched = window_belongs_to(window, &wrong, &mut image);
+        unsafe { DestroyWindow(window) };
+        assert!(good && !wrong_matched);
+        Ok(())
+    }
 
     #[test]
     fn recognizes_e_once_per_press_with_either_windows_key() {
