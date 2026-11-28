@@ -1,6 +1,6 @@
 [package]
 name = "better-explorer"
-version = "0.1.10"
+version = "0.1.11"
 description = "A native Windows file manager from the Better series"
 authors = ["Aziz Taban"]
 edition = "2021"

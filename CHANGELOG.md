@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.11
+
+- Keep the Close button above the tabs and redraw it reliably during layout changes.
+- Right-click a Quick access folder for actions including Copy as path, Open in new tab, and Properties.
+- Win+E brings a responsive BetterExplorer window from the same installation forward when available. Ctrl+N still opens a new window.
+- Show the first window without blocking on DWM composition. Reuse recent local folder listings while refreshing them in the background.
+
 ## 0.1.10
 
 - Start the opted-in Win+E helper through a per-user sign-in task so it can run without waiting for delayed Startup Apps.
