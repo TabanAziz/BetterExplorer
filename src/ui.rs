@@ -5853,7 +5853,14 @@ mod context_menu_tests {
                 .children
                 .iter()
                 .any(|item| item.id == COMPRESS_OPTIONS && item.enabled));
+            assert!(
+                GetDlgItem(window, ARCHIVE_FORMAT as i32).is_null()
+                    && app.button(ARCHIVE_BROWSE).is_null(),
+                "browsing and quick actions must not create advanced archive inputs"
+            );
             app.command(COMPRESS_OPTIONS);
+            assert!(!GetDlgItem(window, ARCHIVE_FORMAT as i32).is_null());
+            assert!(!app.button(ARCHIVE_BROWSE).is_null());
             assert!(matches!(app.edit, Some(Edit::Compress(..))));
             assert!(pending.try_recv().is_err());
             text(app.edit_name, folder.join("Other").join("Custom.name.zip"));
