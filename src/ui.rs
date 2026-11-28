@@ -548,7 +548,7 @@ struct App {
     status: HWND,
     edit_label: HWND,
     edit_name: HWND,
-    archive_options: ArchiveOptions,
+    archive_options: Option<ArchiveOptions>,
     images: [HIMAGELIST; 2],
     file_icons: FileIconCache,
     icon_size: i32,
@@ -632,7 +632,6 @@ impl App {
             (PATH, "Path choices"),
             (ACCEPT, "Apply"),
             (CANCEL, "Cancel"),
-            (ARCHIVE_BROWSE, "Browse…"),
             (STOP_SEARCH, "Stop search"),
             (SEARCH_ALL_DRIVES, "Search all drives"),
             (FRAME_MIN, "Minimize"),
@@ -722,7 +721,7 @@ impl App {
             status: label(STATUS),
             edit_label: label(0),
             edit_name: input(NAME),
-            archive_options: ArchiveOptions::create(window),
+            archive_options: None,
             images: [0; 2],
             file_icons: FileIconCache::default(),
             icon_size: 52,
@@ -1029,8 +1028,11 @@ impl App {
             self.detail_body,
         ]
         .into_iter()
-        .chain(self.archive_options.controls())
-        {
+        .chain(
+            self.archive_options
+                .iter()
+                .flat_map(ArchiveOptions::controls),
+        ) {
             send(control, WM_SETFONT, self.fonts[0] as usize, 1);
         }
         for control in [self.title, self.detail_title, self.header] {
@@ -1145,34 +1147,47 @@ impl App {
         if let Some(page) = &self.settings_controls {
             page.set_style(&self.colors);
         }
-        let theme = wide(if self.colors.dark {
-            "DarkMode_Explorer"
-        } else {
-            "Explorer"
-        });
-        unsafe {
-            for control in [
-                self.navigation,
-                self.archive_options.format,
-                self.archive_options.level,
-            ] {
-                SetWindowTheme(
-                    control,
-                    if self.colors.contrast {
-                        null()
-                    } else {
-                        theme.as_ptr()
-                    },
-                    null(),
-                );
-            }
-        }
+        self.style_shell_controls(
+            [self.navigation].into_iter().chain(
+                self.archive_options
+                    .iter()
+                    .flat_map(|options| [options.format, options.level]),
+            ),
+        );
         for handle in old {
             if !handle.is_null() {
                 unsafe {
                     DeleteObject(handle);
                 }
             }
+        }
+    }
+
+    fn style_shell_controls(&self, controls: impl IntoIterator<Item = HWND>) {
+        let theme = wide(if self.colors.dark {
+            "DarkMode_Explorer"
+        } else {
+            "Explorer"
+        });
+        let name = if self.colors.contrast {
+            null()
+        } else {
+            theme.as_ptr()
+        };
+        for control in controls {
+            unsafe { SetWindowTheme(control, name, null()) };
+        }
+    }
+
+    fn ensure_archive_options(&mut self) {
+        if self.archive_options.is_none() {
+            let options = ArchiveOptions::create(self.window);
+            for control in options.controls() {
+                send(control, WM_SETFONT, self.fonts[0] as usize, 0);
+            }
+            self.style_shell_controls([options.format, options.level]);
+            self.set_dynamic_button(ARCHIVE_BROWSE, "Browse…");
+            self.archive_options = Some(options);
         }
     }
 
@@ -1804,13 +1819,13 @@ impl App {
         }
         for control in self
             .archive_options
-            .controls()
-            .into_iter()
-            .chain([self.button(ARCHIVE_BROWSE)])
+            .iter()
+            .flat_map(ArchiveOptions::controls)
+            .chain(std::iter::once(self.button(ARCHIVE_BROWSE)).filter(|handle| !handle.is_null()))
         {
             set_visible(control, archive_options);
         }
-        if archive_options {
+        if let Some(options) = self.archive_options.as_ref().filter(|_| archive_options) {
             let actions_y = status_y - d(39);
             let options_y = actions_y - if stack_archive_actions { d(35) } else { 0 };
             let path_y = options_y - d(35);
@@ -1824,21 +1839,15 @@ impl App {
             );
             pos(ARCHIVE_BROWSE, w - d(92), path_y, d(79), d(28));
             move_to(
-                self.archive_options.format_label,
+                options.format_label,
                 content_x,
                 options_y + d(5),
                 d(48),
                 d(24),
             );
+            move_to(options.format, content_x + d(50), options_y, d(66), d(140));
             move_to(
-                self.archive_options.format,
-                content_x + d(50),
-                options_y,
-                d(66),
-                d(140),
-            );
-            move_to(
-                self.archive_options.level_label,
+                options.level_label,
                 content_x + d(124),
                 options_y + d(5),
                 d(83),
@@ -1847,7 +1856,7 @@ impl App {
             let level_right = w - d(if stack_archive_actions { 13 } else { 155 });
             let level_x = content_x + d(209);
             move_to(
-                self.archive_options.level,
+                options.level,
                 level_x,
                 options_y,
                 (level_right - level_x).min(d(106)),
@@ -3816,7 +3825,13 @@ impl App {
                 permanent: true,
             },
             Edit::Compress(sources, target) => {
-                let options = self.archive_options.compression();
+                let Some(options) = self
+                    .archive_options
+                    .as_ref()
+                    .map(ArchiveOptions::compression)
+                else {
+                    return;
+                };
                 let output = compression_output(Path::new(&name), options.format)
                     .map(|path| target.join(path))
                     .filter(|path| path.is_absolute());
@@ -3905,8 +3920,11 @@ impl App {
     }
 
     fn archive_format_changed(&self) {
-        let format = self.archive_options.format();
-        set_enabled(self.archive_options.level, format != Format::Tar);
+        let Some(options) = &self.archive_options else {
+            return;
+        };
+        let format = options.format();
+        set_enabled(options.level, format != Format::Tar);
         let name = read(self.edit_name);
         if let Some(output) = compression_output(Path::new(&name), format) {
             text(self.edit_name, output);
@@ -3931,9 +3949,11 @@ impl App {
         let extension = format!(".{}", format.extension());
         let output = target.join(archive::suggested_name(&stem.to_string_lossy(), &extension));
         if advanced {
-            send(self.archive_options.format, CB_SETCURSEL, 0, 0);
-            send(self.archive_options.level, CB_SETCURSEL, 0, 0);
-            set_enabled(self.archive_options.level, true);
+            self.ensure_archive_options();
+            let options = self.archive_options.as_ref().unwrap();
+            send(options.format, CB_SETCURSEL, 0, 0);
+            send(options.level, CB_SETCURSEL, 0, 0);
+            set_enabled(options.level, true);
             self.begin_edit(Edit::Compress(sources, target), "Archive path", output);
             send(self.edit_name, EM_SETREADONLY, 0, 0);
         } else {
@@ -5864,9 +5884,19 @@ mod context_menu_tests {
             assert!(matches!(app.edit, Some(Edit::Compress(..))));
             assert!(pending.try_recv().is_err());
             text(app.edit_name, folder.join("Other").join("Custom.name.zip"));
-            send(app.archive_options.format, CB_SETCURSEL, 1, 0);
+            send(
+                app.archive_options.as_ref().unwrap().format,
+                CB_SETCURSEL,
+                1,
+                0,
+            );
             app.archive_format_changed();
-            send(app.archive_options.level, CB_SETCURSEL, 2, 0);
+            send(
+                app.archive_options.as_ref().unwrap().level,
+                CB_SETCURSEL,
+                2,
+                0,
+            );
             assert_eq!(
                 PathBuf::from(read(app.edit_name)),
                 folder.join("Other").join("Custom.name.7z"),
@@ -5891,7 +5921,7 @@ mod context_menu_tests {
                         SWP_NOZORDER,
                     );
                     app.layout();
-                    let level = bounds(app.archive_options.level);
+                    let level = bounds(app.archive_options.as_ref().unwrap().level);
                     let create = bounds(app.button(ACCEPT));
                     assert!(
                         level.right <= create.left || level.bottom <= create.top,
@@ -6296,7 +6326,10 @@ fn key(app: &RefCell<App>, message: &MSG) -> bool {
             unsafe { PostMessageW(app.window, WM_COMMAND, ARCHIVE_BROWSE as WPARAM, 0) };
             return true;
         }
-        if [app.archive_options.format, app.archive_options.level].contains(&focus)
+        if app
+            .archive_options
+            .as_ref()
+            .is_some_and(|options| [options.format, options.level].contains(&focus))
             && matches!(message.wParam as u16, VK_RETURN | VK_ESCAPE)
             && send(focus, CB_GETDROPPEDSTATE, 0, 0) != 0
         {
