@@ -1,0 +1,31 @@
+name: Installed Windows diagnostics
+on:
+  push:
+    branches: [diagnostics/installed-win-e]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  installed:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: better-explorer-windows
+          run-id: 46111626911
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/bex-draft
+      - name: Verify exact installers and run installed comparison
+        shell: powershell
+        run: |
+          $previous = Join-Path $env:RUNNER_TEMP 'BetterExplorer-0.1.10-windows-x64-setup.exe'
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/TabanAziz/BetterExplorer/releases/download/v0.1.10/BetterExplorer-0.1.10-windows-x64-setup.exe' -OutFile $previous
+          $draft = @(Get-ChildItem -LiteralPath (Join-Path $env:RUNNER_TEMP 'bex-draft') -Filter 'BetterExplorer-0.1.11-windows-x64-setup.exe' -File -Recurse)
+          if ($draft.Count -ne 1) { throw 'Expected one draft installer.' }
+          if ((Get-FileHash -LiteralPath $previous).Hash -ne 'aaacf13c6d5e2eab8d8a2e3cab43ac9cf0b24c2d705b6437b3c0fa69768602d0' -or
+              (Get-FileHash -LiteralPath $draft[0].FullName).Hash -ne '688cb19507508a67e79a452c1d720d7adde4e3ac3cd5a1de0fe22768197afb44') {
+            throw 'An installer did not match its recorded SHA-256.'
+          }
+          ./tools/test-installed-startup.ps1 -Previous $previous -Draft $draft[0].FullName
