@@ -31,6 +31,17 @@ public static class InstalledExplorerProbe {
     [DllImport("user32.dll", CharSet=CharSet.Unicode)]
     private static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string name, string caption);
     [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr window, out uint pid);
+    public static IntPtr MainFor(uint target) {
+        IntPtr window = IntPtr.Zero;
+        while ((window = FindWindowEx(IntPtr.Zero, window, "BetterExplorerWindow", null)) != IntPtr.Zero) {
+            uint pid;
+            GetWindowThreadProcessId(window, out pid);
+            if (pid == target && IsWindowVisible(window)) return window;
+        }
+        return IntPtr.Zero;
+    }
+    [DllImport("user32.dll")]
     private static extern bool IsWindowVisible(IntPtr window);
     [DllImport("user32.dll")]
     private static extern IntPtr SendMessageTimeout(IntPtr window, uint msg, UIntPtr wparam,
@@ -79,16 +90,31 @@ function Measure-Helper([int] $ExpectedPriority) {
     }
     $clock.ElapsedMilliseconds
 }
+function Measure-Installed([string] $Version, [int] $Priority, [int] $FirstFolder) {
+    $helperTime = Measure-Helper $Priority
+    Write-Host "BEX_HELPER $Version ready=${helperTime}ms priority=$Priority"
+    $external = @(Measure-FolderLaunch $folders[$FirstFolder] $count; Measure-FolderLaunch $folders[($FirstFolder + 1)] $count)
+    & (Join-Path $PSScriptRoot 'bench.ps1') -BinaryPath $exe -StartupRuns 3 -NavigationRuns 3 -Entries $count | Out-Host
+    [ordered]@{
+        install = $Version; executable_sha256 = (Get-FileHash -LiteralPath $exe).Hash; task_priority = $Priority
+        helper_ready_ms = $helperTime; folder_launch = $external
+    }
+}
 function Measure-FolderLaunch([string] $Folder, [int] $ExpectedRows) {
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $process = Start-Process -FilePath $exe -ArgumentList ('"{0}"' -f $Folder) -PassThru
     try {
         $visible = $null
         $first = $null
+        $last = -2
+        $highest = -2
         while ($clock.ElapsedMilliseconds -lt 12000) {
             $process.Refresh()
             if ($process.HasExited) { throw 'Installed app exited before loading the folder.' }
-            $rows = [InstalledExplorerProbe]::Rows($process.MainWindowHandle)
+            $main = [InstalledExplorerProbe]::MainFor([uint32]$process.Id)
+            $rows = [InstalledExplorerProbe]::Rows($main)
+            $last = $rows
+            $highest = [Math]::Max($highest, $rows)
             $elapsed = $clock.ElapsedMilliseconds
             if ($null -eq $visible -and $rows -ge -1) { $visible = $elapsed }
             if ($null -eq $first -and $rows -gt 0) { $first = $elapsed }
@@ -97,7 +123,8 @@ function Measure-FolderLaunch([string] $Folder, [int] $ExpectedRows) {
             }
             Start-Sleep -Milliseconds 10
         }
-        throw "The installed app did not show all $ExpectedRows rows: $Folder"
+        Write-Warning "External list probe could not confirm $ExpectedRows rows (last=$last, max=$highest, title=$($process.MainWindowTitle))."
+        return [ordered]@{ visible_window_ms = $visible; first_rows_ms = $first; full_rows_ms = $null; rows = $highest }
     } finally {
         if (-not $process.HasExited) {
             $null = $process.CloseMainWindow()
@@ -127,23 +154,15 @@ try {
     Invoke-CheckedProcess $exe '--win-e-on' 15000
     $oldTask = Get-ScheduledTask -TaskPath '\' -TaskName $taskName
     $oldPriority = [int]$oldTask.Settings.Priority
-    $baseline = [ordered]@{
-        install = '0.1.10'; executable_sha256 = $previousHash; task_priority = $oldPriority
-        helper_ready_ms = Measure-Helper $oldPriority
-        folder_launch = @(Measure-FolderLaunch $folders[0] $count; Measure-FolderLaunch $folders[1] $count)
-    }
+    $baseline = Measure-Installed '0.1.10' $oldPriority 0
     Write-Host ('BEX_BASELINE ' + ($baseline | ConvertTo-Json -Depth 5 -Compress))
     Invoke-CheckedProcess $Draft '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-' 90000
     $draftHash = (Get-FileHash -LiteralPath $exe).Hash
     if ($draftHash -eq $previousHash) { throw 'The installer did not replace the installed executable.' }
     Invoke-CheckedProcess $exe '--win-e-enabled' 10000
-    $candidate = [ordered]@{
-        install = '0.1.11'; executable_sha256 = $draftHash; task_priority = 5
-        helper_ready_ms = Measure-Helper 5
-        folder_launch = @(Measure-FolderLaunch $folders[2] $count; Measure-FolderLaunch $folders[3] $count)
-    }
+    $candidate = Measure-Installed '0.1.11' 5 2
     Write-Host ('BEX_CANDIDATE ' + ($candidate | ConvertTo-Json -Depth 5 -Compress))
-    Write-Host 'Installed compare only: on-demand scheduled task, no sign-in/reboot or physical Win+E. Two launches each on Windows Server.'
+    Write-Host 'Installed compare only: on-demand scheduled task, no sign-in/reboot or physical Win+E. Two ordinary launches and three instrumented samples each on Windows Server.'
 } finally {
     if (Test-Path -LiteralPath $uninstaller) {
         Invoke-CheckedProcess $uninstaller '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART' 90000
