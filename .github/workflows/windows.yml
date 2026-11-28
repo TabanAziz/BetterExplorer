@@ -116,21 +116,20 @@ jobs:
               throw 'The sign-in task remained registered after opting out.'
             }
           }
-      - name: Check out published Explorer for comparison
-        if: github.ref == 'refs/heads/fix/first-launch-performance'
-        uses: actions/checkout@v7
-        with:
-          ref: v0.1.10
-          path: .benchmark-baseline
       - name: Compare startup and large folder loading
         if: github.ref == 'refs/heads/fix/first-launch-performance'
         shell: powershell
         run: |
-          $previous = Join-Path $PWD '.benchmark-baseline'
-          cargo +stable build --manifest-path "$previous/Cargo.toml" --release --locked
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $archive = Join-Path $env:RUNNER_TEMP 'better-explorer-0.1.10.zip'
+          $previous = Join-Path $env:RUNNER_TEMP 'better-explorer-0.1.10'
+          $url = 'https://github.com/TabanAziz/BetterExplorer/releases/download/v0.1.10/BetterExplorer-0.1.10-windows-x64-portable.zip'
+          Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $archive
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne 'ca9216718f525ab9e62006c84df798f2500cb541357a316173830e69a9eb8c8e') {
+            throw 'Baseline archive did not match the recorded release digest.'
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $previous
           Write-Host 'Published 0.1.10 on the same Windows runner'
-          ./tools/bench.ps1 -BinaryPath "$previous/target/release/BetterExplorer.exe" -StartupRuns 10 -NavigationRuns 10 -Entries 50000
+          ./tools/bench.ps1 -BinaryPath "$previous/BetterExplorer.exe" -StartupRuns 10 -NavigationRuns 10 -Entries 50000
           Write-Host 'Release candidate on the same Windows runner'
           ./tools/bench.ps1 -StartupRuns 10 -NavigationRuns 10 -Entries 50000
       - name: Upload benchmark results
