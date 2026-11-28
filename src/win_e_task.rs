@@ -22,7 +22,7 @@ use windows::{
                 ITaskFolder, ITaskService, TaskScheduler, TASK_ACTION_EXEC, TASK_ACTION_TYPE,
                 TASK_CREATE, TASK_INSTANCES_IGNORE_NEW, TASK_LOGON_INTERACTIVE_TOKEN,
                 TASK_LOGON_TYPE, TASK_RUNLEVEL_LUA, TASK_RUNLEVEL_TYPE, TASK_TRIGGER_LOGON,
-                TASK_TRIGGER_TYPE2,
+                TASK_TRIGGER_TYPE2, TASK_UPDATE,
             },
             Variant::VARIANT,
         },
@@ -40,6 +40,21 @@ use windows_sys::Win32::{
 
 const SOURCE: &str = "BetterExplorer.WinE.Logon.v1";
 const LISTENER_ARG: &str = "--win-e-listener";
+const DEFAULT_TASK_PRIORITY: i32 = 7;
+const INTERACTIVE_TASK_PRIORITY: i32 = 5;
+
+#[cfg(test)]
+#[test]
+fn only_the_scheduler_default_priority_is_migrated() {
+    assert!(should_migrate_priority(true, DEFAULT_TASK_PRIORITY));
+    assert!(!should_migrate_priority(false, DEFAULT_TASK_PRIORITY));
+    assert!(!should_migrate_priority(true, 6));
+    assert!(!should_migrate_priority(true, INTERACTIVE_TASK_PRIORITY));
+}
+
+fn should_migrate_priority(enabled: bool, priority: i32) -> bool {
+    enabled && priority == DEFAULT_TASK_PRIORITY
+}
 
 pub fn ensure(exe: &Path) -> io::Result<()> {
     Scheduler::connect()?.ensure(exe, true)
@@ -102,28 +117,42 @@ impl Scheduler {
             if !self.owns(&definition, exe).map_err(io_error)? {
                 return Err(name_in_use());
             }
-            if !enable_existing {
+            if !self.starts_at_logon(&definition).map_err(io_error)? {
+                if enable_existing {
+                    return Err(io::Error::other(
+                        "The BetterExplorer logon trigger has been changed.",
+                    ));
+                }
                 return Ok(());
             }
-            if !self.starts_at_logon(&definition).map_err(io_error)? {
-                return Err(io::Error::other(
-                    "The BetterExplorer logon trigger has been changed.",
-                ));
-            }
-            if unsafe { task.Enabled() }.map_err(io_error)? == VARIANT_FALSE {
+            let enabled = unsafe { task.Enabled() }.map_err(io_error)? != VARIANT_FALSE;
+            let settings = unsafe { definition.Settings() }.map_err(io_error)?;
+            let mut priority = 0;
+            unsafe { settings.Priority(&mut priority) }.map_err(io_error)?;
+            if should_migrate_priority(enabled || enable_existing, priority) {
+                unsafe { settings.SetPriority(INTERACTIVE_TASK_PRIORITY) }.map_err(io_error)?;
+                if !enabled {
+                    unsafe { settings.SetEnabled(VARIANT_TRUE) }.map_err(io_error)?;
+                }
+                self.register(&definition, TASK_UPDATE.0)?;
+            } else if enable_existing && !enabled {
                 unsafe { task.SetEnabled(VARIANT_TRUE) }.map_err(io_error)?;
             }
             return Ok(());
         }
 
-        let empty = VARIANT::default();
         let definition = self.definition(exe).map_err(io_error)?;
         // Create-only registration also protects a task added after the lookup.
+        self.register(&definition, TASK_CREATE.0)
+    }
+
+    fn register(&self, definition: &ITaskDefinition, flags: i32) -> io::Result<()> {
+        let empty = VARIANT::default();
         unsafe {
             self.folder.RegisterTaskDefinition(
                 &self.name,
-                &definition,
-                TASK_CREATE.0,
+                definition,
+                flags,
                 &empty,
                 &empty,
                 TASK_LOGON_INTERACTIVE_TOKEN,
@@ -180,6 +209,7 @@ impl Scheduler {
 
             let settings = definition.Settings()?;
             settings.SetEnabled(VARIANT_TRUE)?;
+            settings.SetPriority(INTERACTIVE_TASK_PRIORITY)?;
             settings.SetMultipleInstances(TASK_INSTANCES_IGNORE_NEW)?;
             settings.SetDisallowStartIfOnBatteries(VARIANT_FALSE)?;
             settings.SetStopIfGoingOnBatteries(VARIANT_FALSE)?;

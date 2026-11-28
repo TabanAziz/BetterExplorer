@@ -2,6 +2,9 @@
 
 ## 0.1.11
 
+- Run the optional Win+E logon helper and its foreground launch at normal priority instead of inheriting background priority.
+- Start the first folder scan ahead of other background services. Populate the first viewport sooner and coalesce repeated list redraws. Defer large icon setup until an icon view uses it.
+
 - Keep the Close button above the tabs and redraw it reliably during layout changes.
 - Right-click a Quick access folder for actions including Copy as path, Open in new tab, and Properties.
 - Win+E brings a responsive BetterExplorer window from the same installation forward when available. Ctrl+N still opens a new window.

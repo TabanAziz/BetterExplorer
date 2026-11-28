@@ -636,6 +636,28 @@ impl Visibility {
     }
 }
 
+// The first user-visible batch should be a useful viewport, not a lone row.
+fn ready_to_publish(first: bool, pending: usize, elapsed: Duration) -> bool {
+    pending > 0
+        && if first {
+            pending >= 32 || elapsed >= Duration::from_millis(12)
+        } else {
+            pending >= 2048 || elapsed >= Duration::from_millis(45)
+        }
+}
+
+#[cfg(test)]
+#[test]
+fn early_batches_fill_a_viewport_but_do_not_wait_on_slow_scans() {
+    let ms = Duration::from_millis;
+    assert!(!ready_to_publish(true, 1, ms(0)));
+    assert!(ready_to_publish(true, 32, ms(0)));
+    assert!(ready_to_publish(true, 2, ms(12)));
+    assert!(!ready_to_publish(false, 32, ms(12)));
+    assert!(ready_to_publish(false, 2048, ms(12)));
+    assert!(!ready_to_publish(true, 0, ms(100)));
+}
+
 fn enumerate(
     root: PathBuf,
     query: Option<String>,
@@ -646,7 +668,8 @@ fn enumerate(
     mut batch: impl FnMut(Vec<Arc<Entry>>),
 ) {
     let mut pending = vec![root.clone()];
-    let mut delivered = entries.len();
+    let initial = entries.len();
+    let mut delivered = initial;
     let mut last_batch = Instant::now();
     let mut unreadable = 0usize;
     while let Some(folder) = pending.pop() {
@@ -706,15 +729,18 @@ fn enumerate(
                     shell_item: None,
                 }));
             }
-            if entries.len() > delivered
-                && (delivered == 0 || last_batch.elapsed() >= Duration::from_millis(45))
-            {
+            let count = entries.len() - delivered;
+            if count != 0 && ready_to_publish(delivered == initial, count, last_batch.elapsed()) {
                 let cutoff = entries.len();
                 batch(entries[delivered..cutoff].to_vec());
                 delivered = cutoff;
                 last_batch = Instant::now();
             }
         }
+    }
+    // Expose the tail before name sorting, but do not double-paint a single small listing.
+    if !stale() && delivered < entries.len() && entries.len() - initial >= 32 {
+        batch(entries[delivered..].to_vec());
     }
     if unreadable != 0 && error.is_none() {
         *error = Some(format!(

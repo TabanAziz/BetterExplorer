@@ -834,11 +834,15 @@ impl App {
 
     fn start(&mut self) {
         let owner = self.window as usize;
-        unsafe { AddClipboardFormatListener(self.window) };
         let scan_queue = Arc::clone(&self.events);
         self.scanner = Some(Scanner::start(move |event| {
             publish(&scan_queue, owner, Event::Scan(event))
         }));
+        self.watcher = work::Watcher::start(move |id| unsafe {
+            PostMessageW(owner as HWND, CHANGE, id as usize, 0);
+        });
+        self.request_scan();
+        unsafe { AddClipboardFormatListener(self.window) };
         let (operations, receiver) = sync_channel::<Operation>(8);
         let operation_queue = Arc::clone(&self.events);
         std::thread::Builder::new()
@@ -893,10 +897,6 @@ impl App {
                 .expect("start settings worker"),
         );
         self.saved = Some(saved);
-        self.watcher = work::Watcher::start(move |id| unsafe {
-            PostMessageW(owner as HWND, CHANGE, id as usize, 0);
-        });
-        self.request_scan();
         self.focus_content();
     }
 
@@ -1058,21 +1058,22 @@ impl App {
             scale(31, dpi) as isize,
         );
         self.fitted_columns = None;
-        for (index, (kind, side)) in [(LVSIL_SMALL, 22), (LVSIL_NORMAL, self.icon_size)]
-            .into_iter()
-            .enumerate()
-        {
-            let images = list_images(dpi, side);
-            self.file_icons.reset(index);
-            send(self.list, LVM_SETIMAGELIST, kind as usize, images as isize);
-            let old = std::mem::replace(&mut self.images[index], images);
-            if old != 0 {
-                unsafe {
-                    ImageList_Destroy(old);
-                }
-            }
+        self.replace_image_list(0, 22);
+        if self.images[1] != 0 || self.file_icon_slot() == 1 {
+            self.replace_image_list(1, self.icon_size);
         }
         self.refresh_home_file_icons();
+    }
+
+    fn replace_image_list(&mut self, slot: usize, side: i32) {
+        let kind = [LVSIL_SMALL, LVSIL_NORMAL][slot];
+        let images = list_images(self.dpi, side);
+        self.file_icons.reset(slot);
+        send(self.list, LVM_SETIMAGELIST, kind as usize, images);
+        let old = std::mem::replace(&mut self.images[slot], images);
+        if old != 0 {
+            unsafe { ImageList_Destroy(old) };
+        }
     }
 
     fn apply_theme(&mut self) {
@@ -2773,17 +2774,11 @@ impl App {
             VIEW_XLARGE => 112,
             _ => 52,
         };
-        if side != self.icon_size {
+        if matches!(view, LV_VIEW_ICON | VIEW_SMALL | VIEW_LARGE | VIEW_XLARGE)
+            && (side != self.icon_size || self.images[1] == 0)
+        {
             self.icon_size = side;
-            let images = list_images(self.dpi, side);
-            self.file_icons.reset(1);
-            send(self.list, LVM_SETIMAGELIST, LVSIL_NORMAL as usize, images);
-            let old = std::mem::replace(&mut self.images[1], images);
-            if old != 0 {
-                unsafe {
-                    ImageList_Destroy(old);
-                }
-            }
+            self.replace_image_list(1, side);
         }
         let native = match view {
             VIEW_SMALL | VIEW_LARGE | VIEW_XLARGE => LV_VIEW_ICON,
@@ -2991,6 +2986,7 @@ impl App {
     fn events(&mut self) {
         let events = std::mem::take(&mut *self.events.lock().unwrap());
         let mut redraw_icons = false;
+        let mut listing_changed = false;
         for event in events {
             match event {
                 Event::FileIcon(result) => {
@@ -3007,10 +3003,10 @@ impl App {
                         }
                         self.rows.push(row);
                     }
-                    self.set_count();
-                    self.status();
+                    listing_changed = true;
                 }
                 Event::Scan(ScanEvent::Done(id, rows, error)) if id == self.id => {
+                    listing_changed = false;
                     let selection = self.list_selection();
                     self.clear_selection();
                     self.rows = rows;
@@ -3087,6 +3083,10 @@ impl App {
                     self.status();
                 }
             }
+        }
+        if listing_changed {
+            self.set_count();
+            self.status();
         }
         if redraw_icons {
             if *self.location() == Location::Home {

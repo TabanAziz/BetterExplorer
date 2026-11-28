@@ -5,7 +5,7 @@ use std::{
     ffi::{OsStr, OsString},
     io,
     mem::size_of,
-    os::windows::ffi::OsStrExt,
+    os::windows::{ffi::OsStrExt, process::CommandExt},
     path::{Path, PathBuf},
     process::Command,
     ptr::{null, null_mut},
@@ -28,7 +28,7 @@ use windows_sys::Win32::{
         },
         Threading::{
             CreateMutexW, OpenProcess, QueryFullProcessImageNameW, ReleaseMutex,
-            WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+            WaitForSingleObject, NORMAL_PRIORITY_CLASS, PROCESS_QUERY_LIMITED_INFORMATION,
         },
     },
     UI::{
@@ -848,7 +848,14 @@ fn run_listener(exe: PathBuf) -> io::Result<()> {
         while receiver.recv().is_ok() {
             let _ = open_requested_window(
                 || foreground_running_window(&launch_exe),
-                || Command::new(&launch_exe).spawn().map(drop),
+                // The shortcut is an interactive request, even when the Startup Apps
+                // fallback was launched at below-normal priority during sign-in.
+                || {
+                    Command::new(&launch_exe)
+                        .creation_flags(NORMAL_PRIORITY_CLASS)
+                        .spawn()
+                        .map(drop)
+                },
             );
         }
     })?;
